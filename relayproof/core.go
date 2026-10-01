@@ -16,12 +16,13 @@ type Header struct {
 
 // Message is one outbound cross-chain message awaiting delivery.
 type Message struct {
-	ID      string
-	From    string
-	To      string
-	Nonce   uint64
-	Payload string
-	ProofAt int64
+	ID       string
+	From     string
+	To       string
+	Nonce    uint64
+	Payload  string
+	ProofAt  int64
+	ExpireAt int64 // absolute expiry in Unix milliseconds; zero means no expiry
 }
 
 // Delivery is the outcome of a relay attempt.
