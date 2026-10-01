@@ -85,8 +85,20 @@ type AdvanceReport struct {
 	Results []Result
 }
 
-func nonceKey(from, to string, nonce uint64) string {
-	return from + "\x00" + to + "\x00" + strconv.FormatUint(nonce, 10)
+// ConsumeKey identifies one consumed (source chain, destination chain, nonce)
+// triple. Chain names are compared as their exact UTF-8 content, so two
+// distinct paths never share a consumption slot even when their names contain
+// separator or zero bytes: "a\x00b" -> "c" and "a" -> "b\x00c" are different
+// keys despite producing the same old-style composite string.
+type ConsumeKey struct {
+	From  string
+	To    string
+	Nonce uint64
+}
+
+// consumeKeyOf builds the consumption triple for a message.
+func consumeKeyOf(from, to string, nonce uint64) ConsumeKey {
+	return ConsumeKey{From: from, To: to, Nonce: nonce}
 }
 
 // Queue is a durable local outbox backed by a state directory. A single
@@ -106,7 +118,7 @@ type Queue struct {
 	headers  map[string]Header  // latest registered header per chain
 	records  map[string]*Record // by message id
 	order    []string           // non-terminal messages, submission order
-	consumed map[string]string  // nonce combination -> successful message id
+	consumed map[ConsumeKey]string // consumption triple -> successful message id
 	nextSeq  int64
 }
 
@@ -183,7 +195,7 @@ func (q *Queue) snapshot() *loadedState {
 		sources:  map[string]bool{},
 		headers:  map[string]Header{},
 		records:  map[string]*Record{},
-		consumed: map[string]string{},
+		consumed: map[ConsumeKey]string{},
 		now:      q.now,
 		nextSeq:  q.nextSeq,
 	}
@@ -439,7 +451,7 @@ func (q *Queue) maybeCompact() error {
 // hold. The bool reports whether the message was terminalized.
 func (q *Queue) checkReplayExpiry(rec *Record, now int64) (Result, bool, error) {
 	id := rec.Msg.Message.ID
-	key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+	key := consumeKeyOf(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
 	if winner, taken := q.consumed[key]; taken && winner != id {
 		reason := "nonce combination already consumed by message " + winner
 		if err := q.terminalize(rec, now, StatusReplay, reason); err != nil {
@@ -482,7 +494,7 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 	}
 
 	// Deliver: success record and nonce consumption are one log entry.
-	key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+	key := consumeKeyOf(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
 	reason := "delivered; proof verified by trusted header at height " + strconv.FormatInt(h.Height, 10)
 	if err := q.store.appendResult(now, rec, StatusSuccess, reason, rec.Attempts+1, key, id, true); err != nil {
 		return Result{}, q.fail("deliver", err)
@@ -498,7 +510,7 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 }
 
 func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error {
-	if err := q.store.appendResult(now, rec, status, reason, rec.Attempts+1, "", "", false); err != nil {
+	if err := q.store.appendResult(now, rec, status, reason, rec.Attempts+1, ConsumeKey{}, "", false); err != nil {
 		return q.fail("terminalize", err)
 	}
 	rec.Attempts++
@@ -512,7 +524,7 @@ func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error
 
 func (q *Queue) markWaiting(rec *Record, now int64, reason string) error {
 	attempt := rec.Attempts + 1
-	if err := q.store.appendResult(now, rec, StatusWaiting, reason, attempt, "", "", false); err != nil {
+	if err := q.store.appendResult(now, rec, StatusWaiting, reason, attempt, ConsumeKey{}, "", false); err != nil {
 		return q.fail("schedule retry", err)
 	}
 	rec.Attempts = attempt

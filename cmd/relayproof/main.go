@@ -318,7 +318,7 @@ func runDemo() {
 	headers := map[string]relayproof.Header{
 		"chain-a": {Chain: "chain-a", Height: 1024, Root: "0xabc", Trusted: true},
 	}
-	consumed := map[string]bool{}
+	consumed := map[relayproof.ConsumeKey]bool{}
 	messages := []relayproof.Message{
 		{ID: "msg-1", From: "chain-a", To: "chain-b", Nonce: 7, ProofAt: 1000},
 		{ID: "msg-2", From: "chain-c", To: "chain-b", Nonce: 1, ProofAt: 10},

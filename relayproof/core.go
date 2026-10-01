@@ -31,8 +31,11 @@ type Delivery struct {
 	Reason  string
 }
 
-// Verify accepts a message only when the header covering it is known and trusted.
-func Verify(headers map[string]Header, message Message, consumed map[string]bool) Delivery {
+// Verify accepts a message only when the header covering it is known and
+// trusted. Replay protection keys the consumption by the exact
+// (source chain, destination chain, nonce) triple, so two distinct paths
+// never collide even when their names contain separator or zero bytes.
+func Verify(headers map[string]Header, message Message, consumed map[ConsumeKey]bool) Delivery {
 	header, ok := headers[message.From]
 	if !ok {
 		return Delivery{Message: message.ID, Status: "rejected", Reason: "unknown source chain"}
@@ -40,7 +43,7 @@ func Verify(headers map[string]Header, message Message, consumed map[string]bool
 	if !header.Trusted || header.Height < message.ProofAt {
 		return Delivery{Message: message.ID, Status: "pending", Reason: "header not yet trusted at proof height"}
 	}
-	key := message.From + ":" + message.To + ":" + strconv.FormatUint(message.Nonce, 10)
+	key := consumeKeyOf(message.From, message.To, message.Nonce)
 	if consumed[key] {
 		return Delivery{Message: message.ID, Status: "rejected", Reason: "replay: nonce already consumed"}
 	}

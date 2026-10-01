@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 // On-disk format (queue.log):
@@ -37,6 +38,15 @@ const (
 	frameCRCsSize    = 4
 )
 
+// Log versions. v1 encoded nonce consumption as a single composite string
+// (from + NUL + to + NUL + nonce), which collided for paths whose names
+// contained separator bytes. v2 carries the three independent values.
+const (
+	currentLogV = 2
+	logV1       = 1
+	logV2       = 2
+)
+
 var crcTable = crc32.MakeTable(crc32.IEEE)
 
 // JSON log entry kinds.
@@ -48,7 +58,6 @@ const (
 	kindResult  = "result"
 	kindState   = "state" // compacted snapshot: full status after >=1 attempts
 	kindAdvance = "advance"
-	currentLogV = 1
 )
 
 type logEntry struct {
@@ -74,8 +83,12 @@ type logEntry struct {
 	Reason     string `json:"reason,omitempty"`
 	Attempts   int    `json:"attempts,omitempty"`
 	NextRetry  int64  `json:"nextRetry,omitempty"`
-	ConsumeKey string `json:"consumeKey,omitempty"`
+	ConsumeKey string `json:"consumeKey,omitempty"` // v1 composite string (read-only legacy)
 	ConsumeBy  string `json:"consumeBy,omitempty"`
+	// v2 consumption triple, stored as three independent values.
+	ConsumeFrom  string `json:"consumeFrom,omitempty"`
+	ConsumeTo    string `json:"consumeTo,omitempty"`
+	ConsumeNonce uint64 `json:"consumeNonce,omitempty"`
 }
 
 type store struct {
@@ -93,7 +106,7 @@ type loadedState struct {
 	sources  map[string]bool
 	headers  map[string]Header
 	records  map[string]*Record
-	consumed map[string]string
+	consumed map[ConsumeKey]string
 	nextSeq  int64
 	now      int64
 }
@@ -222,7 +235,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		sources:  map[string]bool{},
 		headers:  map[string]Header{},
 		records:  map[string]*Record{},
-		consumed: map[string]string{},
+		consumed: map[ConsumeKey]string{},
 	}
 
 	sawVersion := false
@@ -254,7 +267,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
 		}
 		if !sawVersion {
-			if e.T != kindVersion || e.V != currentLogV {
+			if e.T != kindVersion || (e.V != logV1 && e.V != logV2) {
 				return 0, nil, fmt.Errorf("%w: unsupported log version entry: %+v", ErrCorrupt, e)
 			}
 			sawVersion = true
@@ -269,6 +282,47 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		return 0, nil, fmt.Errorf("%w: missing version record", ErrCorrupt)
 	}
 	return int64(pos), state, nil
+}
+
+// oldStyleKey is the v1 nonce encoding: from, zero byte, to, zero byte,
+// decimal nonce. Used only to validate v1 logs on open.
+func oldStyleKey(from, to string, nonce uint64) string {
+	return from + "\x00" + to + "\x00" + strconv.FormatUint(nonce, 10)
+}
+
+// applyConsumption validates a success entry's nonce consumption against the
+// record's own message and records it. v1 logs encode the triple as a single
+// composite consumeKey string; v2 logs carry the three independent values.
+// Either way the consumption must match the message exactly, and the same
+// triple can never be consumed twice.
+func applyConsumption(s *loadedState, e *logEntry, rec *Record) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	m := rec.Msg.Message
+	if e.ConsumeBy != e.ID {
+		return corrupt("success entry for %q carries mismatched consumer id", e.ID)
+	}
+	switch {
+	case e.ConsumeKey != "":
+		// v1: composite string must equal the old-style concatenation.
+		if e.ConsumeKey != oldStyleKey(m.From, m.To, m.Nonce) {
+			return corrupt("success entry for %q carries mismatched nonce consumption", e.ID)
+		}
+	case e.ConsumeFrom != "":
+		// v2: three independent values must match the message.
+		if e.ConsumeFrom != m.From || e.ConsumeTo != m.To || e.ConsumeNonce != m.Nonce {
+			return corrupt("success entry for %q carries mismatched nonce consumption", e.ID)
+		}
+	default:
+		return corrupt("success entry for %q carries no nonce consumption", e.ID)
+	}
+	key := consumeKeyOf(m.From, m.To, m.Nonce)
+	if winner, taken := s.consumed[key]; taken {
+		return corrupt("nonce combination already consumed by %q while accepting %q", winner, e.ID)
+	}
+	s.consumed[key] = e.ID
+	return nil
 }
 
 func applyEntry(s *loadedState, e *logEntry) error {
@@ -336,19 +390,15 @@ func applyEntry(s *loadedState, e *logEntry) error {
 				return corrupt("waiting result has wrong retry schedule for %q", e.ID)
 			}
 		case StatusSuccess:
-			key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-			if e.ConsumeKey != key || e.ConsumeBy != e.ID {
-				return corrupt("success entry for %q carries mismatched nonce consumption", e.ID)
-			}
-			if winner, taken := s.consumed[key]; taken {
-				return corrupt("nonce %s already consumed by %q while accepting %q", key, winner, e.ID)
+			if err := applyConsumption(s, e, rec); err != nil {
+				return err
 			}
 			if e.NextRetry != 0 {
 				return corrupt("success entry for %q carries retry time", e.ID)
 			}
-			s.consumed[key] = e.ID
 		default: // terminal failure kinds
-			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" {
+			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" ||
+				e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0 {
 				return corrupt("terminal entry for %q carries scheduling/consume fields", e.ID)
 			}
 		}
@@ -383,19 +433,15 @@ func applyEntry(s *loadedState, e *logEntry) error {
 				return corrupt("state has wrong retry schedule for %q", e.ID)
 			}
 		case StatusSuccess:
-			key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-			if e.ConsumeKey != key || e.ConsumeBy != e.ID {
-				return corrupt("state for %q carries mismatched nonce consumption", e.ID)
-			}
-			if winner, taken := s.consumed[key]; taken {
-				return corrupt("nonce %s already consumed by %q while loading %q", key, winner, e.ID)
+			if err := applyConsumption(s, e, rec); err != nil {
+				return err
 			}
 			if e.NextRetry != 0 {
 				return corrupt("success state for %q carries retry time", e.ID)
 			}
-			s.consumed[key] = e.ID
 		default:
-			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" {
+			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" ||
+				e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0 {
 				return corrupt("terminal state for %q carries scheduling/consume fields", e.ID)
 			}
 		}
@@ -493,9 +539,9 @@ func (s *store) appendSubmit(rec *Record) error {
 }
 
 // appendResult records one processing outcome. On success the nonce
-// consumption (consumeKey/consumeBy) is part of the same durable record,
-// committing together atomically.
-func (s *store) appendResult(now int64, rec *Record, status, reason string, attempts int, consumeKey, consumeBy string, success bool) error {
+// consumption triple (consumeFrom/consumeTo/consumeNonce/consumeBy) is part of
+// the same durable record, committing together atomically.
+func (s *store) appendResult(now int64, rec *Record, status, reason string, attempts int, key ConsumeKey, consumeBy string, success bool) error {
 	e := &logEntry{
 		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
 		Status: status, Reason: reason, Attempts: attempts,
@@ -504,7 +550,9 @@ func (s *store) appendResult(now int64, rec *Record, status, reason string, atte
 		e.NextRetry = now + nextRetryDelay(attempts)
 	}
 	if success {
-		e.ConsumeKey = consumeKey
+		e.ConsumeFrom = key.From
+		e.ConsumeTo = key.To
+		e.ConsumeNonce = key.Nonce
 		e.ConsumeBy = consumeBy
 	}
 	return s.append(e)
@@ -562,7 +610,9 @@ func (s *store) compact(state *loadedState) error {
 				re.NextRetry = rec.NextRetry
 			}
 			if rec.Status == StatusSuccess {
-				re.ConsumeKey = nonceKey(m.From, m.To, m.Nonce)
+				re.ConsumeFrom = m.From
+				re.ConsumeTo = m.To
+				re.ConsumeNonce = m.Nonce
 				re.ConsumeBy = m.ID
 			}
 			entries = append(entries, re)

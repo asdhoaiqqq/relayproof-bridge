@@ -103,7 +103,7 @@ func TestHappyPath(t *testing.T) {
 	if r.Status != StatusSuccess || r.NextRetry != 0 {
 		t.Fatalf("want terminal success without retry, got %+v", r)
 	}
-	if got := q.consumed[nonceKey("a", "b", 1)]; got != "m1" {
+	if got := q.consumed[consumeKeyOf("a", "b", 1)]; got != "m1" {
 		t.Fatalf("nonce not consumed by m1: %q", got)
 	}
 }
@@ -860,5 +860,426 @@ func TestValidation(t *testing.T) {
 	}
 	if len(q.records)+len(q.sources) != 0 {
 		t.Fatal("invalid calls mutated state")
+	}
+}
+
+// Two distinct cross-chain paths that collide under the old composite-string
+// encoding must each succeed with nonce 7. Chain names are compared as their
+// exact UTF-8 content: "a:b" -> "c" and "a" -> "b:c" are different paths, as
+// are "a\x00b" -> "c" and "a" -> "b\x00c".
+func TestDistinctPathsSameNonce(t *testing.T) {
+	cases := []struct {
+		name       string
+		from1, to1 string
+		from2, to2 string
+	}{
+		{"colon", "a:b", "c", "a", "b:c"},
+		{"zero-byte", "a\x00b", "c", "a", "b\x00c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, _ := openTempQueue(t)
+			defer q.Close()
+			// Both source chains must be registered and have trusted headers.
+			q.RegisterSource(tc.from1)
+			q.RegisterSource(tc.from2)
+			q.UpsertHeader(Header{Chain: tc.from1, Height: 100, Trusted: true})
+			q.UpsertHeader(Header{Chain: tc.from2, Height: 100, Trusted: true})
+
+			q.Submit(env("p1", tc.from1, tc.to1, 7, 10, 0))
+			q.Submit(env("p2", tc.from2, tc.to2, 7, 10, 0))
+			rep, err := q.Advance(1000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{"p1": StatusSuccess, "p2": StatusSuccess}
+			if len(rep.Results) != 2 {
+				t.Fatalf("want 2 results, got %+v", rep.Results)
+			}
+			for _, res := range rep.Results {
+				if res.Status != want[res.ID] {
+					t.Fatalf("id %s want %s got %s", res.ID, want[res.ID], res.Status)
+				}
+			}
+			// Both consumption triples are distinct and recorded.
+			if len(q.consumed) != 2 {
+				t.Fatalf("want 2 distinct consumed triples, got %d: %v", len(q.consumed), q.consumed)
+			}
+			// Full chain names are preserved in queries, including zero bytes.
+			for _, id := range []string{"p1", "p2"} {
+				r, ok := q.Query(id)
+				if !ok {
+					t.Fatalf("missing %s", id)
+				}
+				if r.Status != StatusSuccess {
+					t.Fatalf("%s: want success got %s", id, r.Status)
+				}
+			}
+			r1, _ := q.Query("p1")
+			if r1.From != tc.from1 || r1.To != tc.to1 {
+				t.Fatalf("p1 chain names not preserved: from=%q to=%q", r1.From, r1.To)
+			}
+			r2, _ := q.Query("p2")
+			if r2.From != tc.from2 || r2.To != tc.to2 {
+				t.Fatalf("p2 chain names not preserved: from=%q to=%q", r2.From, r2.To)
+			}
+		})
+	}
+}
+
+// The memory verification entry keys consumption by the exact triple too.
+func TestVerifyDistinctPathsSameNonce(t *testing.T) {
+	cases := []struct {
+		name       string
+		from1, to1 string
+		from2, to2 string
+	}{
+		{"colon", "a:b", "c", "a", "b:c"},
+		{"zero-byte", "a\x00b", "c", "a", "b\x00c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := map[string]Header{
+				tc.from1: {Chain: tc.from1, Height: 100, Root: "0x1", Trusted: true},
+				tc.from2: {Chain: tc.from2, Height: 100, Root: "0x1", Trusted: true},
+			}
+			consumed := map[ConsumeKey]bool{}
+			m1 := Message{ID: "p1", From: tc.from1, To: tc.to1, Nonce: 7, ProofAt: 10}
+			m2 := Message{ID: "p2", From: tc.from2, To: tc.to2, Nonce: 7, ProofAt: 10}
+			if d := Verify(headers, m1, consumed); d.Status != "delivered" {
+				t.Fatalf("p1: want delivered got %s (%s)", d.Status, d.Reason)
+			}
+			if d := Verify(headers, m2, consumed); d.Status != "delivered" {
+				t.Fatalf("p2: want delivered got %s (%s)", d.Status, d.Reason)
+			}
+			if len(consumed) != 2 {
+				t.Fatalf("want 2 consumed triples, got %d", len(consumed))
+			}
+			// Replaying p1 is still rejected.
+			if d := Verify(headers, m1, consumed); d.Status != "rejected" {
+				t.Fatalf("p1 replay: want rejected got %s", d.Status)
+			}
+		})
+	}
+}
+
+// The same real combination is consumed at most once; a different id, payload
+// or proof height cannot bypass an already-occurred consumption.
+func TestSameTripleReplayRegardlessOfPayload(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+
+	q.Submit(env("win", "a", "b", 7, 10, 0))
+	lose := env("lose", "a", "b", 7, 10, 0)
+	lose.Message.Payload = "different-payload"
+	lose.Message.ProofAt = 50
+	q.Submit(lose)
+	rep, err := q.Advance(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"win": StatusSuccess, "lose": StatusReplay}
+	for _, res := range rep.Results {
+		if res.Status != want[res.ID] {
+			t.Fatalf("id %s want %s got %s", res.ID, want[res.ID], res.Status)
+		}
+	}
+	if len(q.consumed) != 1 {
+		t.Fatalf("want exactly 1 consumed triple, got %d", len(q.consumed))
+	}
+}
+
+// Two distinct paths submitted concurrently do not interfere.
+func TestDistinctPathsConcurrent(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a\x00b")
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a\x00b", Height: 100, Trusted: true})
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Alternate between two distinct paths that share nonce 7.
+			if i%2 == 0 {
+				q.Submit(env(fmt.Sprintf("p%d", i), "a\x00b", "c", 7, 10, 0))
+			} else {
+				q.Submit(env(fmt.Sprintf("p%d", i), "a", "b\x00c", 7, 10, 0))
+			}
+		}(i)
+	}
+	wg.Wait()
+	rep, err := q.Advance(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivered := 0
+	for _, res := range rep.Results {
+		if res.Status == StatusSuccess {
+			delivered++
+		}
+	}
+	// Exactly one per path: two distinct paths each succeed once.
+	if delivered != 2 {
+		t.Fatalf("want exactly 2 successes (one per distinct path), got %d", delivered)
+	}
+	if len(q.consumed) != 2 {
+		t.Fatalf("want 2 consumed triples, got %d", len(q.consumed))
+	}
+}
+
+// Two distinct paths processed in a single Advance do not interfere.
+func TestDistinctPathsInOneAdvance(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a:b")
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a:b", Height: 100, Trusted: true})
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+
+	q.Submit(env("p1", "a:b", "c", 7, 10, 0))
+	q.Submit(env("p2", "a", "b:c", 7, 10, 0))
+	rep, err := q.Advance(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Results) != 2 {
+		t.Fatalf("want 2 results, got %+v", rep.Results)
+	}
+	for _, res := range rep.Results {
+		if res.Status != StatusSuccess {
+			t.Fatalf("id %s want success got %s (%s)", res.ID, res.Status, res.Reason)
+		}
+	}
+}
+
+// buildV1Log writes a v1 log with the given entries (version record first).
+func buildV1Log(t *testing.T, dir string, entries ...*logEntry) {
+	t.Helper()
+	raw := append([]byte(logMagic), encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: logV1}))...)
+	for _, e := range entries {
+		raw = append(raw, encodeFrame(mustMarshal(e))...)
+	}
+	if err := os.WriteFile(filepath.Join(dir, logName), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Recovery from a v1 log: a historical success consumes only its original
+// triple; a path that collided under the old encoding can now be delivered
+// with a new id, while the historical replay record stays replay and its id
+// cannot be reused.
+func TestV1RecoveryCollidingPath(t *testing.T) {
+	dir := t.TempDir()
+	// m1: from="a", to="b", nonce=7 (success).
+	// m2: from="a\x00b", to="c", nonce=7 — collided under the old encoding and
+	// was historically marked replay.
+	buildV1Log(t, dir,
+		&logEntry{T: kindSource, Chain: "a"},
+		&logEntry{T: kindHeader, Chain: "a", Height: 100, Root: "0x1", Trusted: true},
+		&logEntry{T: kindSubmit, Seq: 0, ID: "m1", From: "a", To: "b", Nonce: 7, ProofAt: 10},
+		&logEntry{T: kindResult, Now: 1000, ID: "m1", Status: StatusSuccess, Reason: "delivered", Attempts: 1, ConsumeKey: oldStyleKey("a", "b", 7), ConsumeBy: "m1"},
+		&logEntry{T: kindSubmit, Seq: 1, ID: "m2", From: "a\x00b", To: "c", Nonce: 7, ProofAt: 10},
+		&logEntry{T: kindResult, Now: 1000, ID: "m2", Status: StatusReplay, Reason: "nonce combination already consumed by message m1", Attempts: 1},
+	)
+
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open v1 log: %v", err)
+	}
+	defer q.Close()
+
+	// Historical state preserved.
+	if r, ok := q.Query("m1"); !ok || r.Status != StatusSuccess {
+		t.Fatalf("m1 should be success, got %+v", r)
+	}
+	if r, ok := q.Query("m2"); !ok || r.Status != StatusReplay {
+		t.Fatalf("m2 should stay replay, got %+v", r)
+	}
+	// Only the m1 triple is consumed.
+	if len(q.consumed) != 1 {
+		t.Fatalf("want 1 consumed triple after recovery, got %d: %v", len(q.consumed), q.consumed)
+	}
+	if got := q.consumed[consumeKeyOf("a", "b", 7)]; got != "m1" {
+		t.Fatalf("m1 triple should be consumed by m1, got %q", got)
+	}
+
+	// A new message with m2's path (new id) can now succeed.
+	q.RegisterSource("a\x00b")
+	q.UpsertHeader(Header{Chain: "a\x00b", Height: 100, Trusted: true})
+	q.Submit(env("m3", "a\x00b", "c", 7, 10, 0))
+	// The other colliding path also succeeds.
+	q.Submit(env("m4", "a", "b\x00c", 7, 10, 0))
+	// The exact m1 triple still replays.
+	q.Submit(env("m5", "a", "b", 7, 10, 0))
+	rep, err := q.Advance(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"m3": StatusSuccess, "m4": StatusSuccess, "m5": StatusReplay}
+	for _, res := range rep.Results {
+		if res.Status != want[res.ID] {
+			t.Fatalf("id %s want %s got %s (%s)", res.ID, want[res.ID], res.Status, res.Reason)
+		}
+	}
+	// The replay reason points at the actual winner (m1), not another path.
+	r, _ := q.Query("m5")
+	if !strings.Contains(r.Reason, "m1") {
+		t.Fatalf("replay reason should name m1, got %q", r.Reason)
+	}
+	// Historical replay id cannot be reused.
+	if _, err := q.Submit(env("m2", "a\x00b", "c", 7, 10, 0)); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("reusing historical replay id must be ErrTerminal, got %v", err)
+	}
+}
+
+// A v1 success record whose consumeKey does not match its message content is
+// rejected as corrupt, and the original data is preserved.
+func TestV1CorruptionMismatchedConsumeKey(t *testing.T) {
+	dir := t.TempDir()
+	buildV1Log(t, dir,
+		&logEntry{T: kindSource, Chain: "a"},
+		&logEntry{T: kindHeader, Chain: "a", Height: 100, Root: "0x1", Trusted: true},
+		&logEntry{T: kindSubmit, Seq: 0, ID: "m1", From: "a", To: "b", Nonce: 7, ProofAt: 10},
+		// consumeKey claims a different path than the message content.
+		&logEntry{T: kindResult, Now: 1000, ID: "m1", Status: StatusSuccess, Reason: "delivered", Attempts: 1, ConsumeKey: oldStyleKey("a", "c", 7), ConsumeBy: "m1"},
+	)
+	if _, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("mismatched consumeKey must be ErrCorrupt, got %v", err)
+	}
+	// Original data preserved.
+	raw, _ := os.ReadFile(filepath.Join(dir, logName))
+	if len(raw) == 0 {
+		t.Fatal("corrupt log must not be wiped")
+	}
+}
+
+// A v1 log with two success records consuming the same triple is rejected.
+func TestV1CorruptionDoubleConsume(t *testing.T) {
+	dir := t.TempDir()
+	buildV1Log(t, dir,
+		&logEntry{T: kindSource, Chain: "a"},
+		&logEntry{T: kindHeader, Chain: "a", Height: 100, Root: "0x1", Trusted: true},
+		&logEntry{T: kindSubmit, Seq: 0, ID: "m1", From: "a", To: "b", Nonce: 7, ProofAt: 10},
+		&logEntry{T: kindResult, Now: 1000, ID: "m1", Status: StatusSuccess, Reason: "delivered", Attempts: 1, ConsumeKey: oldStyleKey("a", "b", 7), ConsumeBy: "m1"},
+		&logEntry{T: kindSubmit, Seq: 1, ID: "m2", From: "a", To: "b", Nonce: 7, ProofAt: 10},
+		&logEntry{T: kindResult, Now: 2000, ID: "m2", Status: StatusSuccess, Reason: "delivered", Attempts: 1, ConsumeKey: oldStyleKey("a", "b", 7), ConsumeBy: "m2"},
+	)
+	if _, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("double consume must be ErrCorrupt, got %v", err)
+	}
+}
+
+// After compaction and reopen, distinct paths still succeed and the
+// consumption relationship is preserved.
+func TestCompactionPreservesConsumption(t *testing.T) {
+	dir := t.TempDir()
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.RegisterSource("a:b")
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a:b", Height: 100, Trusted: true})
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+	q.Submit(env("p1", "a:b", "c", 7, 10, 0))
+	q.Submit(env("p2", "a", "b:c", 7, 10, 0))
+	q.Advance(1000)
+
+	if err := q.store.compact(q.snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	q.Close()
+
+	q2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen compacted log: %v", err)
+	}
+	defer q2.Close()
+	if len(q2.consumed) != 2 {
+		t.Fatalf("want 2 consumed triples after compaction, got %d", len(q2.consumed))
+	}
+	// A new message with the same triple replays; a distinct path succeeds.
+	q2.Submit(env("p3", "a:b", "c", 7, 10, 0))
+	q2.Submit(env("p4", "a:b", "d", 7, 10, 0))
+	rep, err := q2.Advance(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"p3": StatusReplay, "p4": StatusSuccess}
+	for _, res := range rep.Results {
+		if res.Status != want[res.ID] {
+			t.Fatalf("id %s want %s got %s", res.ID, want[res.ID], res.Status)
+		}
+	}
+}
+
+// Two messages sharing the same source and nonce but with different
+// destination chains are distinct triples and both succeed.
+func TestSameSourceDifferentDestination(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+
+	q.Submit(env("p1", "a", "b", 7, 10, 0))
+	q.Submit(env("p2", "a", "c", 7, 10, 0))
+	rep, err := q.Advance(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"p1": StatusSuccess, "p2": StatusSuccess}
+	for _, res := range rep.Results {
+		if res.Status != want[res.ID] {
+			t.Fatalf("id %s want %s got %s", res.ID, want[res.ID], res.Status)
+		}
+	}
+	if len(q.consumed) != 2 {
+		t.Fatalf("want 2 consumed triples, got %d", len(q.consumed))
+	}
+}
+
+// A normal directory that completes open, write and reopen keeps the
+// consumption relationship: success record and nonce consumption never take
+// effect separately.
+func TestConsumptionAtomicAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Trusted: true})
+	q.Submit(env("m1", "a", "b", 7, 10, 0))
+	q.Advance(1000)
+	q.Close()
+
+	q2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q2.Close()
+	// m1 success and its consumption are both present.
+	if r, ok := q2.Query("m1"); !ok || r.Status != StatusSuccess {
+		t.Fatalf("m1 should be success, got %+v", r)
+	}
+	if got := q2.consumed[consumeKeyOf("a", "b", 7)]; got != "m1" {
+		t.Fatalf("m1 triple should be consumed by m1, got %q", got)
+	}
+	// The same triple cannot be delivered again.
+	q2.Submit(env("m2", "a", "b", 7, 10, 0))
+	rep, err := q2.Advance(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range rep.Results {
+		if res.ID == "m2" && res.Status != StatusReplay {
+			t.Fatalf("m2 should replay, got %s", res.Status)
+		}
 	}
 }
