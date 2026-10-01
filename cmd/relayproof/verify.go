@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asdhoaiqqq/relayproof-bridge/relayproof"
 )
@@ -33,6 +34,8 @@ func runVerify(args []string) error {
 		defer os.RemoveAll(stateDir)
 	}
 	fmt.Println("verify state dir:", stateDir)
+
+	verifyAmbiguousPaths()
 
 	must := func(step string, err error) {
 		if err != nil {
@@ -118,4 +121,154 @@ func printRecords(q *relayproof.Queue) {
 		}
 		fmt.Printf("    %-8s %-14s retry=%-6s %s\n", r.ID, r.Status, retry, r.Reason)
 	}
+}
+
+// verifyAmbiguousPaths drives the replay-protection fix: two distinct routing
+// paths that flatten to the same string under any delimiter-joined key must
+// both deliver. The colon pair is expressible on the command line as well;
+// the U+0000 pair can only be submitted through the Go API because argv
+// strings cannot contain a NUL byte. A genuine same-path repeat must still
+// be a replay whose reason names the real winner, and the consumption
+// relationships must survive a close/reopen cycle.
+func verifyAmbiguousPaths() {
+	// --- In-memory Verify entry point. ---
+	headers := map[string]relayproof.Header{
+		"a:b": {Chain: "a:b", Height: 100, Trusted: true},
+		"a":   {Chain: "a", Height: 100, Trusted: true},
+	}
+	consumed := map[string]bool{}
+	msgs := []relayproof.Message{
+		{ID: "mem-col-1", From: "a:b", To: "c", Nonce: 7, ProofAt: 10},
+		{ID: "mem-col-2", From: "a", To: "b:c", Nonce: 7, ProofAt: 10},
+		{ID: "mem-nul-1", From: "a\x00b", To: "c", Nonce: 7, ProofAt: 10},
+		{ID: "mem-nul-2", From: "a", To: "b\x00c", Nonce: 7, ProofAt: 10},
+	}
+	fmt.Println("ambiguous-path check (in-memory Verify):")
+	for _, m := range msgs {
+		// The two NUL-bearing messages also need their own source header.
+		headers[m.From] = relayproof.Header{Chain: m.From, Height: 100, Trusted: true}
+		d := relayproof.Verify(headers, m, consumed)
+		fmt.Printf("    %-10s %-10s %s\n", d.Message, d.Status, d.Reason)
+		if d.Status != "delivered" {
+			panic("distinct path " + m.ID + " was mistaken for a replay")
+		}
+	}
+	d := relayproof.Verify(headers, msgs[0], consumed)
+	if d.Status != "rejected" || !strings.Contains(d.Reason, "replay") {
+		panic("genuine repeat of mem-col-1 was not a replay: " + d.Reason)
+	}
+	fmt.Printf("    %-10s %-10s %s\n", d.Message, d.Status, d.Reason)
+
+	// --- Durable queue, including persistence across reopen. ---
+	dir, err := os.MkdirTemp("", "relayproof-verify-paths-")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+
+	q, err := relayproof.Open(dir)
+	if err != nil {
+		panic(err)
+	}
+	for _, chain := range []string{"a:b", "a", "a\x00b"} {
+		if err := q.RegisterSource(chain); err != nil {
+			panic(err)
+		}
+		if err := q.UpsertHeader(relayproof.Header{Chain: chain, Height: 100, Trusted: true}); err != nil {
+			panic(err)
+		}
+	}
+	submit := func(id, from, to string) {
+		_, err := q.Submit(relayproof.Envelope{
+			Message: relayproof.Message{ID: id, From: from, To: to, Nonce: 7, ProofAt: 10},
+		})
+		if err != nil {
+			panic(err)
+		}
+	}
+	submit("q-col-1", "a:b", "c")
+	submit("q-col-2", "a", "b:c")
+	submit("q-nul-1", "a\x00b", "c")
+	submit("q-dup", "a:b", "c") // genuinely the same triple as q-col-1
+
+	rep, err := q.Advance(1000)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("ambiguous-path check (durable queue):")
+	want := map[string]string{
+		"q-col-1": relayproof.StatusSuccess,
+		"q-col-2": relayproof.StatusSuccess,
+		"q-nul-1": relayproof.StatusSuccess,
+		"q-dup":   relayproof.StatusReplay,
+	}
+	got := map[string]relayproof.Result{}
+	for _, r := range rep.Results {
+		got[r.ID] = r
+		fmt.Printf("    %-10s %-14s %s\n", r.ID, r.Status, r.Reason)
+	}
+	for id, st := range want {
+		r, ok := got[id]
+		if !ok || r.Status != st {
+			panic(fmt.Sprintf("%s: want %s got %+v", id, st, r))
+		}
+	}
+	if !strings.Contains(got["q-dup"].Reason, "q-col-1") {
+		panic("replay reason must name the real winner q-col-1: " + got["q-dup"].Reason)
+	}
+	if err := q.Close(); err != nil {
+		panic(err)
+	}
+
+	q2, err := relayproof.Open(dir)
+	if err != nil {
+		panic(err)
+	}
+	defer q2.Close()
+	rep, err = q2.Advance(2000)
+	if err != nil {
+		panic(err)
+	}
+	if len(rep.Results) != 0 {
+		panic(fmt.Sprintf("historical successes processed again after reopen: %+v", rep.Results))
+	}
+	for id, st := range want {
+		r, ok := q2.Query(id)
+		if !ok || r.Status != st {
+			panic(fmt.Sprintf("after reopen %s: want %s got %+v", id, st, r))
+		}
+		// Full chain names, including the NUL bytes, must survive intact.
+		if id == "q-col-1" && (r.From != "a:b" || r.To != "c") {
+			panic(fmt.Sprintf("%s names rewritten: %q -> %q", id, r.From, r.To))
+		}
+		if id == "q-nul-1" && (r.From != "a\x00b" || r.To != "c") {
+			panic(fmt.Sprintf("%s names rewritten: %q -> %q", id, r.From, r.To))
+		}
+	}
+	// New id on the path that shares the old NUL-flattened identifier with the
+	// historical q-nul-1 ("a\x00b"->"c" and "a"->"b\x00c" used to collide).
+	// It is a different triple, so it must deliver; reusing q-nul-1's exact
+	// triple under any new id must still be a replay.
+	if _, err := q2.Submit(relayproof.Envelope{
+		Message: relayproof.Message{ID: "q-nul-1-again", From: "a\x00b", To: "c", Nonce: 7, ProofAt: 10},
+	}); err != nil {
+		panic(err)
+	}
+	if _, err := q2.Submit(relayproof.Envelope{
+		Message: relayproof.Message{ID: "q-nul-2", From: "a", To: "b\x00c", Nonce: 7, ProofAt: 10},
+	}); err != nil {
+		panic(err)
+	}
+	if _, err := q2.Advance(3000); err != nil {
+		panic(err)
+	}
+	if r, ok := q2.Query("q-nul-2"); !ok || r.Status != relayproof.StatusSuccess {
+		panic(fmt.Sprintf("distinct path sharing old flattened key must deliver: %+v", r))
+	}
+	if r, ok := q2.Query("q-nul-1-again"); !ok || r.Status != relayproof.StatusReplay {
+		panic(fmt.Sprintf("same triple under a new id must still replay: %+v", r))
+	} else if !strings.Contains(r.Reason, "q-nul-1") {
+		panic("replay reason must point at the actual success q-nul-1: " + r.Reason)
+	}
+	fmt.Println("ambiguous-path check: OK")
 }

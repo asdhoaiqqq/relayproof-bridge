@@ -103,7 +103,7 @@ func TestHappyPath(t *testing.T) {
 	if r.Status != StatusSuccess || r.NextRetry != 0 {
 		t.Fatalf("want terminal success without retry, got %+v", r)
 	}
-	if got := q.consumed[nonceKey("a", "b", 1)]; got != "m1" {
+	if got := q.consumed[newConsumeToken("a", "b", 1)]; got != "m1" {
 		t.Fatalf("nonce not consumed by m1: %q", got)
 	}
 }

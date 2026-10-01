@@ -72,21 +72,17 @@ type Query struct {
 	Attempts  int
 }
 
-// Result describes what happened to one message during an Advance.
-type Result struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Reason string `json:"reason"`
-}
-
 // AdvanceReport is the outcome of one Advance call.
 type AdvanceReport struct {
 	Now     int64
 	Results []Result
 }
 
-func nonceKey(from, to string, nonce uint64) string {
-	return from + "\x00" + to + "\x00" + strconv.FormatUint(nonce, 10)
+// Result describes what happened to one message during an Advance.
+type Result struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
 }
 
 // Queue is a durable local outbox backed by a state directory. A single
@@ -101,12 +97,12 @@ type Queue struct {
 	flock  *os.File
 	broken bool // a storage write failed; all further mutations fail
 
-	now      int64              // last advanced Unix-ms time, 0 = never advanced
-	sources  map[string]bool    // registered source chains
-	headers  map[string]Header  // latest registered header per chain
-	records  map[string]*Record // by message id
-	order    []string           // non-terminal messages, submission order
-	consumed map[string]string  // nonce combination -> successful message id
+	now      int64                   // last advanced Unix-ms time, 0 = never advanced
+	sources  map[string]bool         // registered source chains
+	headers  map[string]Header       // latest registered header per chain
+	records  map[string]*Record      // by message id
+	order    []string                // non-terminal messages, submission order
+	consumed map[consumeToken]string // (source, destination, nonce) -> successful message id
 	nextSeq  int64
 }
 
@@ -183,7 +179,7 @@ func (q *Queue) snapshot() *loadedState {
 		sources:  map[string]bool{},
 		headers:  map[string]Header{},
 		records:  map[string]*Record{},
-		consumed: map[string]string{},
+		consumed: map[consumeToken]string{},
 		now:      q.now,
 		nextSeq:  q.nextSeq,
 	}
@@ -439,8 +435,8 @@ func (q *Queue) maybeCompact() error {
 // hold. The bool reports whether the message was terminalized.
 func (q *Queue) checkReplayExpiry(rec *Record, now int64) (Result, bool, error) {
 	id := rec.Msg.Message.ID
-	key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-	if winner, taken := q.consumed[key]; taken && winner != id {
+	token := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+	if winner, taken := q.consumed[token]; taken && winner != id {
 		reason := "nonce combination already consumed by message " + winner
 		if err := q.terminalize(rec, now, StatusReplay, reason); err != nil {
 			return Result{}, false, err
@@ -482,9 +478,9 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 	}
 
 	// Deliver: success record and nonce consumption are one log entry.
-	key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+	token := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
 	reason := "delivered; proof verified by trusted header at height " + strconv.FormatInt(h.Height, 10)
-	if err := q.store.appendResult(now, rec, StatusSuccess, reason, rec.Attempts+1, key, id, true); err != nil {
+	if err := q.store.appendResult(now, rec, StatusSuccess, reason, rec.Attempts+1, &token, id); err != nil {
 		return Result{}, q.fail("deliver", err)
 	}
 	rec.Attempts++
@@ -492,13 +488,13 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 	rec.Status = StatusSuccess
 	rec.Reason = reason
 	rec.NextRetry = 0
-	q.consumed[key] = id
+	q.consumed[token] = id
 	q.removeFromOrder(id)
 	return Result{ID: id, Status: StatusSuccess, Reason: reason}, nil
 }
 
 func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error {
-	if err := q.store.appendResult(now, rec, status, reason, rec.Attempts+1, "", "", false); err != nil {
+	if err := q.store.appendResult(now, rec, status, reason, rec.Attempts+1, nil, ""); err != nil {
 		return q.fail("terminalize", err)
 	}
 	rec.Attempts++
@@ -512,7 +508,7 @@ func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error
 
 func (q *Queue) markWaiting(rec *Record, now int64, reason string) error {
 	attempt := rec.Attempts + 1
-	if err := q.store.appendResult(now, rec, StatusWaiting, reason, attempt, "", "", false); err != nil {
+	if err := q.store.appendResult(now, rec, StatusWaiting, reason, attempt, nil, ""); err != nil {
 		return q.fail("schedule retry", err)
 	}
 	rec.Attempts = attempt

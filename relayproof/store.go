@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 // On-disk format (queue.log):
@@ -22,11 +23,25 @@ import (
 // acknowledged; a success record frames the local success entry and the nonce
 // consumption together, so the two can never take effect separately.
 //
+// A success (result or compacted state) names the consumed triple in three
+// independent fields, consumeFrom/consumeTo/consumeNonce, alongside consumeBy.
+// Chain names are stored verbatim as raw UTF-8 — they may contain ':' or even
+// U+0000 — so the triple is never flattened into one delimiter-joined string,
+// which would let distinct routing paths share one consumption identity.
+//
 // Crash recovery: a frame missing bytes at end of file, or a final frame with
 // a bad checksum, is the torn tail of a write that was never acknowledged and
 // is truncated. Bad checksums or framing anywhere before the end, a foreign
 // header, or an unsupported version reject the directory with ErrCorrupt;
 // state is never silently cleared.
+//
+// Logs written by older builds recorded the consumption as one NUL-joined
+// consumeKey string. Such success entries are still accepted on replay: the
+// key is validated against the record's own (from,to,nonce) and consumeBy,
+// and only the record's own triple is marked consumed. A legacy key that does
+// not match the record it is attached to — a genuinely inconsistent old
+// record — rejects the whole directory with ErrCorrupt instead of silently
+// accepting or "repairing" the bad entry.
 
 const (
 	logName          = "queue.log"
@@ -69,13 +84,31 @@ type logEntry struct {
 	ProofAt   int64  `json:"proofAt,omitempty"`
 	ExpiresAt int64  `json:"expiresAt,omitempty"`
 
-	Now        int64  `json:"now,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	Attempts   int    `json:"attempts,omitempty"`
-	NextRetry  int64  `json:"nextRetry,omitempty"`
+	Now       int64  `json:"now,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Attempts  int    `json:"attempts,omitempty"`
+	NextRetry int64  `json:"nextRetry,omitempty"`
+
+	// Consumed triple of a success entry, stored as three independent values
+	// so routing paths that share a flattened key stay distinct. consumeBy is
+	// the id of the successful message.
+	ConsumeFrom  string `json:"consumeFrom,omitempty"`
+	ConsumeTo    string `json:"consumeTo,omitempty"`
+	ConsumeNonce uint64 `json:"consumeNonce,omitempty"`
+	ConsumeBy    string `json:"consumeBy,omitempty"`
+
+	// ConsumeKey is the legacy (pre-triple) NUL-joined consumption string. It
+	// is accepted only while replaying logs written by older builds and is
+	// never written anymore.
 	ConsumeKey string `json:"consumeKey,omitempty"`
-	ConsumeBy  string `json:"consumeBy,omitempty"`
+}
+
+// legacyNonceKey reproduces the consumption string used by older builds:
+// from NUL to NUL nonce. It exists solely to validate records in pre-existing
+// state directories; new state always uses consumeToken triples.
+func legacyNonceKey(from, to string, nonce uint64) string {
+	return from + "\x00" + to + "\x00" + strconv.FormatUint(nonce, 10)
 }
 
 type store struct {
@@ -93,7 +126,7 @@ type loadedState struct {
 	sources  map[string]bool
 	headers  map[string]Header
 	records  map[string]*Record
-	consumed map[string]string
+	consumed map[consumeToken]string
 	nextSeq  int64
 	now      int64
 }
@@ -222,7 +255,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		sources:  map[string]bool{},
 		headers:  map[string]Header{},
 		records:  map[string]*Record{},
-		consumed: map[string]string{},
+		consumed: map[consumeToken]string{},
 	}
 
 	sawVersion := false
@@ -269,6 +302,52 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		return 0, nil, fmt.Errorf("%w: missing version record", ErrCorrupt)
 	}
 	return int64(pos), state, nil
+}
+
+// entryCarriesConsumption reports whether a non-success entry smuggles any
+// consumption field, which is always corrupt.
+func entryCarriesConsumption(e *logEntry) bool {
+	return e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0 ||
+		e.ConsumeKey != "" || e.ConsumeBy != ""
+}
+
+// acceptConsumption validates the triple consumed by a success result or
+// compacted state entry and records it in s.consumed. The triple must
+// identify the record's own message and be consumed by that message.
+//
+// Logs written by older builds carry the consumption as one NUL-joined
+// consumeKey. Such an entry is accepted only when that legacy key matches the
+// record's own triple; it is the record's own triple that is marked consumed,
+// never the ambiguous flattened string — so two distinct paths that happened
+// to share one old flattened key each consume only themselves. A legacy key
+// that does not match its record is an inconsistent record and rejected.
+func acceptConsumption(s *loadedState, rec *Record, e *logEntry, corrupt func(string, ...any) error) (consumeToken, error) {
+	m := rec.Msg.Message
+	if e.ConsumeBy != e.ID {
+		return consumeToken{}, corrupt("success entry for %q is marked consumed by %q", e.ID, e.ConsumeBy)
+	}
+	token := newConsumeToken(m.From, m.To, m.Nonce)
+	hasTriple := e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0
+	switch {
+	case hasTriple:
+		if e.ConsumeKey != "" {
+			return consumeToken{}, corrupt("success entry for %q carries both a triple and a legacy consume key", e.ID)
+		}
+		if e.ConsumeFrom != m.From || e.ConsumeTo != m.To || e.ConsumeNonce != m.Nonce {
+			return consumeToken{}, corrupt("success entry for %q carries mismatched nonce consumption: %q -> %q nonce %d", e.ID, e.ConsumeFrom, e.ConsumeTo, e.ConsumeNonce)
+		}
+	case e.ConsumeKey != "":
+		if want := legacyNonceKey(m.From, m.To, m.Nonce); e.ConsumeKey != want {
+			return consumeToken{}, corrupt("success entry for %q carries a legacy consume key for a different path", e.ID)
+		}
+	default:
+		return consumeToken{}, corrupt("success entry for %q carries no nonce consumption", e.ID)
+	}
+	if winner, taken := s.consumed[token]; taken {
+		return consumeToken{}, corrupt("nonce %s already consumed by %q while accepting %q", token, winner, e.ID)
+	}
+	s.consumed[token] = e.ID
+	return token, nil
 }
 
 func applyEntry(s *loadedState, e *logEntry) error {
@@ -335,20 +414,18 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
 				return corrupt("waiting result has wrong retry schedule for %q", e.ID)
 			}
+			if entryCarriesConsumption(e) {
+				return corrupt("waiting result for %q carries nonce consumption fields", e.ID)
+			}
 		case StatusSuccess:
-			key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-			if e.ConsumeKey != key || e.ConsumeBy != e.ID {
-				return corrupt("success entry for %q carries mismatched nonce consumption", e.ID)
-			}
-			if winner, taken := s.consumed[key]; taken {
-				return corrupt("nonce %s already consumed by %q while accepting %q", key, winner, e.ID)
-			}
 			if e.NextRetry != 0 {
 				return corrupt("success entry for %q carries retry time", e.ID)
 			}
-			s.consumed[key] = e.ID
+			if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
+				return err
+			}
 		default: // terminal failure kinds
-			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" {
+			if e.NextRetry != 0 || entryCarriesConsumption(e) {
 				return corrupt("terminal entry for %q carries scheduling/consume fields", e.ID)
 			}
 		}
@@ -382,20 +459,18 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
 				return corrupt("state has wrong retry schedule for %q", e.ID)
 			}
+			if entryCarriesConsumption(e) {
+				return corrupt("waiting state for %q carries nonce consumption fields", e.ID)
+			}
 		case StatusSuccess:
-			key := nonceKey(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-			if e.ConsumeKey != key || e.ConsumeBy != e.ID {
-				return corrupt("state for %q carries mismatched nonce consumption", e.ID)
-			}
-			if winner, taken := s.consumed[key]; taken {
-				return corrupt("nonce %s already consumed by %q while loading %q", key, winner, e.ID)
-			}
 			if e.NextRetry != 0 {
 				return corrupt("success state for %q carries retry time", e.ID)
 			}
-			s.consumed[key] = e.ID
+			if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
+				return err
+			}
 		default:
-			if e.NextRetry != 0 || e.ConsumeKey != "" || e.ConsumeBy != "" {
+			if e.NextRetry != 0 || entryCarriesConsumption(e) {
 				return corrupt("terminal state for %q carries scheduling/consume fields", e.ID)
 			}
 		}
@@ -492,10 +567,11 @@ func (s *store) appendSubmit(rec *Record) error {
 	})
 }
 
-// appendResult records one processing outcome. On success the nonce
-// consumption (consumeKey/consumeBy) is part of the same durable record,
-// committing together atomically.
-func (s *store) appendResult(now int64, rec *Record, status, reason string, attempts int, consumeKey, consumeBy string, success bool) error {
+// appendResult records one processing outcome. On success the consumed triple
+// (consumeFrom/consumeTo/consumeNonce) and its consumer are part of the same
+// durable record, committing together atomically. token is nil for every
+// non-success status.
+func (s *store) appendResult(now int64, rec *Record, status, reason string, attempts int, token *consumeToken, consumeBy string) error {
 	e := &logEntry{
 		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
 		Status: status, Reason: reason, Attempts: attempts,
@@ -503,8 +579,13 @@ func (s *store) appendResult(now int64, rec *Record, status, reason string, atte
 	if status == StatusWaiting {
 		e.NextRetry = now + nextRetryDelay(attempts)
 	}
-	if success {
-		e.ConsumeKey = consumeKey
+	if status == StatusSuccess {
+		if token == nil || consumeBy == "" {
+			return fmt.Errorf("internal error: success result for %q missing nonce consumption", rec.Msg.Message.ID)
+		}
+		e.ConsumeFrom = token.from
+		e.ConsumeTo = token.to
+		e.ConsumeNonce = token.nonce
 		e.ConsumeBy = consumeBy
 	}
 	return s.append(e)
@@ -562,7 +643,9 @@ func (s *store) compact(state *loadedState) error {
 				re.NextRetry = rec.NextRetry
 			}
 			if rec.Status == StatusSuccess {
-				re.ConsumeKey = nonceKey(m.From, m.To, m.Nonce)
+				re.ConsumeFrom = m.From
+				re.ConsumeTo = m.To
+				re.ConsumeNonce = m.Nonce
 				re.ConsumeBy = m.ID
 			}
 			entries = append(entries, re)
