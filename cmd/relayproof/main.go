@@ -2,8 +2,12 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/asdhoaiqqq/relayproof-bridge/relayproof"
 )
@@ -18,6 +22,8 @@ func main() {
 		runDemo()
 	case "version":
 		fmt.Println("relayproof 0.1.0")
+	case "normalize":
+		runNormalize()
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -28,7 +34,48 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: relayproof [demo|version|help]")
+	fmt.Println("usage: relayproof [demo|version|normalize|help]")
+	fmt.Println("  normalize  read JSON log events from stdin and write normalized JSON per line to stdout")
+}
+
+func runNormalize() {
+	failed, err := normalizeStream(os.Stdin, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
+// normalizeStream reads JSON log lines from r and writes one normalized JSON
+// result per input line to w. Blank lines produce no output but still count
+// as physical lines. It reports whether any line failed.
+func normalizeStream(r io.Reader, w io.Writer) (bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	enc := json.NewEncoder(w)
+	lineNo := 0
+	failed := false
+	for scanner.Scan() {
+		lineNo++
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		result := relayproof.NormalizeLine(line, lineNo)
+		if !result.OK {
+			failed = true
+		}
+		if err := enc.Encode(result); err != nil {
+			return failed, fmt.Errorf("write error: %v", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return failed, fmt.Errorf("read error: %v", err)
+	}
+	return failed, nil
 }
 
 func runDemo() {
