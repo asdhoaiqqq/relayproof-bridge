@@ -26,6 +26,10 @@ const (
 var (
 	// ErrConflict is returned when an id is reused with different message content.
 	ErrConflict = errors.New("message id conflict: existing record has different content")
+	// ErrHeaderConflict is returned when a trusted header is submitted at the
+	// height of the accepted highest trusted header with a different root. The
+	// accepted trusted header is kept and the queue remains usable.
+	ErrHeaderConflict = errors.New("trusted header conflict: different root at the accepted height")
 	// ErrTerminal is returned when re-submitting a terminal id or attempting to
 	// reactivate it.
 	ErrTerminal = errors.New("message is terminal and cannot be reactivated")
@@ -85,6 +89,16 @@ type Result struct {
 	Reason string `json:"reason"`
 }
 
+// headerState records the headers seen for one chain: the latest header
+// written (any trust level) and the highest trusted header accepted. Proof
+// coverage is determined solely by the highest trusted header — a later
+// untrusted header, even at a greater height, can never lower or invalidate
+// it. The zero value is a chain with no recorded headers.
+type headerState struct {
+	latest  Header
+	trusted *Header
+}
+
 // Queue is a durable local outbox backed by a state directory. A single
 // Queue owns the directory for writes; other processes attempting to Open the
 // same directory fail with ErrLocked. It is safe for concurrent use by
@@ -99,7 +113,7 @@ type Queue struct {
 
 	now      int64                   // last advanced Unix-ms time, 0 = never advanced
 	sources  map[string]bool         // registered source chains
-	headers  map[string]Header       // latest registered header per chain
+	headers  map[string]*headerState // per-chain recorded headers (latest + highest trusted)
 	records  map[string]*Record      // by message id
 	order    []string                // non-terminal messages, submission order
 	consumed map[consumeToken]string // (source, destination, nonce) -> successful message id
@@ -177,7 +191,7 @@ func (q *Queue) reconstructOrder() []string {
 func (q *Queue) snapshot() *loadedState {
 	s := &loadedState{
 		sources:  map[string]bool{},
-		headers:  map[string]Header{},
+		headers:  map[string]*headerState{},
 		records:  map[string]*Record{},
 		consumed: map[consumeToken]string{},
 		now:      q.now,
@@ -187,7 +201,12 @@ func (q *Queue) snapshot() *loadedState {
 		s.sources[c] = true
 	}
 	for c, h := range q.headers {
-		s.headers[c] = h
+		cp := &headerState{latest: h.latest}
+		if h.trusted != nil {
+			t := *h.trusted
+			cp.trusted = &t
+		}
+		s.headers[c] = cp
 	}
 	for id, rec := range q.records {
 		cp := *rec
@@ -256,11 +275,22 @@ func (q *Queue) RegisterSource(chain string) error {
 	return q.maybeCompact()
 }
 
-// UpsertHeader stores the latest known header for a chain. A header with
-// Trusted=false records the chain tip but grants no proof coverage; a later
-// trusted header covering the proof height can unblock waiting messages.
-// Header updates never bypass retry scheduling and never reactivate terminal
-// messages.
+// UpsertHeader records a header for a chain. The latest header is always
+// recorded, but proof coverage is determined solely by the highest trusted
+// header accepted for the chain:
+//
+//   - the first trusted header establishes coverage;
+//   - a higher trusted header advances it;
+//   - a lower trusted header, or an untrusted header of any height, is
+//     recorded but can never lower or invalidate established coverage;
+//   - a trusted header at the current highest trusted height with the same
+//     root is an idempotent no-op;
+//   - a trusted header at that height with a different root is an
+//     ErrHeaderConflict: the accepted trusted header is kept and the queue
+//     remains usable.
+//
+// Header updates never bypass retry scheduling, never process messages, and
+// never reactivate terminal messages.
 func (q *Queue) UpsertHeader(h Header) error {
 	if h.Chain == "" {
 		return fmt.Errorf("%w: empty header chain", ErrInvalidArg)
@@ -273,10 +303,24 @@ func (q *Queue) UpsertHeader(h Header) error {
 	if err := q.checkWritable(); err != nil {
 		return err
 	}
+	hs := q.headers[h.Chain]
+	if hs == nil {
+		hs = &headerState{}
+		q.headers[h.Chain] = hs
+	}
+	if h.Trusted && hs.trusted != nil &&
+		h.Height == hs.trusted.Height && h.Root != hs.trusted.Root {
+		return fmt.Errorf("%w: chain %q height %d: submitted root %q conflicts with accepted root %q",
+			ErrHeaderConflict, h.Chain, h.Height, h.Root, hs.trusted.Root)
+	}
 	if err := q.store.appendHeader(h); err != nil {
 		return q.fail("upsert header", err)
 	}
-	q.headers[h.Chain] = h
+	hs.latest = h
+	if h.Trusted && (hs.trusted == nil || h.Height > hs.trusted.Height) {
+		t := h
+		hs.trusted = &t
+	}
 	return q.maybeCompact()
 }
 
@@ -464,11 +508,11 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 		}
 		return Result{ID: id, Status: StatusUnknownSrc, Reason: reason}, nil
 	}
-	h, hasHeader := q.headers[rec.Msg.Message.From]
-	if !hasHeader || !h.Trusted || h.Height < rec.Msg.Message.ProofAt {
+	hs := q.headers[rec.Msg.Message.From]
+	if hs == nil || hs.trusted == nil || hs.trusted.Height < rec.Msg.Message.ProofAt {
 		cur := int64(0)
-		if hasHeader {
-			cur = h.Height
+		if hs != nil && hs.trusted != nil {
+			cur = hs.trusted.Height
 		}
 		reason := fmt.Sprintf("waiting for trusted header covering height %d (current %d)", rec.Msg.Message.ProofAt, cur)
 		if err := q.markWaiting(rec, now, reason); err != nil {
@@ -477,9 +521,11 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 		return Result{ID: id, Status: StatusWaiting, Reason: reason}, nil
 	}
 
-	// Deliver: success record and nonce consumption are one log entry.
+	// Deliver: success record and nonce consumption are one log entry. The
+	// coverage height is the highest trusted header actually accepted — never
+	// a higher untrusted header.
 	token := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
-	reason := "delivered; proof verified by trusted header at height " + strconv.FormatInt(h.Height, 10)
+	reason := "delivered; proof verified by trusted header at height " + strconv.FormatInt(hs.trusted.Height, 10)
 	if err := q.store.appendResult(now, rec, StatusSuccess, reason, rec.Attempts+1, &token, id); err != nil {
 		return Result{}, q.fail("deliver", err)
 	}

@@ -124,7 +124,7 @@ type store struct {
 // loadedState is the fully replayed (or live) queue state.
 type loadedState struct {
 	sources  map[string]bool
-	headers  map[string]Header
+	headers  map[string]*headerState
 	records  map[string]*Record
 	consumed map[consumeToken]string
 	nextSeq  int64
@@ -253,7 +253,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	pos := len(logMagic)
 	state := &loadedState{
 		sources:  map[string]bool{},
-		headers:  map[string]Header{},
+		headers:  map[string]*headerState{},
 		records:  map[string]*Record{},
 		consumed: map[consumeToken]string{},
 	}
@@ -364,7 +364,22 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if e.Chain == "" || e.Height < 0 {
 			return corrupt("bad header entry: %+v", e)
 		}
-		s.headers[e.Chain] = Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted}
+		// Replay is permissive: historical same-height coverage is never
+		// rejected as a conflict, and recovery relies only on the header
+		// records actually kept in the log. The latest header is the last one
+		// written; the highest trusted header is the max-height trusted one,
+		// with ties going to the later write (matching old overwrite
+		// semantics). Neither is fabricated from lost history.
+		hs := s.headers[e.Chain]
+		if hs == nil {
+			hs = &headerState{}
+			s.headers[e.Chain] = hs
+		}
+		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted}
+		if e.Trusted && (hs.trusted == nil || e.Height >= hs.trusted.Height) {
+			t := hs.latest
+			hs.trusted = &t
+		}
 	case kindSubmit:
 		if e.ID == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
 			return corrupt("bad submit entry: %+v", e)
@@ -616,8 +631,17 @@ func (s *store) compact(state *loadedState) error {
 	}
 	sort.Strings(headerChains)
 	for _, c := range headerChains {
-		h := state.headers[c]
-		entries = append(entries, &logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Root: h.Root, Trusted: h.Trusted})
+		hs := state.headers[c]
+		// Write the highest trusted header first, then the latest header when
+		// it differs. Replay reconstructs latest as the last entry and the
+		// highest trusted as the max-height trusted entry, so this order
+		// restores both exactly.
+		if hs.trusted != nil {
+			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.trusted.Chain, Height: hs.trusted.Height, Root: hs.trusted.Root, Trusted: hs.trusted.Trusted})
+		}
+		if hs.trusted == nil || hs.latest != *hs.trusted {
+			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.latest.Chain, Height: hs.latest.Height, Root: hs.latest.Root, Trusted: hs.latest.Trusted})
+		}
 	}
 
 	seqs := make([]int64, 0, len(state.records))

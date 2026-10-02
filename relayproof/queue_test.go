@@ -862,3 +862,338 @@ func TestValidation(t *testing.T) {
 		t.Fatal("invalid calls mutated state")
 	}
 }
+
+// An untrusted header written after a trusted one must not erase established
+// coverage: a message at or below the trusted height still succeeds, while a
+// message above it keeps waiting.
+func TestUntrustedHigherHeaderDoesNotEraseCoverage(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	// This used to overwrite the only stored header and wipe trusted coverage.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 120, Root: "0x120", Trusted: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	q.Submit(env("m90", "a", "b", 1, 90, 0))
+	q.Submit(env("m110", "a", "b", 2, 110, 0))
+
+	rep, err := q.Advance(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range rep.Results {
+		got[r.ID] = r.Status
+	}
+	if got["m90"] != StatusSuccess {
+		t.Fatalf("m90 (proof 90 <= trusted 100) must succeed despite untrusted 120, got %s", got["m90"])
+	}
+	if got["m110"] != StatusWaiting {
+		t.Fatalf("m110 (proof 110 > trusted 100) must keep waiting, got %s", got["m110"])
+	}
+
+	// The success reason must name the trusted height actually used (100), not
+	// the higher untrusted header (120).
+	r := statusOf(t, q, "m90")
+	if !strings.Contains(r.Reason, "height 100") || strings.Contains(r.Reason, "120") {
+		t.Fatalf("success reason must cite trusted height 100, got %q", r.Reason)
+	}
+
+	// A trusted header high enough finally unblocks m110.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 110, Root: "0x110", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Advance(2000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m110"); r.Status != StatusSuccess {
+		t.Fatalf("m110 should succeed once trusted height reaches 110, got %s (%s)", r.Status, r.Reason)
+	}
+}
+
+// A lower trusted header is recorded but cannot lower established coverage.
+func TestLowerTrustedHeaderDoesNotLowerCoverage(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true})
+	// Lower trusted header: recorded as latest, but coverage stays at 100.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 90, Root: "0x090", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	q.Submit(env("m95", "a", "b", 1, 95, 0))
+	if _, err := q.Advance(1000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m95"); r.Status != StatusSuccess {
+		t.Fatalf("coverage must stay at 100 after a lower trusted header, got %s (%s)", r.Status, r.Reason)
+	}
+}
+
+// Resubmitting a trusted header at the current highest trusted height with the
+// same root is an idempotent no-op that leaves coverage unchanged.
+func TestSameHeightSameRootIdempotent(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true})
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true}); err != nil {
+		t.Fatalf("same height same root must succeed: %v", err)
+	}
+	if q.headers["a"].trusted == nil || q.headers["a"].trusted.Height != 100 ||
+		q.headers["a"].trusted.Root != "0x100" {
+		t.Fatalf("accepted trusted header changed: %+v", q.headers["a"].trusted)
+	}
+
+	// Empty root is still a valid input and compares as a raw string: on a
+	// fresh chain, two trusted headers at the same height with empty roots are
+	// idempotent, not a conflict.
+	q.RegisterSource("b")
+	if err := q.UpsertHeader(Header{Chain: "b", Height: 50, Root: "", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.UpsertHeader(Header{Chain: "b", Height: 50, Root: "", Trusted: true}); err != nil {
+		t.Fatalf("same height same empty root must succeed: %v", err)
+	}
+	if q.headers["b"].trusted == nil || q.headers["b"].trusted.Height != 50 ||
+		q.headers["b"].trusted.Root != "" {
+		t.Fatalf("empty-root trusted header changed: %+v", q.headers["b"].trusted)
+	}
+}
+
+// A trusted header at the current highest trusted height with a different root
+// is a conflict: the accepted trusted header is kept and the queue stays
+// usable.
+func TestSameHeightDifferentRootConflict(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0xaaa", Trusted: true})
+	err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0xbbb", Trusted: true})
+	if !errors.Is(err, ErrHeaderConflict) {
+		t.Fatalf("want ErrHeaderConflict, got %v", err)
+	}
+	// The accepted trusted header is unchanged; the conflicting one was not
+	// recorded as coverage.
+	if q.headers["a"].trusted == nil || q.headers["a"].trusted.Root != "0xaaa" {
+		t.Fatalf("accepted trusted header must be kept, got %+v", q.headers["a"].trusted)
+	}
+	// The queue remains usable: coverage at 100 still works.
+	q.Submit(env("m", "a", "b", 1, 100, 0))
+	if _, err := q.Advance(1000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m"); r.Status != StatusSuccess {
+		t.Fatalf("queue must stay usable after conflict, got %s (%s)", r.Status, r.Reason)
+	}
+	// A higher trusted header still advances coverage.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 110, Root: "0xccc", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if q.headers["a"].trusted.Height != 110 || q.headers["a"].trusted.Root != "0xccc" {
+		t.Fatalf("higher trusted header should advance coverage, got %+v", q.headers["a"].trusted)
+	}
+}
+
+// An untrusted header at the same height as the accepted trusted header is
+// recorded normally and is not a conflict.
+func TestUntrustedSameHeightIsNotConflict(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true})
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x999", Trusted: false}); err != nil {
+		t.Fatalf("untrusted header at trusted height must not conflict: %v", err)
+	}
+	if q.headers["a"].trusted == nil || q.headers["a"].trusted.Root != "0x100" {
+		t.Fatalf("coverage must be unchanged: %+v", q.headers["a"].trusted)
+	}
+}
+
+// Header updates do not process messages, do not add attempts, and do not
+// advance existing retry times.
+func TestHeaderUpdateDoesNotBypassRetryOrProcess(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+	q.Submit(env("m", "a", "b", 1, 100, 0))
+	q.Advance(1000) // waiting, retry 2000
+
+	// A trusted header arrives before the retry is due: no extra attempt, no
+	// earlier retry.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	r := statusOf(t, q, "m")
+	if r.Status != StatusWaiting || r.Attempts != 1 || r.NextRetry != 2000 {
+		t.Fatalf("header update must not process or reschedule: status=%s attempts=%d retry=%d", r.Status, r.Attempts, r.NextRetry)
+	}
+	// The waiting message succeeds at its scheduled retry (2000), not earlier.
+	if _, err := q.Advance(2000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m"); r.Status != StatusSuccess {
+		t.Fatalf("want success at scheduled retry, got %s (%s)", r.Status, r.Reason)
+	}
+}
+
+// A trusted header for an unregistered source chain cannot bypass
+// unknown-source.
+func TestTrustedHeaderForUnregisteredChainNoBypass(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	// No RegisterSource("ghost").
+	q.UpsertHeader(Header{Chain: "ghost", Height: 100, Root: "0x100", Trusted: true})
+	q.Submit(env("m", "ghost", "b", 1, 10, 0))
+	q.Advance(1000)
+	if r := statusOf(t, q, "m"); r.Status != StatusUnknownSrc {
+		t.Fatalf("trusted header must not bypass unknown-source, got %s (%s)", r.Status, r.Reason)
+	}
+}
+
+// Header updates for one chain do not affect another chain.
+func TestHeaderUpdatesPerChainIndependent(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+	q.RegisterSource("b")
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0xa", Trusted: true})
+	q.UpsertHeader(Header{Chain: "b", Height: 50, Root: "0xb", Trusted: true})
+
+	q.Submit(env("ma", "a", "c", 1, 100, 0))
+	q.Submit(env("mb", "b", "c", 2, 100, 0))
+	q.Advance(1000)
+	if r := statusOf(t, q, "ma"); r.Status != StatusSuccess {
+		t.Fatalf("ma should succeed via chain a coverage, got %s", r.Status)
+	}
+	if r := statusOf(t, q, "mb"); r.Status != StatusWaiting {
+		t.Fatalf("mb must wait (chain b coverage 50 < proof 100), got %s", r.Status)
+	}
+}
+
+// The highest trusted header survives close/reopen and log compaction, so
+// coverage is not lost by either.
+func TestHighestTrustedSurvivesReopenAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.RegisterSource("a")
+	q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0x100", Trusted: true})
+	q.UpsertHeader(Header{Chain: "a", Height: 120, Root: "0x120", Trusted: false})
+	q.Close()
+
+	q2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q2.headers["a"].trusted == nil || q2.headers["a"].trusted.Height != 100 {
+		t.Fatalf("trusted coverage lost on reopen: %+v", q2.headers["a"].trusted)
+	}
+	if q2.headers["a"].latest.Height != 120 || q2.headers["a"].latest.Trusted {
+		t.Fatalf("latest header should be the untrusted 120: %+v", q2.headers["a"].latest)
+	}
+	// Coverage still works after reopen.
+	q2.Submit(env("m90", "a", "b", 1, 90, 0))
+	if _, err := q2.Advance(1000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q2, "m90"); r.Status != StatusSuccess {
+		t.Fatalf("coverage lost after reopen: %s (%s)", r.Status, r.Reason)
+	}
+
+	// Compact and reopen again: coverage must survive.
+	if err := q2.store.compact(q2.snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	q2.Close()
+	q3, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q3.Close()
+	if q3.headers["a"].trusted == nil || q3.headers["a"].trusted.Height != 100 {
+		t.Fatalf("trusted coverage lost after compaction: %+v", q3.headers["a"].trusted)
+	}
+	if q3.headers["a"].latest.Height != 120 || q3.headers["a"].latest.Trusted {
+		t.Fatalf("latest header wrong after compaction: %+v", q3.headers["a"].latest)
+	}
+	q3.Submit(env("m95", "a", "b", 2, 95, 0))
+	if _, err := q3.Advance(2000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q3, "m95"); r.Status != StatusSuccess {
+		t.Fatalf("coverage lost after compaction: %s (%s)", r.Status, r.Reason)
+	}
+}
+
+// A terminal message keeps its status and reason after a later header update;
+// the nonce is not consumed again.
+func TestHeaderUpdateDoesNotReactivateTerminal(t *testing.T) {
+	q, _ := openTempQueue(t)
+	defer q.Close()
+	q.RegisterSource("a")
+	q.Submit(env("m", "a", "b", 1, 1000, 3000))
+	q.Advance(1000) // waiting
+	q.Advance(3000) // expired
+	if r := statusOf(t, q, "m"); r.Status != StatusExpired {
+		t.Fatalf("want expired, got %s", r.Status)
+	}
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 1000, Root: "0x1000", Trusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Advance(4000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m"); r.Status != StatusExpired {
+		t.Fatalf("header update reactivated expired message: %s", r.Status)
+	}
+	if len(q.consumed) != 0 {
+		t.Fatalf("nonce consumed by a terminal message: %v", q.consumed)
+	}
+}
+
+// Historically recorded same-height coverage in an old log is not rejected as
+// a conflict; recovery relies only on the header records kept in the log.
+func TestHistoricalSameHeightCoverageNotRejected(t *testing.T) {
+	dir := t.TempDir()
+	// Simulate an old log that recorded two trusted headers at height 100
+	// with different roots (old code overwrote without conflict detection).
+	entries := []*logEntry{
+		{T: kindSource, Chain: "a"},
+		{T: kindHeader, Chain: "a", Height: 100, Root: "0xaaa", Trusted: true},
+		{T: kindHeader, Chain: "a", Height: 100, Root: "0xbbb", Trusted: true},
+		{T: kindSubmit, Seq: 0, ID: "m", From: "a", To: "b", Nonce: 1, ProofAt: 100},
+	}
+	writeLegacyLog(t, dir, entries...)
+
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatalf("old same-height coverage must open directly: %v", err)
+	}
+	defer q.Close()
+	// The later write wins for the accepted trusted header (old semantics).
+	if q.headers["a"].trusted == nil || q.headers["a"].trusted.Root != "0xbbb" {
+		t.Fatalf("historical coverage not reconstructed: %+v", q.headers["a"].trusted)
+	}
+	if q.headers["a"].latest.Root != "0xbbb" {
+		t.Fatalf("latest header should be the last write: %+v", q.headers["a"].latest)
+	}
+	// Coverage still works.
+	if _, err := q.Advance(1000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m"); r.Status != StatusSuccess {
+		t.Fatalf("historical coverage should deliver, got %s (%s)", r.Status, r.Reason)
+	}
+}
