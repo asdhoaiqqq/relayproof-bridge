@@ -16,6 +16,8 @@ func main() {
 	switch command {
 	case "demo":
 		runDemo()
+	case "normalize":
+		runNormalize()
 	case "version":
 		fmt.Println("relayproof 0.1.0")
 	case "help", "-h", "--help":
@@ -28,7 +30,25 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: relayproof [demo|version|help]")
+	fmt.Println("usage: relayproof [demo|normalize|version|help]")
+	fmt.Println()
+	fmt.Println("  demo       run the built-in verification demo (default with no arguments)")
+	fmt.Println("  normalize   read newline-delimited JSON logs from stdin and write")
+	fmt.Println("              normalized event results to stdout, one JSON object per line;")
+	fmt.Println("              exits non-zero when one or more input lines fail")
+	fmt.Println("  version     print the relayproof version")
+	fmt.Println("  help        show this help")
+}
+
+func runNormalize() {
+	failures, err := relayproof.NormalizeReader(os.Stdin, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "normalize: %v\n", err)
+		os.Exit(2)
+	}
+	if failures > 0 {
+		os.Exit(1)
+	}
 }
 
 func runDemo() {
