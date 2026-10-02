@@ -95,6 +95,8 @@ func exitCode(err error) int {
 		return 13
 	case errors.Is(err, relayproof.ErrTerminal):
 		return 14
+	case errors.Is(err, relayproof.ErrHeaderConflict):
+		return 16
 	case errors.Is(err, relayproof.ErrInvalidArg):
 		return 2
 	case errors.Is(err, relayproof.ErrStorage):

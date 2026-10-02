@@ -37,6 +37,10 @@ var (
 	ErrCorrupt = errors.New("state directory is corrupt or uses an unsupported format")
 	// ErrStorage is returned after a storage failure; the queue must be reopened.
 	ErrStorage = errors.New("storage failure; queue must be reopened")
+	// ErrHeaderConflict is returned when a trusted header at the established
+	// coverage height carries a different root. The original trusted header is
+	// kept and the queue remains usable.
+	ErrHeaderConflict = errors.New("trusted header conflict: different root at established coverage height")
 )
 
 // Envelope is a submitted message together with its absolute expiry time.
@@ -99,7 +103,7 @@ type Queue struct {
 
 	now      int64                   // last advanced Unix-ms time, 0 = never advanced
 	sources  map[string]bool         // registered source chains
-	headers  map[string]Header       // latest registered header per chain
+	trusted  map[string]Header       // highest trusted header per chain (proof coverage)
 	records  map[string]*Record      // by message id
 	order    []string                // non-terminal messages, submission order
 	consumed map[consumeToken]string // (source, destination, nonce) -> successful message id
@@ -142,7 +146,7 @@ func Open(stateDir string) (*Queue, error) {
 		store:    st,
 		flock:    lock,
 		sources:  state.sources,
-		headers:  state.headers,
+		trusted:  state.trusted,
 		records:  state.records,
 		consumed: state.consumed,
 		now:      state.now,
@@ -177,7 +181,7 @@ func (q *Queue) reconstructOrder() []string {
 func (q *Queue) snapshot() *loadedState {
 	s := &loadedState{
 		sources:  map[string]bool{},
-		headers:  map[string]Header{},
+		trusted:  map[string]Header{},
 		records:  map[string]*Record{},
 		consumed: map[consumeToken]string{},
 		now:      q.now,
@@ -186,8 +190,8 @@ func (q *Queue) snapshot() *loadedState {
 	for c := range q.sources {
 		s.sources[c] = true
 	}
-	for c, h := range q.headers {
-		s.headers[c] = h
+	for c, h := range q.trusted {
+		s.trusted[c] = h
 	}
 	for id, rec := range q.records {
 		cp := *rec
@@ -256,9 +260,16 @@ func (q *Queue) RegisterSource(chain string) error {
 	return q.maybeCompact()
 }
 
-// UpsertHeader stores the latest known header for a chain. A header with
-// Trusted=false records the chain tip but grants no proof coverage; a later
-// trusted header covering the proof height can unblock waiting messages.
+// UpsertHeader records a header for a chain and folds it into the chain's
+// trusted proof coverage. The first trusted header establishes the coverage;
+// a higher trusted header advances it. Lower trusted headers and untrusted
+// headers of any height are recorded but never lower or invalidate the
+// established coverage, and an untrusted header — however high — can never
+// make a message beyond the trusted height succeed. A trusted header at the
+// exact coverage height must carry the same root (compared as the raw
+// string, empty roots included); a different root is rejected with
+// ErrHeaderConflict, the original trusted header is kept, and the queue
+// remains usable. Chains are tracked independently by their raw names.
 // Header updates never bypass retry scheduling and never reactivate terminal
 // messages.
 func (q *Queue) UpsertHeader(h Header) error {
@@ -273,11 +284,31 @@ func (q *Queue) UpsertHeader(h Header) error {
 	if err := q.checkWritable(); err != nil {
 		return err
 	}
+	if h.Trusted {
+		if cur, ok := q.trusted[h.Chain]; ok && h.Height == cur.Height && h.Root != cur.Root {
+			return fmt.Errorf("%w: chain %q height %d: keeping trusted root %q, rejecting %q",
+				ErrHeaderConflict, h.Chain, h.Height, cur.Root, h.Root)
+		}
+	}
 	if err := q.store.appendHeader(h); err != nil {
 		return q.fail("upsert header", err)
 	}
-	q.headers[h.Chain] = h
+	foldTrustedHeader(q.trusted, h)
 	return q.maybeCompact()
+}
+
+// foldTrustedHeader applies one recorded header to the per-chain trusted
+// coverage: only trusted headers count, and only a higher one advances it.
+// A trusted header at the established height never displaces the existing
+// root — live updates reject a different root before this point, and log
+// replay keeps the first root recorded for that height.
+func foldTrustedHeader(trusted map[string]Header, h Header) {
+	if !h.Trusted {
+		return
+	}
+	if cur, ok := trusted[h.Chain]; !ok || h.Height > cur.Height {
+		trusted[h.Chain] = h
+	}
 }
 
 // Submit enqueues a message with an absolute expiry (Unix milliseconds; zero
@@ -464,10 +495,10 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 		}
 		return Result{ID: id, Status: StatusUnknownSrc, Reason: reason}, nil
 	}
-	h, hasHeader := q.headers[rec.Msg.Message.From]
-	if !hasHeader || !h.Trusted || h.Height < rec.Msg.Message.ProofAt {
+	h, hasTrusted := q.trusted[rec.Msg.Message.From]
+	if !hasTrusted || h.Height < rec.Msg.Message.ProofAt {
 		cur := int64(0)
-		if hasHeader {
+		if hasTrusted {
 			cur = h.Height
 		}
 		reason := fmt.Sprintf("waiting for trusted header covering height %d (current %d)", rec.Msg.Message.ProofAt, cur)

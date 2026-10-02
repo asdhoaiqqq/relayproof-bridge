@@ -124,7 +124,7 @@ type store struct {
 // loadedState is the fully replayed (or live) queue state.
 type loadedState struct {
 	sources  map[string]bool
-	headers  map[string]Header
+	trusted  map[string]Header // highest trusted header per chain (proof coverage)
 	records  map[string]*Record
 	consumed map[consumeToken]string
 	nextSeq  int64
@@ -253,7 +253,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	pos := len(logMagic)
 	state := &loadedState{
 		sources:  map[string]bool{},
-		headers:  map[string]Header{},
+		trusted:  map[string]Header{},
 		records:  map[string]*Record{},
 		consumed: map[consumeToken]string{},
 	}
@@ -364,7 +364,13 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if e.Chain == "" || e.Height < 0 {
 			return corrupt("bad header entry: %+v", e)
 		}
-		s.headers[e.Chain] = Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted}
+		// Fold into the trusted coverage exactly like a live update. Recovery
+		// relies solely on the header records actually present: untrusted
+		// records never grant coverage, and a same-height trusted record never
+		// displaces the first root recorded — historical logs may contain
+		// same-height overwrites written by older builds and must not be
+		// rejected as conflicts.
+		foldTrustedHeader(s.trusted, Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted})
 	case kindSubmit:
 		if e.ID == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
 			return corrupt("bad submit entry: %+v", e)
@@ -610,14 +616,14 @@ func (s *store) compact(state *loadedState) error {
 		entries = append(entries, &logEntry{T: kindSource, Chain: c})
 	}
 
-	headerChains := make([]string, 0, len(state.headers))
-	for c := range state.headers {
+	headerChains := make([]string, 0, len(state.trusted))
+	for c := range state.trusted {
 		headerChains = append(headerChains, c)
 	}
 	sort.Strings(headerChains)
 	for _, c := range headerChains {
-		h := state.headers[c]
-		entries = append(entries, &logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Root: h.Root, Trusted: h.Trusted})
+		h := state.trusted[c]
+		entries = append(entries, &logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Root: h.Root, Trusted: true})
 	}
 
 	seqs := make([]int64, 0, len(state.records))
