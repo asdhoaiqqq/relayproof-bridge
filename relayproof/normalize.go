@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Canonical event field names.
@@ -154,6 +155,9 @@ func NormalizeLine(lineNo int, raw []byte) NormalizeResult {
 }
 
 func normalizeEvent(raw []byte) (*NormalizedEvent, error) {
+	if err := checkCharacterIntegrity(raw); err != nil {
+		return nil, err
+	}
 	object, err := decodeObject(raw)
 	if err != nil {
 		return nil, err
@@ -227,6 +231,113 @@ func normalizeEvent(raw []byte) (*NormalizedEvent, error) {
 		event.Extra = extra
 	}
 	return event, nil
+}
+
+// checkCharacterIntegrity rejects log lines whose characters cannot be
+// represented exactly. The raw bytes must be valid UTF-8, and every \uXXXX
+// escape inside a JSON string — field names and string values at any depth,
+// including unmapped fields and an input's own extra — must denote a Unicode
+// scalar value: a high surrogate escape (D800-DBFF) is only legal immediately
+// followed by a low surrogate escape (DC00-DFFF), and a low surrogate escape
+// never appears on its own. encoding/json silently rewrites both defects to
+// U+FFFD, so decoding without this check would map fields, compare aliases,
+// and preserve extra data built from corrupted text. Nothing is repaired:
+// no bytes are dropped, no escapes are completed, and no replacement
+// characters are substituted — the whole line fails instead. A literal
+// U+FFFD the user actually wrote (as UTF-8 bytes or as a \uFFFD escape) is valid
+// input and passes.
+func checkCharacterIntegrity(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("invalid UTF-8 encoding at byte offset %d", invalidUTF8Offset(raw))
+	}
+	return checkUnicodeEscapes(raw)
+}
+
+// invalidUTF8Offset locates the first byte that cannot start or continue a
+// valid UTF-8 sequence. Callers must only invoke it on input utf8.Valid has
+// already rejected.
+func invalidUTF8Offset(raw []byte) int {
+	for i := 0; i < len(raw); {
+		_, size := utf8.DecodeRune(raw[i:])
+		if size == 1 && raw[i] >= utf8.RuneSelf {
+			return i
+		}
+		i += size
+	}
+	return 0 // unreachable: utf8.Valid reported the input invalid
+}
+
+// checkUnicodeEscapes scans the string literals of a JSON document and
+// rejects unpaired surrogate escapes. Only bytes inside a string are
+// examined; a backslash anywhere else is a JSON syntax error the decoder
+// reports. Escapes other than \u are skipped as two-byte pairs, so an
+// escaped backslash hides nothing: in "\\uD800" the uD800 part is ordinary
+// text, not an escape, and stays untouched. A \u escape that is truncated or
+// carries non-hex digits is left for the decoder, which rejects the line as
+// invalid JSON.
+func checkUnicodeEscapes(raw []byte) error {
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		if c == '"' {
+			inString = false
+			continue
+		}
+		if c != '\\' {
+			continue
+		}
+		if i+1 >= len(raw) || raw[i+1] != 'u' {
+			i++ // two-byte escape (\\, \", \n, ...); a trailing lone backslash is the decoder's error
+			continue
+		}
+		if i+6 > len(raw) {
+			continue // truncated \u escape: invalid JSON, reported by the decoder
+		}
+		code, ok := hex4(raw[i+2 : i+6])
+		if !ok {
+			continue // malformed \u escape: invalid JSON, reported by the decoder
+		}
+		switch {
+		case code >= 0xD800 && code <= 0xDBFF:
+			if i+12 <= len(raw) && raw[i+6] == '\\' && raw[i+7] == 'u' {
+				if low, ok := hex4(raw[i+8 : i+12]); ok && low >= 0xDC00 && low <= 0xDFFF {
+					i += 11 // consume the whole surrogate pair
+					continue
+				}
+			}
+			return fmt.Errorf("unpaired Unicode escape \\u%04X at byte offset %d: high surrogate must be followed immediately by a low surrogate escape", code, i)
+		case code >= 0xDC00 && code <= 0xDFFF:
+			return fmt.Errorf("unpaired Unicode escape \\u%04X at byte offset %d: low surrogate must follow a high surrogate escape", code, i)
+		default:
+			i += 5 // consume \uXXXX
+		}
+	}
+	return nil
+}
+
+// hex4 parses exactly four hexadecimal digits.
+func hex4(b []byte) (int, bool) {
+	v := 0
+	for _, c := range b {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v |= int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v |= int(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 // decodeObject parses one JSON object and rejects duplicate top-level keys,

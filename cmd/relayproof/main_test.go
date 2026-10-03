@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // escKey renders key as a JSON member name spelled entirely with unicode
@@ -337,6 +338,71 @@ func TestNormalizeCLIReadErrorExitsTwo(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(result.stderr), "read") {
 		t.Fatalf("the diagnostic must identify a read failure, got %q", result.stderr)
+	}
+}
+
+// A log line with corrupted characters — invalid UTF-8 bytes or an unpaired
+// \uXXXX surrogate escape anywhere in the object, including deep inside
+// unmapped fields — is an ordinary per-line failure: one ok:false record with
+// the physical line number and a reason that distinguishes the two defects,
+// no event, valid lines around it still processed in order, exit status 1,
+// and stderr empty. The failure records themselves must be valid UTF-8 JSON:
+// corrupted input bytes are never echoed back into the output.
+func TestNormalizeCLICorruptedCharactersExitOne(t *testing.T) {
+	input := []byte(`{"timestamp":"2026-01-02T00:00:00Z","action":"first"}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"bad` + "\xff\xfe" + `"}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"ok","extra":{"deep":["` + "\\uD800" + `"]}}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:02Z","action":"last"}` + "\n")
+
+	result := runNormalizeCLI(t, bytes.NewReader(input))
+
+	if result.exitCode != 1 {
+		t.Fatalf("corrupted log lines must set exit status 1, got %d (stderr: %q)", result.exitCode, result.stderr)
+	}
+	if result.stderr != "" {
+		t.Fatalf("per-line failures belong in result records, not stderr, got %q", result.stderr)
+	}
+	if !utf8.ValidString(result.stdout) {
+		t.Fatalf("stdout must be valid UTF-8 even for corrupted input, got %q", result.stdout)
+	}
+
+	results := decodeStdoutResults(t, result.stdout)
+	if len(results) != 4 {
+		t.Fatalf("processing must continue past corrupted lines; expected 4 results, got %#v", results)
+	}
+	if results[0]["line"] != float64(1) || results[0]["ok"] != true {
+		t.Fatalf("the leading valid log must succeed on line 1: %#v", results[0])
+	}
+
+	badUTF8 := results[1]
+	if badUTF8["line"] != float64(2) || badUTF8["ok"] != false {
+		t.Fatalf("the invalid-UTF-8 log must fail as line 2: %#v", badUTF8)
+	}
+	if _, exists := badUTF8["event"]; exists {
+		t.Fatalf("a corrupted line must not carry an event: %#v", badUTF8)
+	}
+	msg, _ := badUTF8["error"].(string)
+	if !strings.Contains(msg, "UTF-8") {
+		t.Fatalf("invalid bytes must be reported as UTF-8 corruption, got %q", msg)
+	}
+
+	badEscape := results[2]
+	if badEscape["line"] != float64(3) || badEscape["ok"] != false {
+		t.Fatalf("the unpaired-escape log must fail as line 3: %#v", badEscape)
+	}
+	if _, exists := badEscape["event"]; exists {
+		t.Fatalf("a corrupted line must not carry an event: %#v", badEscape)
+	}
+	msg, _ = badEscape["error"].(string)
+	if !strings.Contains(msg, "surrogate") {
+		t.Fatalf("an unpaired escape deep in extra must be reported as a surrogate problem, got %q", msg)
+	}
+
+	if results[3]["line"] != float64(4) || results[3]["ok"] != true {
+		t.Fatalf("the trailing valid log must still succeed on line 4: %#v", results[3])
+	}
+	if eventOf(t, results[3])["action"] != "last" {
+		t.Fatalf("line 4 event content mismatch: %#v", results[3])
 	}
 }
 
