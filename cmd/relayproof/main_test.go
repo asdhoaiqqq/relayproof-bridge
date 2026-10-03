@@ -11,13 +11,30 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
+
+// escKey renders key as a JSON member name spelled entirely with unicode
+// escapes (with UTF-16 surrogate pairs above the BMP), so tests can feed a
+// \uXXXX-encoded key without embedding escape text in the source.
+func escKey(key string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range key {
+		for _, u := range utf16.Encode([]rune{r}) {
+			fmt.Fprintf(&b, "\\u%04x", u)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
 
 // normalizeBin is the compiled relayproof binary shared by all tests in
 // this package, built once from the current sources.
@@ -320,5 +337,74 @@ func TestNormalizeCLIReadErrorExitsTwo(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(result.stderr), "read") {
 		t.Fatalf("the diagnostic must identify a read failure, got %q", result.stderr)
+	}
+}
+
+// A duplicate top-level key written with a unicode escape is the same failure
+// as a literal repeated key. With one such line between legal logs (and a
+// blank line shifting physical numbers), the CLI must emit per-line JSON
+// results in order, keep the failure's line number with no event and a reason
+// that names the field, and still exit 1: trailing valid lines never reset
+// the status. An escape-only spelling of a standard field is a normal event.
+func TestNormalizeCLIEscapedDuplicateKeyExitsOne(t *testing.T) {
+	dup := `{"timestamp":"2026-01-02T00:00:00Z","action":"first",` + escKey("action") + `:"second"}`
+	escapedOnly := `{` + escKey("timestamp") + `:"2026-01-02T08:04:05+08:00",` + escKey("action") + `:"ok"}`
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"first"}` + "\n" +
+		dup + "\n" +
+		"  \n" +
+		`{"timestamp":"2026-01-02T00:00:02Z","action":"last"}` + "\n" +
+		escapedOnly
+
+	result := runNormalizeCLI(t, strings.NewReader(input))
+
+	if result.exitCode != 1 {
+		t.Fatalf("a duplicate-key line must set exit status 1 even with later valid logs, got %d (stderr: %q)",
+			result.exitCode, result.stderr)
+	}
+	if result.stderr != "" {
+		t.Fatalf("per-line failures belong in result records, not stderr, got %q", result.stderr)
+	}
+
+	results := decodeStdoutResults(t, result.stdout)
+	if len(results) != 4 {
+		t.Fatalf("blank lines produce no output; expected 4 results, got %#v", results)
+	}
+	if results[0]["line"] != float64(1) || results[0]["ok"] != true {
+		t.Fatalf("leading valid log must succeed on line 1: %#v", results[0])
+	}
+	if eventOf(t, results[0])["action"] != "first" {
+		t.Fatalf("line 1 event content mismatch: %#v", results[0])
+	}
+
+	bad := results[1]
+	if bad["line"] != float64(2) || bad["ok"] != false {
+		t.Fatalf("the escaped duplicate key must fail as line 2: %#v", bad)
+	}
+	if _, exists := bad["event"]; exists {
+		t.Fatalf("a failed line must not carry an event: %#v", bad)
+	}
+	message, ok := bad["error"].(string)
+	if !ok || message == "" {
+		t.Fatalf("the failed line must explain itself: %#v", bad)
+	}
+	if !strings.Contains(strings.ToLower(message), "duplicate") || !strings.Contains(message, "action") {
+		t.Fatalf("error must identify the duplicate action field, got %q", message)
+	}
+	if strings.Contains(strings.ToLower(message), "conflict") {
+		t.Fatalf("a decoded duplicate key must not be reported as an action conflict: %q", message)
+	}
+
+	if results[2]["line"] != float64(4) || results[2]["ok"] != true {
+		t.Fatalf("the valid log after the blank line must succeed as line 4: %#v", results[2])
+	}
+	if eventOf(t, results[2])["action"] != "last" {
+		t.Fatalf("line 4 event content must survive in order: %#v", results[2])
+	}
+
+	if results[3]["line"] != float64(5) || results[3]["ok"] != true {
+		t.Fatalf("an escape-only standard field spelling must succeed as line 5: %#v", results[3])
+	}
+	if eventOf(t, results[3])["timestamp"] != "2026-01-02T00:04:05Z" {
+		t.Fatalf("escaped-only names must normalize like literal names: %#v", results[3])
 	}
 }
