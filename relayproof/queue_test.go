@@ -570,9 +570,73 @@ func TestCorruptionRejected(t *testing.T) {
 	}
 }
 
+// A pre-existing log whose first record — the version record — is incomplete
+// or fails its checksum is unidentifiable data, not an empty queue with a
+// torn tail. It must reject the open with ErrCorrupt and leave every byte
+// untouched, never truncating into a fresh log that would accept new records
+// in front of a missing version record.
+func TestIncompleteVersionRecordRejected(t *testing.T) {
+	versionFrame := encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))
+
+	badCRCFrame := append([]byte(nil), versionFrame...)
+	badCRCFrame[len(badCRCFrame)-1] ^= 0xFF
+
+	cases := map[string][]byte{
+		"magic only":                 []byte(logMagic),
+		"one length byte":            append([]byte(logMagic), versionFrame[0]),
+		"three length bytes":         append([]byte(logMagic), versionFrame[:3]...),
+		"length only, body missing":  append([]byte(logMagic), versionFrame[:frameHeaderSize]...),
+		"partial body":               append([]byte(logMagic), versionFrame[:len(versionFrame)-frameCRCsSize-1]...),
+		"body complete, crc missing": append([]byte(logMagic), versionFrame[:len(versionFrame)-2]...),
+		"version record bad crc":     append([]byte(logMagic), badCRCFrame...),
+		"first record not a version": append([]byte(logMagic), encodeFrame(mustMarshal(&logEntry{T: kindSource, Chain: "a"}))...),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, logName)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			q, err := Open(dir)
+			if !errors.Is(err, ErrCorrupt) {
+				if q != nil {
+					q.Close()
+				}
+				t.Fatalf("want ErrCorrupt, got %v", err)
+			}
+			if q != nil {
+				t.Fatalf("no usable queue may be returned for an unidentifiable log")
+			}
+			// The original log must be preserved byte for byte: no truncation,
+			// no clearing, no appended records.
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(data) {
+				t.Fatalf("log was modified on failed open: %d -> %d bytes", len(data), len(got))
+			}
+			for i := range data {
+				if got[i] != data[i] {
+					t.Fatalf("log byte %d changed on failed open", i)
+				}
+			}
+			// A second open must fail the same way: nothing was repaired or
+			// replaced behind the user's back.
+			q2, err := Open(dir)
+			if !errors.Is(err, ErrCorrupt) {
+				if q2 != nil {
+					q2.Close()
+				}
+				t.Fatalf("second open must also fail with ErrCorrupt, got %v", err)
+			}
+		})
+	}
+}
+
 // Corruption before the final frame is fatal; a torn final frame is truncated.
-func TestMidLogCorruptionAndTornTail(t *testing.T) {
-	dir := t.TempDir()
+func TestMidLogCorruptionAndTornTail(t *testing.T) {	dir := t.TempDir()
 	q, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -603,6 +667,24 @@ func TestMidLogCorruptionAndTornTail(t *testing.T) {
 		t.Fatalf("partial m2 frame must be dropped")
 	}
 	qt.Close()
+
+	// Final frame complete but failing its checksum: the unacknowledged last
+	// record is dropped, everything before it survives, and the queue opens.
+	badTail := append([]byte(nil), raw...)
+	badTail[len(badTail)-1] ^= 0xFF
+	badTailDir := t.TempDir()
+	os.WriteFile(filepath.Join(badTailDir, logName), badTail, 0o600)
+	qb, err := Open(badTailDir)
+	if err != nil {
+		t.Fatalf("bad-checksum final frame should truncate and open: %v", err)
+	}
+	if _, ok := qb.Query("m1"); !ok {
+		t.Fatalf("m1 should survive bad-final-frame recovery")
+	}
+	if _, ok := qb.Query("m2"); ok {
+		t.Fatalf("checksummed-bad m2 frame must be dropped")
+	}
+	qb.Close()
 
 	// Flip a byte inside the middle frame (m1 body): checksum mismatch that is
 	// not at EOF must be fatal.

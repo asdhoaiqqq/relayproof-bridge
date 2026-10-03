@@ -35,6 +35,14 @@ import (
 // header, or an unsupported version reject the directory with ErrCorrupt;
 // state is never silently cleared.
 //
+// The torn-tail allowance only applies once a complete, valid, supported
+// version record has been replayed: it is what makes the log a recoverable
+// queue log at all. A pre-existing log whose first record is incomplete or
+// fails its checksum is not an empty queue with a torn tail — it is
+// unidentifiable data and rejects the directory with ErrCorrupt, leaving
+// every byte untouched, rather than being truncated into a fresh log that
+// would silently accept new records in front of a missing version record.
+//
 // Logs written by older builds recorded the consumption as one NUL-joined
 // consumeKey string. Such success entries are still accepted on replay: the
 // key is validated against the record's own (from,to,nonce) and consumeBy,
@@ -262,6 +270,12 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	for pos < len(raw) {
 		// Need at least the length header.
 		if len(raw)-pos < frameHeaderSize {
+			if !sawVersion {
+				// The version record itself is incomplete: this pre-existing
+				// log cannot be identified and must not be truncated into an
+				// empty queue.
+				return 0, nil, fmt.Errorf("%w: incomplete version record at offset %d", ErrCorrupt, pos)
+			}
 			return int64(pos), state, nil // torn length header of an unacked write
 		}
 		n := int(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
@@ -271,12 +285,18 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		bodyStart := pos + frameHeaderSize
 		frameEnd := bodyStart + n + frameCRCsSize
 		if frameEnd > len(raw) {
+			if !sawVersion {
+				return 0, nil, fmt.Errorf("%w: incomplete version record at offset %d", ErrCorrupt, pos)
+			}
 			return int64(pos), state, nil // torn body/CRC of an unacked write
 		}
 		payload := raw[bodyStart : bodyStart+n]
 		wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
 		if crc32.Checksum(payload, crcTable) != wantCRC {
 			if frameEnd == len(raw) {
+				if !sawVersion {
+					return 0, nil, fmt.Errorf("%w: version record checksum mismatch at offset %d", ErrCorrupt, pos)
+				}
 				// Torn sectors of the final, unacknowledged frame.
 				return int64(pos), state, nil
 			}
