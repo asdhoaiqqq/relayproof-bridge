@@ -234,7 +234,14 @@ func normalizeFieldValue(canonical string, raw json.RawMessage) (string, error) 
 		if err != nil {
 			return "", fmt.Errorf("field %q: invalid RFC3339 timestamp: %v", canonical, err)
 		}
-		return t.UTC().Format(time.RFC3339Nano), nil
+		utc := t.UTC()
+		// The input year is four digits, but applying the offset can push the
+		// UTC instant before year 0000 or past year 9999, which RFC3339Nano
+		// cannot represent (it would emit a negative or five-digit year).
+		if year := utc.Year(); year < 0 || year > 9999 {
+			return "", fmt.Errorf("field %q: UTC year %d out of range (0000-9999) after timezone offset conversion", canonical, year)
+		}
+		return utc.Format(time.RFC3339Nano), nil
 	case FieldAction:
 		value := strings.TrimSpace(s)
 		if value == "" {
