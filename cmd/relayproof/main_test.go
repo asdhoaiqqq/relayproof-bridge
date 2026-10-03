@@ -231,6 +231,71 @@ func TestNormalizeCLIInvalidLineBetweenValidOnesExitsOne(t *testing.T) {
 	}
 }
 
+// Duplicate-key detection on the command line: a line whose repeated key is
+// hidden behind a JSON unicode escape ("act" + esc for U+0069 + "on"
+// decodes to "action") must be reported per line as a duplicate, surrounded
+// by legal logs that still succeed in order; a blank line only moves the
+// physical line counter. The process must end with status 1 and must not
+// recover to 0 because later logs succeed.
+func TestNormalizeCLIEscapedDuplicateKeyBetweenValidOnesExitsOne(t *testing.T) {
+	// escAction is a literal JSON unicode escape assembled from pieces so
+	// the complete escape sequence never appears in this source.
+	escAction := "act" + `\` + "u0069on"
+	dupLine := `{"timestamp":"2026-01-02T00:00:00Z","action":"dup","` + escAction + `":"dup"}`
+
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"first"}` + "\n" +
+		dupLine + "\n" +
+		"\n" +
+		`{"timestamp":"2026-01-02T00:00:02Z","action":"last"}` + "\n"
+
+	result := runNormalizeCLI(t, strings.NewReader(input))
+
+	if result.exitCode != 1 {
+		t.Fatalf("one duplicate-key log must set exit status 1 even with later successes, got %d (stderr: %q)",
+			result.exitCode, result.stderr)
+	}
+	if result.stderr != "" {
+		t.Fatalf("per-line failures belong in result records, not stderr, got %q", result.stderr)
+	}
+
+	results := decodeStdoutResults(t, result.stdout)
+	if len(results) != 3 {
+		t.Fatalf("processing must continue past the duplicate; expected 3 results, got %#v", results)
+	}
+
+	if results[0]["line"] != float64(1) || results[0]["ok"] != true {
+		t.Fatalf("the leading valid log must succeed on line 1: %#v", results[0])
+	}
+	if eventOf(t, results[0])["action"] != "first" {
+		t.Fatalf("line 1 event content mismatch: %#v", results[0])
+	}
+
+	bad := results[1]
+	if bad["line"] != float64(2) || bad["ok"] != false {
+		t.Fatalf("the escaped duplicate must be reported as line 2 with ok=false: %#v", bad)
+	}
+	if _, exists := bad["event"]; exists {
+		t.Fatalf("a duplicate-key line must not carry an event: %#v", bad)
+	}
+	message, ok := bad["error"].(string)
+	if !ok || message == "" {
+		t.Fatalf("the duplicate line must explain itself in error: %#v", bad)
+	}
+	if !strings.Contains(strings.ToLower(message), "duplicate") {
+		t.Fatalf("the error must identify a duplicate field, got %q", message)
+	}
+	if !strings.Contains(message, `"action"`) {
+		t.Fatalf("the error must name the decoded field action despite the escaped spelling, got %q", message)
+	}
+
+	if results[2]["line"] != float64(4) || results[2]["ok"] != true {
+		t.Fatalf("the blank line must only advance numbering; line 4 must succeed: %#v", results[2])
+	}
+	if eventOf(t, results[2])["action"] != "last" {
+		t.Fatalf("input order must be preserved after the duplicate: %#v", results[2])
+	}
+}
+
 // Blank lines produce no results but still consume physical line numbers,
 // and a final complete log without a trailing newline is processed like any
 // other. The run is clean, so the exit status is 0 and stderr stays empty.
