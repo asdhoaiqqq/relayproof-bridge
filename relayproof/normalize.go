@@ -75,7 +75,12 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	lineNo := 0
 	for {
 		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		// A fragment returned together with a non-EOF read fault is
+		// unresolved input, not a final line: it must not be normalized,
+		// counted, or renumbered, and the fault itself is never reported as
+		// an extra per-line failure. At clean EOF the unterminated final
+		// line is still a complete log and is processed below.
+		if len(line) > 0 && (readErr == nil || errors.Is(readErr, io.EOF)) {
 			lineNo++
 			if strings.TrimSpace(string(line)) != "" {
 				result := NormalizeLine(lineNo, line)
