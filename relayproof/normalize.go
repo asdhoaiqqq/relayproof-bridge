@@ -144,10 +144,21 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	}
 }
 
+// jsonSeparatorSpace is the complete set of whitespace JSON allows around
+// a document: space, horizontal tab, carriage return, and line feed. Only
+// these bytes may be stripped from the edges of a log line before parsing.
+// Any other whitespace-like character there — a vertical tab, form feed,
+// no-break space, or similar, alone or mixed between legal separators — is
+// not legal JSON separation, so it must reach the decoder and fail the
+// line as invalid JSON rather than being silently trimmed away. Whitespace
+// inside the JSON document itself (string contents, escapes) is untouched
+// by this and remains governed by the JSON grammar.
+const jsonSeparatorSpace = " \t\r\n"
+
 // NormalizeLine normalizes a single raw JSON log line. The line number is
 // echoed unchanged in the result.
 func NormalizeLine(lineNo int, raw []byte) NormalizeResult {
-	event, err := normalizeEvent(bytes.TrimSpace(raw))
+	event, err := normalizeEvent(bytes.Trim(raw, jsonSeparatorSpace))
 	if err != nil {
 		return NormalizeResult{Line: lineNo, OK: false, Error: err.Error()}
 	}
