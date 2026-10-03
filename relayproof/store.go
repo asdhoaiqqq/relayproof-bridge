@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -478,9 +479,13 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		}
 		switch e.Status {
 		case StatusWaiting:
-			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
+			scheduled, ok := validWaitingSchedule(e.Now, e.Attempts, e.NextRetry)
+			if !ok {
 				return corrupt("waiting result has wrong retry schedule for %q", e.ID)
 			}
+			// Repair a legacy overflowed (negative) retry to the ceiling in
+			// memory; the next compaction writes the repaired value back.
+			e.NextRetry = scheduled
 			if entryCarriesConsumption(e) {
 				return corrupt("waiting result for %q carries nonce consumption fields", e.ID)
 			}
@@ -523,9 +528,11 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		}
 		switch e.Status {
 		case StatusWaiting:
-			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
-				return corrupt("state has wrong retry schedule for %q", e.ID)
+			scheduled, ok := validWaitingSchedule(e.Now, e.Attempts, e.NextRetry)
+			if !ok {
+				return corrupt("waiting state has wrong retry schedule for %q", e.ID)
 			}
+			e.NextRetry = scheduled
 			if entryCarriesConsumption(e) {
 				return corrupt("waiting state for %q carries nonce consumption fields", e.ID)
 			}
@@ -566,6 +573,31 @@ func validStatus(s string) bool {
 		return true
 	}
 	return false
+}
+
+// validWaitingSchedule validates the retry instant recorded on a waiting
+// result or compacted-state entry against the processing time and attempt
+// number. The canonical schedule is nextRetryAt(now, attempts): now plus the
+// backoff delay, saturated at math.MaxInt64 when it would overflow.
+//
+// Logs written by older builds contain the raw now+delay even near the
+// ceiling, where the addition wrapped around to a value below now (typically
+// negative). That exact wrapped value is the only non-canonical schedule
+// accepted: it proves the entry came from the old scheduler rather than from
+// arbitrary corruption, and it is repaired in memory to the saturated
+// ceiling, which the next compaction persists. Any other retry time — zero,
+// an arbitrary instant, or a value before the processing time that is not the
+// exact legacy overflow — is rejected as corrupt.
+func validWaitingSchedule(now int64, attempts int, stored int64) (int64, bool) {
+	canonical := nextRetryAt(now, attempts)
+	if stored == canonical {
+		return stored, true
+	}
+	wrapped := now + nextRetryDelay(attempts)
+	if wrapped < now && stored == wrapped {
+		return math.MaxInt64, true
+	}
+	return 0, false
 }
 
 func (s *store) close() error {
@@ -643,9 +675,6 @@ func (s *store) appendResult(now int64, rec *Record, status, reason string, atte
 		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
 		Status: status, Reason: reason, Attempts: attempts,
 	}
-	if status == StatusWaiting {
-		e.NextRetry = now + nextRetryDelay(attempts)
-	}
 	if status == StatusSuccess {
 		if token == nil || consumeBy == "" {
 			return fmt.Errorf("internal error: success result for %q missing nonce consumption", rec.Msg.Message.ID)
@@ -656,6 +685,16 @@ func (s *store) appendResult(now int64, rec *Record, status, reason string, atte
 		e.ConsumeBy = consumeBy
 	}
 	return s.append(e)
+}
+
+// appendWaiting records a waiting outcome with a retry instant the queue
+// layer already computed and saturated, so the log never carries an overflowed
+// negative schedule.
+func (s *store) appendWaiting(now int64, rec *Record, reason string, attempts int, nextRetry int64) error {
+	return s.append(&logEntry{
+		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
+		Status: StatusWaiting, Reason: reason, Attempts: attempts, NextRetry: nextRetry,
+	})
 }
 
 func (s *store) appendAdvance(now int64) error {

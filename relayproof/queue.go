@@ -4,6 +4,7 @@ package relayproof
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,10 @@ import (
 	"sync"
 	"syscall"
 )
+
+// maxProcessTime is the largest legal processing time: non-negative int64
+// Unix milliseconds, up to the int64 ceiling.
+const maxProcessTime = math.MaxInt64
 
 // Durable queue statuses. Pending and waiting are live; the rest are terminal.
 const (
@@ -398,6 +403,16 @@ func (q *Queue) Submit(env Envelope) (*Record, error) {
 // do not consume the nonce. Waiting retry intervals are 1,2,4,... seconds,
 // doubling to a 60-second cap, measured from the actual processing time;
 // jumping over several intervals still costs one attempt.
+//
+// The retry instant saturates at the int64 ceiling: a waiting message whose
+// computed retry would overflow is scheduled for math.MaxInt64 instead, never
+// a negative, zero or earlier-than-processing instant. Once such a message has
+// been processed at the ceiling, every later advance is at the same instant,
+// so it is never due again and keeps its waiting status, reason, attempt
+// count and ceiling retry time; it is neither reprocessed nor reported again
+// as a waiting result. Replay and expiry checks, which run independently of
+// the retry schedule, still apply to it, and a header update alone never
+// delivers it.
 func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 	if nowMs < 0 {
 		return nil, fmt.Errorf("%w: negative processing time", ErrInvalidArg)
@@ -419,7 +434,7 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 		if rec == nil || isTerminal(rec.Status) {
 			continue
 		}
-		due := rec.Attempts == 0 || nowMs >= rec.NextRetry
+		due := rec.Attempts == 0 || retryDue(rec, nowMs)
 		if !due {
 			continue
 		}
@@ -554,15 +569,32 @@ func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error
 
 func (q *Queue) markWaiting(rec *Record, now int64, reason string) error {
 	attempt := rec.Attempts + 1
-	if err := q.store.appendResult(now, rec, StatusWaiting, reason, attempt, nil, ""); err != nil {
+	nextRetry := nextRetryAt(now, attempt)
+	if err := q.store.appendWaiting(now, rec, reason, attempt, nextRetry); err != nil {
 		return q.fail("schedule retry", err)
 	}
 	rec.Attempts = attempt
 	rec.LastProcAt = now
 	rec.Status = StatusWaiting
 	rec.Reason = reason
-	rec.NextRetry = now + nextRetryDelay(attempt)
+	rec.NextRetry = nextRetry
 	return nil
+}
+
+// retryDue reports whether a waiting record's next retry is reached at now.
+// Backoff delays are always positive, so every representable retry lies
+// strictly after the processing time that scheduled it; a waiting message is
+// therefore evaluated at most once per distinct processing time. The only
+// instant where the retry cannot lie later is the int64 ceiling: there the
+// schedule saturates to the ceiling itself. Once the message was processed at
+// the ceiling, every legal advance is at the same instant, so the retry can
+// never be reached "later" — treating equal time as due would reprocess the
+// message on every advance, inflate attempts and re-report waiting forever.
+func retryDue(rec *Record, now int64) bool {
+	if now < rec.NextRetry {
+		return false
+	}
+	return now != rec.LastProcAt
 }
 
 func (q *Queue) removeFromOrder(id string) {
@@ -572,6 +604,19 @@ func (q *Queue) removeFromOrder(id string) {
 			return
 		}
 	}
+}
+
+// nextRetryAt returns the retry instant after the attempt-th processing at
+// now: now plus the backoff delay, saturated at math.MaxInt64. Saturation
+// keeps the scheduled retry non-negative, never zero (when processed at a
+// positive time) and never earlier than the processing time; when the true
+// retry overflows int64 the ceiling is the nearest representable instant.
+func nextRetryAt(now int64, attempt int) int64 {
+	delay := nextRetryDelay(attempt)
+	if now > maxProcessTime-delay {
+		return maxProcessTime // now+delay would overflow; delay is at most 60000
+	}
+	return now + delay
 }
 
 // nextRetryDelay is the backoff after the attempt-th processing (1-based):
