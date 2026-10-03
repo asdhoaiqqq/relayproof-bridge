@@ -31,9 +31,17 @@ import (
 //
 // Crash recovery: a frame missing bytes at end of file, or a final frame with
 // a bad checksum, is the torn tail of a write that was never acknowledged and
-// is truncated. Bad checksums or framing anywhere before the end, a foreign
-// header, or an unsupported version reject the directory with ErrCorrupt;
-// state is never silently cleared.
+// is truncated. That recovery is only available once the log's leading
+// version record has itself been read whole and verified: the magic alone
+// never establishes a usable version, so a log whose very first record is
+// partial (only some length bytes, or the length without the body and CRC),
+// complete but checksum-bad, not a version record, or names an unsupported
+// version is rejected wholesale with ErrCorrupt and left byte-for-byte
+// untouched — it can never be truncated down to an empty-looking log that a
+// later append would turn into a headerless one. Bad checksums or framing
+// anywhere before the end, a foreign header, or an unsupported version
+// likewise reject the directory with ErrCorrupt; state is never silently
+// cleared.
 //
 // Logs written by older builds recorded the consumption as one NUL-joined
 // consumeKey string. Such success entries are still accepted on replay: the
@@ -250,7 +258,6 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	if !bytes.HasPrefix(raw, []byte(logMagic)) {
 		return 0, nil, fmt.Errorf("%w: missing %s header", ErrCorrupt, logMagic)
 	}
-	pos := len(logMagic)
 	state := &loadedState{
 		sources:  map[string]bool{},
 		headers:  map[string]*headerState{},
@@ -258,7 +265,18 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		consumed: map[consumeToken]string{},
 	}
 
-	sawVersion := false
+	// The leading version record is the precondition for every later recovery
+	// decision: nothing after the magic can be replayed or treated as a
+	// truncatable tail until it has been read complete, checksummed and
+	// confirmed to be a supported version. Validate it on its own so a torn or
+	// bad first record can never look like an empty log that is safe to append
+	// to.
+	verEnd, err := readVersionRecord(raw, len(logMagic))
+	if err != nil {
+		return 0, nil, err
+	}
+	pos := verEnd
+
 	for pos < len(raw) {
 		// Need at least the length header.
 		if len(raw)-pos < frameHeaderSize {
@@ -286,22 +304,56 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		if err := json.Unmarshal(payload, &e); err != nil {
 			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
 		}
-		if !sawVersion {
-			if e.T != kindVersion || e.V != currentLogV {
-				return 0, nil, fmt.Errorf("%w: unsupported log version entry: %+v", ErrCorrupt, e)
-			}
-			sawVersion = true
-		} else if e.T == kindVersion {
+		if e.T == kindVersion {
 			return 0, nil, fmt.Errorf("%w: unexpected version record at offset %d", ErrCorrupt, pos)
-		} else if err := applyEntry(state, &e); err != nil {
+		}
+		if err := applyEntry(state, &e); err != nil {
 			return 0, nil, err
 		}
 		pos = frameEnd
 	}
-	if !sawVersion {
-		return 0, nil, fmt.Errorf("%w: missing version record", ErrCorrupt)
-	}
 	return int64(pos), state, nil
+}
+
+// readVersionRecord reads and validates the log's first record at offset
+// start, returning the offset just past it. A correct magic prefix alone is
+// not a valid log: the version record must be fully present, its checksum
+// must match, and it must name a supported version. Every other shape — a
+// record cut short at end of file (one to three length bytes, or the length
+// without the body and CRC), a complete final record with a bad checksum,
+// invalid JSON, a non-version record, or an unsupported version — is a
+// corrupt log, never a truncatable tail.
+func readVersionRecord(raw []byte, start int) (int, error) {
+	if len(raw)-start < frameHeaderSize {
+		return 0, fmt.Errorf("%w: incomplete version record: only %d of %d length bytes after header",
+			ErrCorrupt, len(raw)-start, frameHeaderSize)
+	}
+	n := int(binary.BigEndian.Uint32(raw[start : start+frameHeaderSize]))
+	if n == 0 {
+		return 0, fmt.Errorf("%w: zero-length version record at offset %d", ErrCorrupt, start)
+	}
+	bodyStart := start + frameHeaderSize
+	frameEnd := bodyStart + n + frameCRCsSize
+	if frameEnd > len(raw) {
+		return 0, fmt.Errorf("%w: incomplete version record: length %d but only %d body/checksum bytes present",
+			ErrCorrupt, n, len(raw)-bodyStart)
+	}
+	payload := raw[bodyStart : bodyStart+n]
+	wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
+	if crc32.Checksum(payload, crcTable) != wantCRC {
+		return 0, fmt.Errorf("%w: checksum mismatch in version record at offset %d", ErrCorrupt, start)
+	}
+	var e logEntry
+	if err := json.Unmarshal(payload, &e); err != nil {
+		return 0, fmt.Errorf("%w: invalid version record at offset %d: %v", ErrCorrupt, start, err)
+	}
+	if e.T != kindVersion {
+		return 0, fmt.Errorf("%w: first record is %q, not a version record", ErrCorrupt, e.T)
+	}
+	if e.V != currentLogV {
+		return 0, fmt.Errorf("%w: unsupported log version %d", ErrCorrupt, e.V)
+	}
+	return frameEnd, nil
 }
 
 // entryCarriesConsumption reports whether a non-success entry smuggles any
