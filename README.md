@@ -43,6 +43,123 @@ go run ./cmd/relayproof normalize < logs.jsonl
   删除字节、补齐转义或替换字符来修复。合法中文、表情、正确配对的代理项转义以及
   用户明确输入的合法“�”字符照常可用；`\\` 转义后的 `uD800` 只是普通文本，原样保留。
 
+### 多个字段同时有问题时先报告哪一个
+
+一条日志可能同时有多处错误，但每条失败记录仍然只有一个 `error`、不带
+`event`，它揭示的是检查过程中**首先遇到的那一个问题**；把它修好后重新
+规范化，才可能看到排在后面的下一个问题。对于已经通过字符完整性检查并成功
+解析为 JSON 对象的日志，报告顺序是固定的：
+
+1. **已提供的映射字段**按 `timestamp`、`source_ip`、`action` 的顺序逐个
+   检查，某字段不合法就立即以该字段的**标准名**报错并停止，后面的字段
+   本次不再检查。标准名（`timestamp`/`source_ip`/`action`）与别名
+   （`time`/`src_ip`/`event_type`）都归入对应的标准字段；调整这些成员在
+   输入 JSON 中的先后位置不会改变首先报告的错误。同一字段的标准名与别名
+   同时出现时，两者都必须合法且规范化结果一致，否则同样在该字段这一步
+   失败（规则见上一节）。
+2. 只有**已提供字段全部合法、且没有别名冲突**之后，才检查必填字段
+   `timestamp`、`action` 是否缺失；两个必填字段都缺失时，先报告
+   `missing required field "timestamp"`。
+3. 显式给出的 `null` 属于“已提供但类型错误”，**不能按缺省处理**：它在
+   第 1 步就以对应标准名报类型错误（如
+   `field "action": value must be a string, got null`），不会留到第 2 步
+   才报缺失。
+
+这一顺序只适用于已经通过前面两类检查的行。字符损坏（非法 UTF-8 或未配对
+代理项转义）、JSON 语法不合法、顶层不是 JSON 对象、或存在重复顶层键，会
+在映射字段检查之前使整行失败（例如非对象报 `log must be a JSON object`、
+重复键报 `duplicate field "..."`，规则见“字段规则”），不能据此推断三个
+映射字段的检查顺序。无论失败在哪一步，结果都只有一个 `error`、没有
+`event`。
+
+下面的示例可像“离线示例”一节那样构建二进制后用 heredoc 贴入；每一步的
+JSON 都可以单独作为一行输入。
+
+#### 逐步修正一条三处皆错的日志
+
+初始这行同时有非法时间、非法地址和空动作。第 1 步输入：
+
+```
+{"timestamp":"2026-10-04T25:00:00Z","source_ip":"999.1.2.3","action":""}
+```
+
+输出（只看到时间错误；`timestamp` 在检查顺序中最靠前，另外两处尚未检查）：
+
+```json
+{"line":1,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: hour 25 out of range (00-23)"}
+```
+
+第 2 步，只把时间改成合法值，地址与动作保持原样：
+
+```
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"999.1.2.3","action":""}
+```
+
+输出（时间通过后，才第一次检查到地址问题）：
+
+```json
+{"line":1,"ok":false,"error":"field \"source_ip\": invalid IP address \"999.1.2.3\" (no port allowed)"}
+```
+
+第 3 步，再把地址改成合法 IPv4，动作仍为空字符串：
+
+```
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"10.0.0.1","action":""}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\": action must not be empty"}
+```
+
+第 4 步，把动作改成非空字符串，三个字段全部合法，得到成功事件：
+
+```
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"10.0.0.1","action":"login"}
+```
+
+输出：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","source_ip":"10.0.0.1","action":"login"}}
+```
+
+每次输入都只有这一行，所以行号始终是 1。改正一个问题后仍然失败，并不是
+修出了新问题，而是此前排在它后面的问题第一次被检查到；一次失败只揭示
+首先遇到的那一个。
+
+#### 缺少时间、但动作显式为 null
+
+`timestamp` 缺失，动作却以别名 `event_type` 显式给出 `null`：
+
+```
+{"source_ip":"10.0.0.1","event_type":null}
+```
+
+输出（原因里用的是标准名 `action`，不是别名 `event_type`）：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\": value must be a string, got null"}
+```
+
+`null` 是已提供但类型错误的值，不算缺省，所以动作的类型错误先于
+`timestamp` 的缺失被报告。把动作改成合法字符串后，必填检查才轮到缺失的
+时间：
+
+```
+{"source_ip":"10.0.0.1","event_type":"login"}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"missing required field \"timestamp\""}
+```
+
+若两个必填字段都没有提供（例如输入就是 `{}`），同样按固定顺序先报
+`missing required field "timestamp"`。
+
 ### 标准输出、标准错误与退出状态
 
 每条非空白物理行在**标准输出**产生一条 JSON 记录：
