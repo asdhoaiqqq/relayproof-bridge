@@ -43,13 +43,23 @@ type NormalizedEvent struct {
 	Extra     map[string]json.RawMessage `json:"extra,omitempty"`
 }
 
-// NormalizeResult is emitted for every non-blank input line, in input order.
+// NormalizeResult is emitted for every non-blank complete input line, in
+// input order.
 type NormalizeResult struct {
 	Line  int              `json:"line"`
 	OK    bool             `json:"ok"`
 	Event *NormalizedEvent `json:"event,omitempty"`
 	Error string           `json:"error,omitempty"`
 }
+
+// ErrLogRead and ErrLogWrite let callers tell stream-level I/O failures
+// apart from per-line normalization failures: NormalizeReader wraps the
+// underlying error with the matching sentinel, and a single invalid log
+// line never carries either.
+var (
+	ErrLogRead  = errors.New("log stream read failure")
+	ErrLogWrite = errors.New("log stream write failure")
+)
 
 type fieldCandidate struct {
 	from string
@@ -59,14 +69,41 @@ type fieldCandidate struct {
 // NormalizeReader streams newline-delimited JSON logs from r and writes one
 // NormalizeResult JSON object per non-blank physical line to w. Blank lines
 // produce no output but still advance the physical line counter. It returns
-// the number of lines that failed normalization; processing of later lines
-// continues after any per-line failure.
+// the number of complete lines that failed normalization; processing of
+// later lines continues after any per-line failure.
+//
+// Stream-level failures are distinct from bad log lines: a read error stops
+// processing and is returned wrapped with ErrLogRead, after every complete
+// line already read has been processed in order; any unterminated fragment
+// delivered together with the read error is part of the failed read rather
+// than a complete log line, so it is neither normalized nor counted and gets
+// no result of its own. A write error is returned wrapped with ErrLogWrite
+// and leaves the failure count unchanged. When both sides fail, the earlier
+// read error is reported. A clean EOF is not an error, including when the
+// final complete line has no trailing newline.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	reader := bufio.NewReader(r)
 	bw := bufio.NewWriter(w)
+	var readErr error // first stream read error, reported even if flushing fails
 	defer func() {
-		if flushErr := bw.Flush(); err == nil {
-			err = flushErr
+		flushErr := bw.Flush()
+		if err != nil {
+			return // a mid-stream error was already wrapped above
+		}
+		switch {
+		case readErr != nil:
+			// The original read failure must survive a write failure
+			// during shutdown: both the read marker and the underlying
+			// cause stay reachable via errors.Is, while the later flush
+			// failure only contributes its text (it must not mask the
+			// original cause).
+			wrapped := fmt.Errorf("%w: %w", ErrLogRead, readErr)
+			if flushErr != nil {
+				wrapped = fmt.Errorf("%w: %v", wrapped, flushErr)
+			}
+			err = wrapped
+		case flushErr != nil:
+			err = fmt.Errorf("%w: %w", ErrLogWrite, flushErr)
 		}
 	}()
 	encoder := json.NewEncoder(bw)
@@ -74,7 +111,16 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 
 	lineNo := 0
 	for {
-		line, readErr := reader.ReadBytes('\n')
+		line, rerr := reader.ReadBytes('\n')
+		complete := rerr == nil || errors.Is(rerr, io.EOF)
+		if !complete {
+			// The read failed mid-line: the bytes in hand are a fragment
+			// of the failed read, not a complete log line. Keep the line
+			// numbering of processed lines stable, emit nothing for the
+			// fragment, and surface only the read failure on return.
+			readErr = rerr
+			return failures, nil
+		}
 		if len(line) > 0 {
 			lineNo++
 			if strings.TrimSpace(string(line)) != "" {
@@ -83,15 +129,16 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 					failures++
 				}
 				if encErr := encoder.Encode(result); encErr != nil {
-					return failures, encErr
+					return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
 				}
 			}
 		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
 				return failures, nil
 			}
-			return failures, readErr
+			readErr = rerr
+			return failures, nil
 		}
 	}
 }
