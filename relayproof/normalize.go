@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -278,25 +280,62 @@ func requireString(canonical string, raw json.RawMessage) (string, error) {
 	}
 }
 
-// parseTimestamp accepts an RFC3339 string with a mandatory timezone and at
-// most nine fractional-second digits. time.Parse silently truncates longer
-// fractions, so the digit count is checked explicitly.
+// strictRFC3339Pattern pins the public RFC3339 shape: four-digit year and
+// two-digit month/day/hour/minute/second, optional fractional seconds that
+// must use a dot with exactly 1-9 digits, and a mandatory "Z" or numeric
+// offset. time.Parse accepts shapes outside this grammar — single-digit
+// hours, comma decimals, and unbounded offsets — so the layout is checked
+// here before any value is handed to the calendar logic.
+var strictRFC3339Pattern = regexp.MustCompile(
+	`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$`,
+)
+
+// parseTimestamp accepts exactly a public RFC3339 string: the hour field
+// must be two digits, fractional seconds must use a dot with 1-9 digits,
+// and a numeric offset must keep its hour within 00-23 and its minute
+// within 00-59. time.Parse silently pads short fields, accepts a comma as
+// the decimal separator, truncates over-long fractions, and carries
+// out-of-range offset components into neighboring units; all of those
+// rewrites are rejected here rather than normalized away.
 func parseTimestamp(s string) (time.Time, error) {
+	m := strictRFC3339Pattern.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}, errors.New("not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)")
+	}
+
+	hour, _ := strconv.Atoi(s[11:13])
+	minute, _ := strconv.Atoi(s[14:16])
+	second, _ := strconv.Atoi(s[17:19])
+
+	// Range-check every numeric component explicitly; no padding or carry
+	// is applied to any field. (:60 leap seconds are not part of RFC3339.)
+	if hour > 23 {
+		return time.Time{}, fmt.Errorf("hour %02d out of range (00-23)", hour)
+	}
+	if minute > 59 {
+		return time.Time{}, fmt.Errorf("minute %02d out of range (00-59)", minute)
+	}
+	if second > 59 {
+		return time.Time{}, fmt.Errorf("second %02d out of range (00-59)", second)
+	}
+
+	if zone := m[2]; zone != "Z" {
+		offsetHour, _ := strconv.Atoi(zone[1:3])
+		offsetMinute, _ := strconv.Atoi(zone[4:6])
+		if offsetHour > 23 {
+			return time.Time{}, fmt.Errorf("timezone offset hour %02d out of range (00-23)", offsetHour)
+		}
+		if offsetMinute > 59 {
+			return time.Time{}, fmt.Errorf("timezone offset minute %02d out of range (00-59)", offsetMinute)
+		}
+	}
+
+	// Delegate calendar validation (month, day-of-month, leap years) and
+	// zone math to the standard library. The strict pattern above keeps it
+	// from truncating or rewriting any component.
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return time.Time{}, err
-	}
-	if dot := strings.IndexByte(s, '.'); dot >= 0 {
-		n := 0
-		for dot+1+n < len(s) && s[dot+1+n] >= '0' && s[dot+1+n] <= '9' {
-			n++
-		}
-		if n == 0 {
-			return time.Time{}, errors.New("expected fractional digits after decimal point")
-		}
-		if n > 9 {
-			return time.Time{}, fmt.Errorf("fractional second has %d digits, at most 9 allowed", n)
-		}
 	}
 	return t, nil
 }

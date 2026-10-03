@@ -205,6 +205,85 @@ func TestNormalizeTimestampFormats(t *testing.T) {
 	}
 }
 
+func TestNormalizeStrictTimestampRejects(t *testing.T) {
+	// Inputs Go's time.Parse rewrites (pad, comma, truncate, carry) must
+	// all fail outright instead of yielding a successful event.
+	bad := []string{
+		"2026-01-02T5:04:05Z",             // single-digit hour
+		"2026-01-02T15:4:05Z",             // single-digit minute
+		"2026-01-02T15:04:5Z",             // single-digit second
+		"2026-01-02T15:04:05,1Z",          // comma decimal separator
+		"2026-01-02T15:04:05,1234567890Z", // 10 fractional digits, comma
+		"2026-01-02T15:04:05.1234567890Z", // 10 fractional digits, dot
+		"2026-01-02T15:04:05+24:00",       // offset hour out of range
+		"2026-01-02T15:04:05-24:00",
+		"2026-01-02T15:04:05+00:60", // offset minute carried by time.Parse
+		"2026-01-02T15:04:05+24:60",
+		"2026-01-02T24:04:05Z", // wall-clock hour out of range
+		"2026-01-02T15:60:05Z",
+		"2026-01-02T15:04:60Z",
+	}
+	for _, in := range bad {
+		for _, wrapper := range []string{
+			`{"timestamp":"` + in + `","action":"a"}`,
+			`{"time":"` + in + `","action":"a"}`,
+		} {
+			results := runNormalize(t, wrapper)
+			if results[0]["ok"] != false {
+				t.Fatalf("timestamp %q must fail, got %#v", in, results[0])
+			}
+			if _, exists := results[0]["event"]; exists {
+				t.Fatalf("rejected timestamp %q must not emit a partial event", in)
+			}
+			msg, _ := results[0]["error"].(string)
+			if !strings.Contains(msg, FieldTimestamp) {
+				t.Fatalf("error for %q must name %q, got %q", in, FieldTimestamp, msg)
+			}
+		}
+	}
+}
+
+func TestNormalizeInvalidAliasFailsEvenWhenRewritable(t *testing.T) {
+	// The single-digit-hour alias denotes the same instant as the legal
+	// timestamp, but validity is checked per field first: the illegal
+	// spelling must fail the whole line, never be padded and then merged.
+	input := `{"timestamp":"2026-01-02T15:04:05Z","time":"2026-01-02T15:04:05,1Z","action":"a"}`
+	results := runNormalize(t, input)
+	if results[0]["ok"] != false {
+		t.Fatalf("comma-fraction alias must fail despite denoting the same instant: %#v", results[0])
+	}
+	input = `{"timestamp":"2026-01-02T15:04:05Z","time":"2026-01-02T16:04:05+00:60","action":"a"}`
+	results = runNormalize(t, input)
+	if results[0]["ok"] != false {
+		t.Fatalf("carried offset alias must fail despite denoting the same instant: %#v", results[0])
+	}
+	msg, _ := results[0]["error"].(string)
+	if !strings.Contains(msg, FieldTimestamp) {
+		t.Fatalf("error must name %q, got %q", FieldTimestamp, msg)
+	}
+}
+
+func TestNormalizeStrictTimestampPreserves(t *testing.T) {
+	ok := map[string]string{
+		// Fractional precision is kept and trailing zeros dropped across zones.
+		"2026-01-02T23:04:05.100000000+08:00": "2026-01-02T15:04:05.1Z",
+		"2026-01-02T15:04:05.000000001Z":      "2026-01-02T15:04:05.000000001Z",
+		// Boundary-valid offsets must stay accepted after the range checks.
+		"2026-01-02T15:04:05+23:59": "2026-01-01T15:05:05Z",
+		"2026-01-02T15:04:05-23:59": "2026-01-03T15:03:05Z",
+		"2026-01-02T15:04:05+00:00": "2026-01-02T15:04:05Z",
+	}
+	for in, want := range ok {
+		results := runNormalize(t, `{"timestamp":"`+in+`","action":"a"}`)
+		if results[0]["ok"] != true {
+			t.Fatalf("legal timestamp %q should parse, got %#v", in, results[0])
+		}
+		if got := eventOf(t, results[0])["timestamp"]; got != want {
+			t.Fatalf("timestamp %q -> %v, want %q", in, got, want)
+		}
+	}
+}
+
 func TestNormalizeEmptyAction(t *testing.T) {
 	for _, action := range []string{"", "   ", "\t\n "} {
 		results := runNormalize(t, `{"timestamp":"2026-01-02T00:00:00Z","action":`+jsonString(action)+`}`)

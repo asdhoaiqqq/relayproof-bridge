@@ -23,8 +23,10 @@ go run ./cmd/relayproof normalize < logs.jsonl
 
 - 标准事件字段为 `timestamp`、`source_ip`、`action`，分别接受别名
   `time`、`src_ip`、`event_type`；`timestamp` 与 `action` 必填，`source_ip` 可缺省。
-- `timestamp` 接受带时区、最多九位小数的 RFC3339 字符串，统一转成 UTC 并以
-  RFC3339Nano 输出；`action` 为去首尾空白后的非空字符串；`source_ip` 必须是
+- `timestamp` 只接受严格 RFC3339 字符串：年月日与时分秒均为两位数字，必须带
+  时区（`Z` 或 `±HH:MM`，偏移小时 00-23、分钟 00-59）；小数秒可缺省，存在时
+  必须以点号引导一到九位数字，不接受逗号、补位、截断或进位。统一转成 UTC 并以
+  RFC3339Nano 输出（保留实际精度、去掉小数尾零）；`action` 为去首尾空白后的非空字符串；`source_ip` 必须是
   不带端口的合法 IPv4/IPv6，同一地址的不同写法输出相同结果。
 - 标准名与别名同时出现时分别规范化后比较：一致则合并，不一致则整条失败；
   `null` 或类型不符按失败处理，重复顶层键同样失败。
