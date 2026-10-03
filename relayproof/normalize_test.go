@@ -165,14 +165,15 @@ func TestNormalizeWhitespaceOnlyIPFails(t *testing.T) {
 
 func TestNormalizeTimestampFormats(t *testing.T) {
 	ok := map[string]string{
-		"2026-01-02T15:04:05Z":           "2026-01-02T15:04:05Z",
-		"2026-01-02T23:04:05+08:00":      "2026-01-02T15:04:05Z",
-		"2026-01-02T10:04:05-05:00":      "2026-01-02T15:04:05Z",
-		"2026-01-02T15:04:05.1Z":         "2026-01-02T15:04:05.1Z",
-		"2026-01-02T15:04:05.123456789Z": "2026-01-02T15:04:05.123456789Z",
-		"2026-01-02T15:04:05.100000000Z": "2026-01-02T15:04:05.1Z",
-		"2026-01-02T15:04:05.000000000Z": "2026-01-02T15:04:05Z",
-		"2026-01-02T15:04:05+00:00":      "2026-01-02T15:04:05Z",
+		"2026-01-02T15:04:05Z":                "2026-01-02T15:04:05Z",
+		"2026-01-02T23:04:05+08:00":           "2026-01-02T15:04:05Z",
+		"2026-01-02T10:04:05-05:00":           "2026-01-02T15:04:05Z",
+		"2026-01-02T15:04:05.1Z":              "2026-01-02T15:04:05.1Z",
+		"2026-01-02T15:04:05.123456789Z":      "2026-01-02T15:04:05.123456789Z",
+		"2026-01-02T15:04:05.100000000Z":      "2026-01-02T15:04:05.1Z",
+		"2026-01-02T15:04:05.000000000Z":      "2026-01-02T15:04:05Z",
+		"2026-01-02T23:04:05.100000000+08:00": "2026-01-02T15:04:05.1Z",
+		"2026-01-02T15:04:05+00:00":           "2026-01-02T15:04:05Z",
 	}
 	for in, want := range ok {
 		results := runNormalize(t, `{"time":"`+in+`","action":"a"}`)
@@ -186,11 +187,24 @@ func TestNormalizeTimestampFormats(t *testing.T) {
 	bad := []string{
 		"2026-01-02T15:04:05",             // no timezone
 		"2026-01-02t15:04:05z",            // lowercase t/z
+		"2026-01-02T5:04:05Z",             // single-digit hour
+		"2026-01-02T05:4:05Z",             // single-digit minute
+		"2026-01-02T15:04:05,1Z",          // comma fraction, one digit
+		"2026-01-02T15:04:05,123456789Z",  // comma fraction, nine digits
+		"2026-01-02T15:04:05,1234567890Z", // comma fraction, ten digits
 		"2026-01-02T15:04:05.1234567890Z", // 10 fractional digits
 		"2026-01-02T15:04:05.123456789012Z",
 		"2026-01-02T15:04:05.Z",    // dot without digits
 		"2026-01-02T15:04:05+0800", // non-RFC3339 offset
-		"2026-13-02T15:04:05Z",     // month out of range
+		"2026-01-02T15:04:05+24:00",
+		"2026-01-02T15:04:05-24:00",
+		"2026-01-02T15:04:05+00:60",
+		"2026-01-02T15:04:05+23:60",
+		"2026-13-02T15:04:05Z",         // month out of range
+		"2026-11-31T15:04:05Z",         // day out of range
+		"2026-01-02T24:04:05Z",         // clock hour out of range
+		"2026-01-02T15:04:05.1Z extra", // trailing garbage
+		"2026-01-02T15:04:05+08:00:30", // seconds in offset
 		"not-a-time",
 	}
 	for _, in := range bad {
@@ -286,6 +300,60 @@ func TestNormalizeConsistentAliasesMerge(t *testing.T) {
 	}
 	if event["action"] != "login" {
 		t.Fatalf("action mismatch: %v", event["action"])
+	}
+}
+
+func TestNormalizeTimestampAndTimeBothValidated(t *testing.T) {
+	// Even when the malformed value would denote the same instant after the
+	// parser rewrites it, the whole line must fail: neither field is dropped
+	// and no (partial) event is emitted.
+	failCases := []string{
+		// Single-digit hour "rewrites" to the same wall-clock hour.
+		`{"timestamp":"2026-01-02T15:04:05Z","time":"2026-01-02T5:04:05Z","action":"a"}`,
+		// Comma fraction would parse to .1, matching the valid field.
+		`{"timestamp":"2026-01-02T15:04:05.1Z","time":"2026-01-02T15:04:05,1Z","action":"a"}`,
+		// Ten digits would be truncated to .123456789, matching the valid field.
+		`{"timestamp":"2026-01-02T15:04:05.123456789Z","time":"2026-01-02T15:04:05.1234567890Z","action":"a"}`,
+		// +24:00 carries the date back one day, landing on the valid instant.
+		`{"timestamp":"2026-01-01T15:04:05Z","time":"2026-01-02T15:04:05+24:00","action":"a"}`,
+		// +00:60 carries the hour forward, landing on the valid instant.
+		`{"timestamp":"2026-01-02T14:04:05Z","time":"2026-01-02T15:04:05+00:60","action":"a"}`,
+	}
+	for _, in := range failCases {
+		results := runNormalize(t, in)
+		if results[0]["ok"] != false {
+			t.Fatalf("malformed dual timestamp must fail even if rewriting matches: %s", in)
+		}
+		if _, exists := results[0]["event"]; exists {
+			t.Fatalf("failure must not emit a partial event: %s", in)
+		}
+		msg, _ := results[0]["error"].(string)
+		if !strings.Contains(msg, FieldTimestamp) {
+			t.Fatalf("error must name %q, got %q", FieldTimestamp, msg)
+		}
+	}
+
+	// Two valid, differently-shaped timezone expressions of the same instant
+	// still merge as before.
+	okCases := []struct {
+		input string
+		want  string
+	}{
+		{`{"timestamp":"2026-01-02T23:04:05+08:00","time":"2026-01-02T15:04:05Z","action":"a"}`,
+			"2026-01-02T15:04:05Z"},
+		{`{"timestamp":"2026-01-02T23:04:05.100000000+08:00","time":"2026-01-02T15:04:05.1Z","action":"a"}`,
+			"2026-01-02T15:04:05.1Z"},
+		{`{"timestamp":"  2026-01-02T15:04:05Z  ","time":"2026-01-02T15:04:05+00:00","action":"a"}`,
+			"2026-01-02T15:04:05Z"},
+	}
+	for _, tc := range okCases {
+		results := runNormalize(t, tc.input)
+		if results[0]["ok"] != true {
+			t.Fatalf("equivalent valid timezones must merge: %s -> %#v", tc.input, results[0])
+		}
+		if got := eventOf(t, results[0])["timestamp"]; got != tc.want {
+			t.Fatalf("timestamp = %v, want %q", got, tc.want)
+		}
 	}
 }
 

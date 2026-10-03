@@ -278,25 +278,100 @@ func requireString(canonical string, raw json.RawMessage) (string, error) {
 	}
 }
 
-// parseTimestamp accepts an RFC3339 string with a mandatory timezone and at
-// most nine fractional-second digits. time.Parse silently truncates longer
-// fractions, so the digit count is checked explicitly.
+// parseTimestamp accepts a strict RFC3339 string with a mandatory timezone.
+// The date and clock fields use fixed-width digits (the hour is always two
+// digits), an optional fractional second uses a decimal point followed by one
+// to nine digits, and numeric timezone offsets have hours in 00-23 and minutes
+// in 00-59. time.Parse is lenient about all of these (it accepts comma
+// fractions and single-digit hours, normalizes offsets such as +24:00/+00:60
+// by carrying into the date, and silently truncates over-long fractions), so
+// the shape is verified explicitly before handing the string to time.Parse.
 func parseTimestamp(s string) (time.Time, error) {
+	if err := validateRFC3339Shape(s); err != nil {
+		return time.Time{}, err
+	}
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return time.Time{}, err
 	}
-	if dot := strings.IndexByte(s, '.'); dot >= 0 {
-		n := 0
-		for dot+1+n < len(s) && s[dot+1+n] >= '0' && s[dot+1+n] <= '9' {
-			n++
+	return t, nil
+}
+
+// validateRFC3339Shape enforces the fixed-width grammar of RFC3339
+// (date-time = full-date "T" partial-time time-offset), which time.Parse
+// alone does not. Calendar ranges (month, day, and the clock hour 00-23) are
+// left to time.Parse.
+func validateRFC3339Shape(s string) error {
+	// "YYYY-MM-DDTHH:MM:SS" occupies the first 19 bytes; at least a trailing
+	// "Z" must follow.
+	const baseLen = len("2006-01-02T15:04:05")
+	if len(s) < baseLen+1 {
+		return errors.New("expected RFC3339 timestamp such as 2006-01-02T15:04:05Z")
+	}
+	allDigits := func(lo, hi int) bool {
+		for i := lo; i < hi; i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
 		}
+		return true
+	}
+	if !allDigits(0, 4) || s[4] != '-' ||
+		!allDigits(5, 7) || s[7] != '-' ||
+		!allDigits(8, 10) || s[10] != 'T' ||
+		!allDigits(11, 13) || s[13] != ':' ||
+		!allDigits(14, 16) || s[16] != ':' ||
+		!allDigits(17, 19) {
+		return errors.New("expected YYYY-MM-DDTHH:MM:SS with two-digit hour, minute and second")
+	}
+
+	i := baseLen
+	switch s[i] {
+	case 'Z':
+		if len(s) != i+1 {
+			return errors.New("unexpected characters after timezone designator Z")
+		}
+		return nil
+	case '.':
+		j := i + 1
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		n := j - (i + 1)
 		if n == 0 {
-			return time.Time{}, errors.New("expected fractional digits after decimal point")
+			return errors.New("expected 1 to 9 fractional digits after the decimal point")
 		}
 		if n > 9 {
-			return time.Time{}, fmt.Errorf("fractional second has %d digits, at most 9 allowed", n)
+			return fmt.Errorf("fractional second has %d digits, at most 9 allowed", n)
 		}
+		i = j
+	case ',':
+		return errors.New("fractional seconds must use a decimal point, got comma")
+	case '+', '-':
+		// Numeric offset follows immediately; validated below.
+	default:
+		return errors.New("expected Z or numeric timezone offset (+HH:MM) after the time")
 	}
-	return t, nil
+
+	// Timezone: either "Z" or ("+" / "-") HH ":" MM with HH in 00-23 and
+	// minutes in 00-59.
+	if s[i] == 'Z' {
+		if len(s) != i+1 {
+			return errors.New("unexpected characters after timezone designator Z")
+		}
+		return nil
+	}
+	if len(s) != i+6 || (s[i] != '+' && s[i] != '-') ||
+		!allDigits(i+1, i+3) || s[i+3] != ':' || !allDigits(i+4, i+6) {
+		return errors.New("invalid timezone offset, expected Z or +HH:MM")
+	}
+	offsetHour := int(s[i+1]-'0')*10 + int(s[i+2]-'0')
+	offsetMinute := int(s[i+4]-'0')*10 + int(s[i+5]-'0')
+	if offsetHour > 23 {
+		return fmt.Errorf("timezone offset hour %02d is out of range (must be 00 to 23)", offsetHour)
+	}
+	if offsetMinute > 59 {
+		return fmt.Errorf("timezone offset minute %02d is out of range (must be 00 to 59)", offsetMinute)
+	}
+	return nil
 }
