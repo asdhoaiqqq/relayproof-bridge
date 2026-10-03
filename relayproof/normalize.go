@@ -147,11 +147,22 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 // NormalizeLine normalizes a single raw JSON log line. The line number is
 // echoed unchanged in the result.
 func NormalizeLine(lineNo int, raw []byte) NormalizeResult {
-	event, err := normalizeEvent(bytes.TrimSpace(raw))
+	event, err := normalizeEvent(trimJSONWhitespace(raw))
 	if err != nil {
 		return NormalizeResult{Line: lineNo, OK: false, Error: err.Error()}
 	}
 	return NormalizeResult{Line: lineNo, OK: true, Event: event}
+}
+
+// trimJSONWhitespace strips only the whitespace JSON allows around a
+// document (RFC 8259 §2): space, horizontal tab, carriage return, and line
+// feed. bytes.TrimSpace must not be used on a raw log line: it also removes
+// characters like U+000B, U+000C, and U+00A0, which are not legal JSON
+// separators, and would silently delete them before the syntax check instead
+// of letting the decoder reject the line. Whitespace inside string values is
+// never touched — only the bytes surrounding the document are examined.
+func trimJSONWhitespace(raw []byte) []byte {
+	return bytes.Trim(raw, " \t\r\n")
 }
 
 func normalizeEvent(raw []byte) (*NormalizedEvent, error) {
