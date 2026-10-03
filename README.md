@@ -43,6 +43,134 @@ go run ./cmd/relayproof normalize < logs.jsonl
   删除字节、补齐转义或替换字符来修复。合法中文、表情、正确配对的代理项转义以及
   用户明确输入的合法“�”字符照常可用；`\\` 转义后的 `uD800` 只是普通文本，原样保留。
 
+### 多处错误的报告顺序
+
+一条日志可能同时带有错误时间、非法地址、空动作等多个问题，但每条失败记录只有
+一个 `error`、不携带 `event`，因此规范化按固定顺序只报告首先遇到的那一个。对于
+**已经通过字符完整性检查、并成功解析为 JSON 对象**的日志，顺序如下：
+
+1. 先检查所有“已提供”的映射字段，固定按 `timestamp`、`source_ip`、`action` 的
+   标准字段顺序进行，与成员在输入对象中的书写位置无关。用标准名还是别名
+   （`time`、`src_ip`、`event_type`）提供都归入对应标准字段，原因中的字段名也
+   始终使用标准名。同一字段的标准名与别名都会被校验：任一取值不合法就按该字段
+   失败；都合法但规范化后不一致，则按别名冲突失败。一旦在该顺序中遇到第一个不
+   合法的字段，立即结束，本轮不再检查后面的字段。
+2. 只有已提供的映射字段全部合法、且没有别名冲突后，才检查必填字段是否缺失。
+   `timestamp` 与 `action` 必填；两者都缺失时，先报告 `missing required field
+   "timestamp"`。
+3. 显式给出的 `null` 属于“已提供但类型错误”，在第 1 步就失败，**不能按缺省
+   处理**留到第 2 步；对象、数组、布尔、数字等非字符串类型同理。例如动作以
+   `null` 给出时报告 `field "action": value must be a string, got null`，字段名
+   用的是标准名 `action` 而不是别名 `event_type`。
+
+因此一次失败只揭示沿上述顺序首先遇到的问题；把它改正后再次规范化，才可能看到
+下一个字段的错误。
+
+这一顺序有明确前提：字符损坏、JSON 语法不合法、非对象输入或重复顶层键会在映射
+字段检查**之前**就让整行失败，此时的原因与字段顺序无关，不能据此推断字段检查的
+先后。这类结果同样只有一条带原始物理行号的 `ok:false` 记录：只有一个 `error`、
+没有 `event`。
+
+#### 例：三个映射字段都有问题，逐步修正同一条日志
+
+下面每一步都是把同一条日志改正一处后、作为**唯一一行**输入喂给
+`./bin/relayproof normalize`（可用 `printf '%s\n' '<JSON>' | ./bin/relayproof
+normalize` 逐行复现），所以行号始终是 1。
+
+第 1 步：时间（小时 25）、地址（`999.1.2.3`）、动作（纯空白）都不合法，但只报告
+排在最前的时间错误（退出状态 `1`）。
+
+输入：
+
+```json
+{"timestamp":"2026-10-04T25:00:00Z","source_ip":"999.1.2.3","action":"   "}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: hour 25 out of range (00-23)"}
+```
+
+第 2 步：仅把时间改成合法值，地址与空动作的问题依旧存在，这时才看到地址错误
+（退出状态 `1`）。
+
+输入：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"999.1.2.3","action":"   "}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"field \"source_ip\": invalid IP address \"999.1.2.3\" (no port allowed)"}
+```
+
+第 3 步：再把地址改成合法 IPv6，只剩空动作，于是报告动作错误（退出状态 `1`）。
+
+输入：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"2001:db8::1","action":"   "}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\": action must not be empty"}
+```
+
+第 4 步：把动作改成非空字符串，三个字段全部合法，得到成功事件（退出状态 `0`）。
+
+输入：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","source_ip":"2001:db8::1","action":"login"}
+```
+
+输出：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","source_ip":"2001:db8::1","action":"login"}}
+```
+
+可见改正一个问题后仍可能失败：每次只揭开顺序中的下一个问题，而不是一次性列出
+全部错误。
+
+#### 例：缺少 timestamp，但 event_type 为 null
+
+这条日志没有 `timestamp`/`time`，动作经别名 `event_type` 显式给出，值为 `null`。
+因为 `null` 是“已提供但类型错误”，第 1 步的字段类型检查先命中 `action`，此时还
+轮不到第 2 步的必填检查，所以不会先报缺少时间（退出状态 `1`）。
+
+输入：
+
+```json
+{"src_ip":"10.0.0.1","event_type":null}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\": value must be a string, got null"}
+```
+
+把动作改成合法字符串后，已提供字段全部合法，才进入必填检查并报告缺少
+`timestamp`（退出状态仍为 `1`）。
+
+输入：
+
+```json
+{"src_ip":"10.0.0.1","event_type":"login"}
+```
+
+输出：
+
+```json
+{"line":1,"ok":false,"error":"missing required field \"timestamp\""}
+```
+
 ### 标准输出、标准错误与退出状态
 
 每条非空白物理行在**标准输出**产生一条 JSON 记录：
