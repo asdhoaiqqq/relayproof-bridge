@@ -535,6 +535,164 @@ func TestNormalizeDeterministic(t *testing.T) {
 	}
 }
 
+func TestNormalizeUTCYearRange(t *testing.T) {
+	// Legal four-digit-year inputs whose UTC conversion escapes 0000-9999
+	// must fail; RFC3339Nano cannot represent the result and detection
+	// rules must never receive an out-of-range canonical timestamp.
+	outOfRange := []string{
+		"0000-01-01T00:00:00+00:01",
+		"0000-01-01T00:00:59+01:00",
+		"0000-01-01T00:00:00+23:59", // largest legal offset: lands in year -1
+		"9999-12-31T23:59:59-00:01",
+		"9999-12-31T23:00:00-01:00",
+		"9999-12-31T23:59:00-23:59",
+	}
+	for _, in := range outOfRange {
+		for _, wrapper := range []string{
+			`{"timestamp":"` + in + `","action":"a"}`,
+			`{"time":"` + in + `","action":"a"}`,
+		} {
+			results := runNormalize(t, wrapper)
+			if results[0]["ok"] != false {
+				t.Fatalf("timestamp %q must fail after UTC conversion, got %#v", in, results[0])
+			}
+			if _, exists := results[0]["event"]; exists {
+				t.Fatalf("out-of-range timestamp %q must not emit an event", in)
+			}
+			msg, _ := results[0]["error"].(string)
+			if !strings.Contains(msg, FieldTimestamp) {
+				t.Fatalf("error for %q must name %q, got %q", in, FieldTimestamp, msg)
+			}
+			if !strings.Contains(msg, "UTC year") || !strings.Contains(msg, "0000-9999") {
+				t.Fatalf("error for %q must state the UTC year range, got %q", in, msg)
+			}
+		}
+	}
+
+	// The range endpoints are inclusive and fractional precision must
+	// survive at the edges, with trailing zeros still trimmed.
+	ok := map[string]string{
+		"0000-01-01T00:00:00Z":             "0000-01-01T00:00:00Z",
+		"0000-01-01T00:01:00+00:01":        "0000-01-01T00:00:00Z",
+		"0000-01-01T00:00:00-23:59":        "0000-01-01T23:59:00Z",
+		"0000-01-01T00:00:00.123456+00:00": "0000-01-01T00:00:00.123456Z",
+		"9999-12-31T23:59:59Z":             "9999-12-31T23:59:59Z",
+		"9999-12-31T23:58:59-00:01":        "9999-12-31T23:59:59Z",
+		"9999-12-31T23:59:59.100000000Z":   "9999-12-31T23:59:59.1Z",
+		"9999-12-31T23:59:59.000000001Z":   "9999-12-31T23:59:59.000000001Z",
+	}
+	for in, want := range ok {
+		results := runNormalize(t, `{"timestamp":"`+in+`","action":"a"}`)
+		if results[0]["ok"] != true {
+			t.Fatalf("boundary timestamp %q should succeed, got %#v", in, results[0])
+		}
+		if got := eventOf(t, results[0])["timestamp"]; got != want {
+			t.Fatalf("timestamp %q -> %v, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeUTCYearRangeAliases(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		ok    bool
+		want  string
+	}{
+		{
+			name:  "same out-of-range instant spelled twice",
+			input: `{"timestamp":"0000-01-01T00:00:00+00:01","time":"0000-01-01T00:01:00+00:02","action":"a"}`,
+			ok:    false,
+		},
+		{
+			name:  "same out-of-range instant repeated",
+			input: `{"timestamp":"9999-12-31T23:59:59-00:01","time":"9999-12-31T23:59:59-00:01","action":"a"}`,
+			ok:    false,
+		},
+		{
+			name:  "one legal value one out of range",
+			input: `{"timestamp":"0000-01-01T00:00:00Z","time":"0000-01-01T00:00:00+00:01","action":"a"}`,
+			ok:    false,
+		},
+		{
+			name:  "legal consistent values at lower edge merge",
+			input: `{"timestamp":"0000-01-01T00:00:00Z","time":"0000-01-01T00:01:00+00:01","action":"a"}`,
+			ok:    true,
+			want:  "0000-01-01T00:00:00Z",
+		},
+		{
+			name:  "legal consistent values at upper edge merge",
+			input: `{"timestamp":"9999-12-31T23:59:59Z","time":"9999-12-31T23:58:59-00:01","action":"a"}`,
+			ok:    true,
+			want:  "9999-12-31T23:59:59Z",
+		},
+		{
+			name:  "distinct legal instants still conflict",
+			input: `{"timestamp":"0000-01-01T00:01:00+00:01","time":"0000-01-01T00:02:00+00:01","action":"a"}`,
+			ok:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			results := runNormalize(t, tc.input)
+			if tc.ok {
+				if results[0]["ok"] != true {
+					t.Fatalf("expected success, got %#v", results[0])
+				}
+				if got := eventOf(t, results[0])["timestamp"]; got != tc.want {
+					t.Fatalf("timestamp %v, want %q", got, tc.want)
+				}
+				return
+			}
+			if results[0]["ok"] != false {
+				t.Fatalf("expected failure, got %#v", results[0])
+			}
+			if _, exists := results[0]["event"]; exists {
+				t.Fatalf("failure must not emit an event")
+			}
+			msg, _ := results[0]["error"].(string)
+			if !strings.Contains(msg, FieldTimestamp) {
+				t.Fatalf("error must name %q, got %q", FieldTimestamp, msg)
+			}
+		})
+	}
+}
+
+func TestNormalizeUTCYearRangeMixedStream(t *testing.T) {
+	// The year-range error is a single-line failure: surrounding legal
+	// lines still come out in order with their physical line numbers,
+	// blank lines only advance the counter, and the run reports the
+	// failure count (which drives exit status 1 in the CLI).
+	input := "{\"timestamp\":\"0000-01-01T00:01:00+00:01\",\"action\":\"a\"}\n" +
+		"\n" +
+		"{\"timestamp\":\"0000-01-01T00:00:00+00:01\",\"action\":\"b\"}\n" +
+		"   \n" +
+		"{\"timestamp\":\"9999-12-31T23:59:59-00:01\",\"action\":\"c\"}\n" +
+		"{\"timestamp\":\"9999-12-31T23:59:59Z\",\"action\":\"d\"}\n"
+	results := runNormalize(t, input)
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results for 6 physical lines, got %d: %#v", len(results), results)
+	}
+	if results[0]["line"] != float64(1) || results[0]["ok"] != true {
+		t.Fatalf("line 1 must succeed: %#v", results[0])
+	}
+	if got := eventOf(t, results[0])["timestamp"]; got != "0000-01-01T00:00:00Z" {
+		t.Fatalf("line 1 timestamp %v", got)
+	}
+	if results[1]["line"] != float64(3) || results[1]["ok"] != false {
+		t.Fatalf("line 3 must fail preserving its line number: %#v", results[1])
+	}
+	if results[2]["line"] != float64(5) || results[2]["ok"] != false {
+		t.Fatalf("line 5 must fail preserving its line number: %#v", results[2])
+	}
+	if results[3]["line"] != float64(6) || results[3]["ok"] != true {
+		t.Fatalf("legal line 6 must still be processed: %#v", results[3])
+	}
+	if eventOf(t, results[3])["action"] != "d" {
+		t.Fatalf("input order not preserved")
+	}
+}
+
 func TestNormalizeCRLF(t *testing.T) {
 	input := "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"action\":\"a\"}\r\n\r\nnot json\r\n"
 	results := runNormalize(t, input)

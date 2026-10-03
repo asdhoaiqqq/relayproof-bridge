@@ -296,7 +296,10 @@ var strictRFC3339Pattern = regexp.MustCompile(
 // within 00-59. time.Parse silently pads short fields, accepts a comma as
 // the decimal separator, truncates over-long fractions, and carries
 // out-of-range offset components into neighboring units; all of those
-// rewrites are rejected here rather than normalized away.
+// rewrites are rejected here rather than normalized away. The parsed
+// instant must also convert to a UTC year within 0000-9999, since a
+// success event serializes its timestamp in RFC3339Nano, which can only
+// carry a four-digit unsigned year.
 func parseTimestamp(s string) (time.Time, error) {
 	m := strictRFC3339Pattern.FindStringSubmatch(s)
 	if m == nil {
@@ -336,6 +339,15 @@ func parseTimestamp(s string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return time.Time{}, err
+	}
+
+	// A legal local instant can still land outside the four-digit-year
+	// window after the zone conversion (e.g. 0000-01-01T00:00:00+00:01
+	// becomes the previous year). RFC3339Nano would then emit a signed or
+	// five-digit year, which is not a value this function accepts on input,
+	// so reject it instead of reporting success.
+	if utc := t.UTC(); utc.Year() < 0 || utc.Year() > 9999 {
+		return time.Time{}, fmt.Errorf("UTC year %d out of range (0000-9999) after timezone conversion", utc.Year())
 	}
 	return t, nil
 }
