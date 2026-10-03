@@ -4,6 +4,7 @@ package relayproof
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -397,7 +398,10 @@ func (q *Queue) Submit(env Envelope) (*Record, error) {
 // sources without a trusted header covering the proof height stay waiting and
 // do not consume the nonce. Waiting retry intervals are 1,2,4,... seconds,
 // doubling to a 60-second cap, measured from the actual processing time;
-// jumping over several intervals still costs one attempt.
+// jumping over several intervals still costs one attempt. A retry time that
+// would exceed the maximum representable Unix-ms time saturates at that
+// maximum instead of wrapping around, and a message already processed at that
+// maximum is never due again from the same time alone.
 func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 	if nowMs < 0 {
 		return nil, fmt.Errorf("%w: negative processing time", ErrInvalidArg)
@@ -419,7 +423,11 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 		if rec == nil || isTerminal(rec.Status) {
 			continue
 		}
-		due := rec.Attempts == 0 || nowMs >= rec.NextRetry
+		// A message processed at the maximum representable time has its retry
+		// saturated at that same instant (see retryAt); it must not become due
+		// again from the same time alone, or every further advance would
+		// re-attempt it and deflate the backoff.
+		due := rec.Attempts == 0 || (nowMs >= rec.NextRetry && nowMs > rec.LastProcAt)
 		if !due {
 			continue
 		}
@@ -561,7 +569,7 @@ func (q *Queue) markWaiting(rec *Record, now int64, reason string) error {
 	rec.LastProcAt = now
 	rec.Status = StatusWaiting
 	rec.Reason = reason
-	rec.NextRetry = now + nextRetryDelay(attempt)
+	rec.NextRetry = retryAt(now, attempt)
 	return nil
 }
 
@@ -584,6 +592,19 @@ func nextRetryDelay(attempt int) int64 {
 		return 60_000
 	}
 	return int64(1) << (attempt - 1) * 1000
+}
+
+// retryAt schedules the next retry after a processing at now with the given
+// attempt count. The backoff is measured from the actual processing time, but
+// the result saturates at the maximum representable Unix-ms time instead of
+// overflowing into a negative instant, which would read as "due immediately"
+// and defeat the backoff for every later advance.
+func retryAt(now int64, attempt int) int64 {
+	delay := nextRetryDelay(attempt)
+	if now > math.MaxInt64-delay {
+		return math.MaxInt64
+	}
+	return now + delay
 }
 
 func isTerminal(status string) bool {

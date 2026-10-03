@@ -478,7 +478,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		}
 		switch e.Status {
 		case StatusWaiting:
-			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
+			if e.NextRetry != retryAt(e.Now, e.Attempts) {
 				return corrupt("waiting result has wrong retry schedule for %q", e.ID)
 			}
 			if entryCarriesConsumption(e) {
@@ -523,7 +523,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		}
 		switch e.Status {
 		case StatusWaiting:
-			if e.NextRetry != e.Now+nextRetryDelay(e.Attempts) {
+			if e.NextRetry != retryAt(e.Now, e.Attempts) {
 				return corrupt("state has wrong retry schedule for %q", e.ID)
 			}
 			if entryCarriesConsumption(e) {
@@ -644,7 +644,7 @@ func (s *store) appendResult(now int64, rec *Record, status, reason string, atte
 		Status: status, Reason: reason, Attempts: attempts,
 	}
 	if status == StatusWaiting {
-		e.NextRetry = now + nextRetryDelay(attempts)
+		e.NextRetry = retryAt(now, attempts)
 	}
 	if status == StatusSuccess {
 		if token == nil || consumeBy == "" {
