@@ -693,6 +693,273 @@ func TestNormalizeUTCYearRangeMixedStream(t *testing.T) {
 	}
 }
 
+// runNormalizeJSON works like runNormalize but decodes result lines with
+// json.Number, so tests can assert that high-precision numbers in extra
+// survive normalization verbatim instead of being rounded into float64.
+func runNormalizeJSON(t *testing.T, input string) []map[string]any {
+	t.Helper()
+	var out bytes.Buffer
+	failures, err := NormalizeReader(strings.NewReader(input), &out)
+	if err != nil {
+		t.Fatalf("NormalizeReader returned error: %v", err)
+	}
+	results := []map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(out.Bytes()))
+	dec.UseNumber()
+	for {
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("decoding result: %v", err)
+		}
+		results = append(results, m)
+	}
+	if got := countFailures(results); got != failures {
+		t.Fatalf("NormalizeReader returned %d failures but output shows %d", failures, got)
+	}
+	return results
+}
+
+// runNormalizeRaw returns the exact bytes NormalizeReader wrote, for
+// assertions on the serialized form of preserved numbers.
+func runNormalizeRaw(t *testing.T, input string) string {
+	t.Helper()
+	var out bytes.Buffer
+	if _, err := NormalizeReader(strings.NewReader(input), &out); err != nil {
+		t.Fatalf("NormalizeReader returned error: %v", err)
+	}
+	return out.String()
+}
+
+func extraOf(t *testing.T, r map[string]any) map[string]any {
+	t.Helper()
+	event := eventOf(t, r)
+	extra, ok := event["extra"].(map[string]any)
+	if !ok {
+		t.Fatalf("event has no extra object: %#v", event)
+	}
+	return extra
+}
+
+// mustNumber asserts v is a JSON number whose serialized form is exactly
+// want — no rounding, no truncation, no conversion to string.
+func mustNumber(t *testing.T, v any, want string) {
+	t.Helper()
+	n, ok := v.(json.Number)
+	if !ok {
+		t.Fatalf("expected JSON number %s, got %T (%v)", want, v, v)
+	}
+	if n.String() != want {
+		t.Fatalf("number preserved as %q, want %q", n.String(), want)
+	}
+}
+
+func TestNormalizeExtraHighPrecisionNumbers(t *testing.T) {
+	// Numbers beyond float64/int64 precision in unmapped fields must reach
+	// the event's extra with their exact literal form intact.
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"a",` +
+		`"big":9007199254740993,` +
+		`"neg_big":-9007199254740993,` +
+		`"precise":1.0000000000000000001,` +
+		`"huge":1e400,` +
+		`"tiny":1e-400}`
+	results := runNormalizeJSON(t, input)
+	if len(results) != 1 || results[0]["ok"] != true {
+		t.Fatalf("high-precision extra numbers must succeed, got %#v", results)
+	}
+	extra := extraOf(t, results[0])
+	mustNumber(t, extra["big"], "9007199254740993")
+	mustNumber(t, extra["neg_big"], "-9007199254740993")
+	mustNumber(t, extra["precise"], "1.0000000000000000001")
+	mustNumber(t, extra["huge"], "1e400")
+	mustNumber(t, extra["tiny"], "1e-400")
+
+	raw := runNormalizeRaw(t, input)
+	for _, want := range []string{"9007199254740993", "1.0000000000000000001", "1e400", "1e-400"} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("serialized output must contain the exact literal %s, got %s", want, raw)
+		}
+	}
+	if strings.Contains(raw, "9007199254740992") {
+		t.Fatalf("big integer was rounded to a float64 neighbor: %s", raw)
+	}
+	if strings.Contains(raw, "Infinity") || strings.Contains(raw, "inf") {
+		t.Fatalf("out-of-float-range exponent must not serialize as infinity: %s", raw)
+	}
+}
+
+func TestNormalizeExtraNestedPrecision(t *testing.T) {
+	// Precision preservation applies at every depth of unmapped objects and
+	// arrays, not just the top level; array order and the JSON types of
+	// values adjacent to the numbers must survive too.
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"a","payload":{` +
+		`"deep":{"id":9007199254740993},` +
+		`"list":[1.0000000000000000001,9007199254740993,"9007199254740993",true,null,3]}}`
+	results := runNormalizeJSON(t, input)
+	if results[0]["ok"] != true {
+		t.Fatalf("nested high-precision numbers must succeed, got %#v", results[0])
+	}
+	payload, ok := extraOf(t, results[0])["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload object must be preserved, got %#v", extraOf(t, results[0])["payload"])
+	}
+	deep, ok := payload["deep"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested object level must be preserved, got %#v", payload["deep"])
+	}
+	mustNumber(t, deep["id"], "9007199254740993")
+
+	list, ok := payload["list"].([]any)
+	if !ok || len(list) != 6 {
+		t.Fatalf("array level and length must be preserved, got %#v", payload["list"])
+	}
+	mustNumber(t, list[0], "1.0000000000000000001")
+	mustNumber(t, list[1], "9007199254740993")
+	// A string that spells a number stays a string; it is not converted.
+	if s, ok := list[2].(string); !ok || s != "9007199254740993" {
+		t.Fatalf("string-formed number must stay a string, got %T (%v)", list[2], list[2])
+	}
+	if list[3] != true {
+		t.Fatalf("adjacent boolean must keep its type, got %#v", list[3])
+	}
+	if list[4] != nil {
+		t.Fatalf("adjacent null must keep its type, got %#v", list[4])
+	}
+	mustNumber(t, list[5], "3")
+}
+
+func TestNormalizeInputExtraKeepsPrecisionAndNesting(t *testing.T) {
+	// An input's own "extra" field is an ordinary unmapped field: it lands
+	// inside the output extra as one nested object, its high-precision
+	// numbers survive, and it is not flattened into the sibling fields.
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"a",` +
+		`"extra":{"balance":9007199254740993,"ratio":1.0000000000000000001,"tags":["x",1e400]},` +
+		`"other":2}`
+	results := runNormalizeJSON(t, input)
+	if results[0]["ok"] != true {
+		t.Fatalf("nested input extra must succeed, got %#v", results[0])
+	}
+	extra := extraOf(t, results[0])
+	if len(extra) != 2 {
+		t.Fatalf("input extra must stay one nested field, not be flattened: %#v", extra)
+	}
+	inner, ok := extra["extra"].(map[string]any)
+	if !ok {
+		t.Fatalf("input extra must be a nested object under extra, got %#v", extra["extra"])
+	}
+	mustNumber(t, inner["balance"], "9007199254740993")
+	mustNumber(t, inner["ratio"], "1.0000000000000000001")
+	tags, ok := inner["tags"].([]any)
+	if !ok || len(tags) != 2 || tags[0] != "x" {
+		t.Fatalf("nested array inside input extra not preserved: %#v", inner["tags"])
+	}
+	mustNumber(t, tags[1], "1e400")
+	if _, leaked := extra["balance"]; leaked {
+		t.Fatalf("nested extra fields must not be hoisted to the top level: %#v", extra)
+	}
+	mustNumber(t, extra["other"], "2")
+}
+
+func TestNormalizeMappedFieldsStillRejectNumbers(t *testing.T) {
+	// Precision preservation is scoped to unmapped data: a number — even a
+	// legal high-precision one — in a mapped field still fails type checks.
+	cases := []struct {
+		input string
+		field string
+	}{
+		{`{"timestamp":9007199254740993,"action":"a"}`, FieldTimestamp},
+		{`{"time":1.0000000000000000001,"action":"a"}`, FieldTimestamp},
+		{`{"timestamp":"2026-01-02T00:00:00Z","action":123}`, FieldAction},
+		{`{"timestamp":"2026-01-02T00:00:00Z","event_type":1e400}`, FieldAction},
+		{`{"timestamp":"2026-01-02T00:00:00Z","action":"a","source_ip":9007199254740993}`, FieldSourceIP},
+		{`{"timestamp":"2026-01-02T00:00:00Z","action":"a","src_ip":1e400}`, FieldSourceIP},
+	}
+	for _, tc := range cases {
+		results := runNormalize(t, tc.input)
+		if results[0]["ok"] != false {
+			t.Fatalf("number in mapped field must fail: %s", tc.input)
+		}
+		if _, exists := results[0]["event"]; exists {
+			t.Fatalf("failure must not emit a partial event: %s", tc.input)
+		}
+		msg, _ := results[0]["error"].(string)
+		if !strings.Contains(msg, tc.field) {
+			t.Fatalf("error for %s must name field %q, got %q", tc.input, tc.field, msg)
+		}
+	}
+}
+
+func TestNormalizeInvalidJSONNumbersFail(t *testing.T) {
+	// Tokens that are not legal JSON numbers must fail the whole line with
+	// an error and no partial event, even inside unmapped fields.
+	cases := []string{
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":NaN}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":Infinity}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":-Infinity}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":01}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":+1}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":1.}`,
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":{"nested":007}}`,
+	}
+	for _, in := range cases {
+		results := runNormalize(t, in)
+		if len(results) != 1 || results[0]["ok"] != false {
+			t.Fatalf("invalid JSON number must fail: %s -> %#v", in, results)
+		}
+		if _, exists := results[0]["event"]; exists {
+			t.Fatalf("invalid JSON number must not emit a partial event: %s", in)
+		}
+		if msg, _ := results[0]["error"].(string); msg == "" {
+			t.Fatalf("invalid JSON number must produce an error message: %s", in)
+		}
+	}
+}
+
+func TestNormalizeMixedStreamHighPrecision(t *testing.T) {
+	// In one stream, invalid-number lines and wrong-typed mapped fields
+	// fail while surrounding legal high-precision logs still succeed in
+	// order; the failure count covers only the genuinely bad lines.
+	input := `{"timestamp":"2026-01-02T00:00:00Z","action":"a","big":9007199254740993}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"a","x":NaN}` + "\n" +
+		`{"timestamp":9007199254740993,"action":"a"}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:00Z","action":"b","extra":{"v":1.0000000000000000001}}` + "\n"
+	var out bytes.Buffer
+	failures, err := NormalizeReader(strings.NewReader(input), &out)
+	if err != nil {
+		t.Fatalf("NormalizeReader returned error: %v", err)
+	}
+	if failures != 2 {
+		t.Fatalf("expected exactly 2 failures (legal extra numbers must not count), got %d", failures)
+	}
+	results := []map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(out.Bytes()))
+	dec.UseNumber()
+	for {
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("decoding result: %v", err)
+		}
+		results = append(results, m)
+	}
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results, got %d: %#v", len(results), results)
+	}
+	if results[0]["ok"] != true || results[1]["ok"] != false || results[2]["ok"] != false || results[3]["ok"] != true {
+		t.Fatalf("ok pattern mismatch: %#v", results)
+	}
+	mustNumber(t, extraOf(t, results[0])["big"], "9007199254740993")
+	inner, ok := extraOf(t, results[3])["extra"].(map[string]any)
+	if !ok {
+		t.Fatalf("line 4 input extra must stay nested, got %#v", extraOf(t, results[3]))
+	}
+	mustNumber(t, inner["v"], "1.0000000000000000001")
+}
+
 func TestNormalizeCRLF(t *testing.T) {
 	input := "{\"timestamp\":\"2026-01-02T00:00:00Z\",\"action\":\"a\"}\r\n\r\nnot json\r\n"
 	results := runNormalize(t, input)
