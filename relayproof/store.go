@@ -403,6 +403,95 @@ func acceptConsumption(s *loadedState, rec *Record, e *logEntry, corrupt func(st
 	return token, nil
 }
 
+// recoveryKind distinguishes the two log record shapes that can carry a
+// message's post-processing state. They are never merged into one kind: a
+// plain result ("result") is one incremental outcome and must follow the
+// attempts-jump and monotonic-time rules, while a compacted snapshot ("state")
+// stores the full current status after >=1 attempts. recoveryKind only selects
+// the record-category wording in corrupt errors and the kind-specific
+// acceptance checks; both kinds then run the *same* per-status rules.
+//
+// waitingNoun is the word the historical waiting errors use ("result" for a
+// plain result, "state" for a snapshot); entryNoun is the word the historical
+// success/terminal errors use ("entry" for a plain result, "state" for a
+// snapshot). Keeping them separate preserves every corrupt message verbatim.
+type recoveryKind struct {
+	waitingNoun string
+	entryNoun   string
+}
+
+var (
+	recoveryResult = recoveryKind{waitingNoun: "result", entryNoun: "entry"}
+	recoveryState  = recoveryKind{waitingNoun: "state", entryNoun: "state"}
+)
+
+// validateRecoveryStatus is the first shared check for a result entry and a
+// compacted state entry: the carried status must be one of the known statuses
+// and must never be pending (pending is established by the submit entry, not
+// by a post-processing record).
+func validateRecoveryStatus(e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	if !validStatus(e.Status) || e.Status == StatusPending {
+		return corrupt("bad %s status %q for %q", rk.waitingNoun, e.Status, e.ID)
+	}
+	return nil
+}
+
+// acceptRecoveryStatus is the second shared check, run after the
+// kind-specific acceptance rules (including the snapshot's >=1-attempts
+// requirement): waiting must carry the canonical retry schedule (with the
+// sole legacy-overflow exception repaired in memory) and no consumption,
+// success must keep no retry time and consume its own (from,to,nonce)
+// attributed to itself, and terminal failures carry neither a retry time nor
+// consumption fields. The repaired retry time of a legacy overflowed schedule
+// is written back onto e.
+func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	switch e.Status {
+	case StatusWaiting:
+		scheduled, ok := validWaitingSchedule(e.Now, e.Attempts, e.NextRetry)
+		if !ok {
+			return corrupt("waiting %s has wrong retry schedule for %q", rk.waitingNoun, e.ID)
+		}
+		// Repair a legacy overflowed (negative) retry to the ceiling in
+		// memory; the next compaction writes the repaired value back.
+		e.NextRetry = scheduled
+		if entryCarriesConsumption(e) {
+			return corrupt("waiting %s for %q carries nonce consumption fields", rk.waitingNoun, e.ID)
+		}
+	case StatusSuccess:
+		if e.NextRetry != 0 {
+			return corrupt("success %s for %q carries retry time", rk.entryNoun, e.ID)
+		}
+		if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
+			return err
+		}
+	default: // terminal failure kinds
+		if e.NextRetry != 0 || entryCarriesConsumption(e) {
+			return corrupt("terminal %s for %q carries scheduling/consume fields", rk.entryNoun, e.ID)
+		}
+	}
+	return nil
+}
+
+// applyRecoveredState copies the validated post-processing state of one result
+// or compacted-state entry onto the record. Both record kinds describe the
+// same message state the same way, so the assignment lives in one place.
+func applyRecoveredState(s *loadedState, rec *Record, e *logEntry) {
+	rec.Attempts = e.Attempts
+	rec.LastProcAt = e.Now
+	rec.Status = e.Status
+	rec.Reason = e.Reason
+	rec.NextRetry = e.NextRetry
+	if e.Now > s.now {
+		s.now = e.Now
+	}
+}
+
 func applyEntry(s *loadedState, e *logEntry) error {
 	corrupt := func(msg string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
@@ -461,6 +550,11 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		}
 		s.nextSeq++
 	case kindResult:
+		// A plain result is one incremental processing outcome: it applies
+		// only to a known, still non-terminal record, attempts must advance by
+		// exactly one, and the processing time must never move backwards. The
+		// per-status validation (waiting schedule, success consumption,
+		// terminal fields) is shared with compacted state entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)
@@ -474,45 +568,19 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if e.Attempts != rec.Attempts+1 {
 			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
 		}
-		if !validStatus(e.Status) || e.Status == StatusPending {
-			return corrupt("bad result status %q for %q", e.Status, e.ID)
+		if err := validateRecoveryStatus(e, recoveryResult); err != nil {
+			return err
 		}
-		switch e.Status {
-		case StatusWaiting:
-			scheduled, ok := validWaitingSchedule(e.Now, e.Attempts, e.NextRetry)
-			if !ok {
-				return corrupt("waiting result has wrong retry schedule for %q", e.ID)
-			}
-			// Repair a legacy overflowed (negative) retry to the ceiling in
-			// memory; the next compaction writes the repaired value back.
-			e.NextRetry = scheduled
-			if entryCarriesConsumption(e) {
-				return corrupt("waiting result for %q carries nonce consumption fields", e.ID)
-			}
-		case StatusSuccess:
-			if e.NextRetry != 0 {
-				return corrupt("success entry for %q carries retry time", e.ID)
-			}
-			if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
-				return err
-			}
-		default: // terminal failure kinds
-			if e.NextRetry != 0 || entryCarriesConsumption(e) {
-				return corrupt("terminal entry for %q carries scheduling/consume fields", e.ID)
-			}
+		if err := acceptRecoveryStatus(s, rec, e, recoveryResult); err != nil {
+			return err
 		}
-		rec.Attempts = e.Attempts
-		rec.LastProcAt = e.Now
-		rec.Status = e.Status
-		rec.Reason = e.Reason
-		rec.NextRetry = e.NextRetry
-		if e.Now > s.now {
-			s.now = e.Now
-		}
+		applyRecoveredState(s, rec, e)
 	case kindState:
-		// Compacted snapshot: the message already has >=1 attempts and the
-		// entry carries its full current status, so there is no attempts-jump
-		// invariant to check against prior result entries (there are none).
+		// A compacted snapshot stores the message's full current status after
+		// >=1 attempts: it may restore an attempt count greater than one
+		// directly, but it applies only to a known record and never twice for
+		// the same message. The per-status validation is shared with plain
+		// result entries; the two kinds stay distinct on disk.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("state for unknown id %q", e.ID)
@@ -520,42 +588,16 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if rec.Attempts != 0 {
 			return corrupt("duplicate state for id %q", e.ID)
 		}
-		if !validStatus(e.Status) || e.Status == StatusPending {
-			return corrupt("bad state status %q for %q", e.Status, e.ID)
+		if err := validateRecoveryStatus(e, recoveryState); err != nil {
+			return err
 		}
 		if e.Attempts < 1 {
 			return corrupt("state with zero attempts for %q", e.ID)
 		}
-		switch e.Status {
-		case StatusWaiting:
-			scheduled, ok := validWaitingSchedule(e.Now, e.Attempts, e.NextRetry)
-			if !ok {
-				return corrupt("waiting state has wrong retry schedule for %q", e.ID)
-			}
-			e.NextRetry = scheduled
-			if entryCarriesConsumption(e) {
-				return corrupt("waiting state for %q carries nonce consumption fields", e.ID)
-			}
-		case StatusSuccess:
-			if e.NextRetry != 0 {
-				return corrupt("success state for %q carries retry time", e.ID)
-			}
-			if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
-				return err
-			}
-		default:
-			if e.NextRetry != 0 || entryCarriesConsumption(e) {
-				return corrupt("terminal state for %q carries scheduling/consume fields", e.ID)
-			}
+		if err := acceptRecoveryStatus(s, rec, e, recoveryState); err != nil {
+			return err
 		}
-		rec.Attempts = e.Attempts
-		rec.LastProcAt = e.Now
-		rec.Status = e.Status
-		rec.Reason = e.Reason
-		rec.NextRetry = e.NextRetry
-		if e.Now > s.now {
-			s.now = e.Now
-		}
+		applyRecoveredState(s, rec, e)
 	case kindAdvance:
 		if e.Now < s.now {
 			return corrupt("advance checkpoint %d before known time %d", e.Now, s.now)
