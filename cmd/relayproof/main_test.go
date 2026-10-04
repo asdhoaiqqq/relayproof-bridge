@@ -406,6 +406,71 @@ func TestNormalizeCLICorruptedCharactersExitOne(t *testing.T) {
 	}
 }
 
+// When one log line carries several problems at once, the user sees exactly
+// one failure record decided by pipeline precedence: invalid UTF-8 bytes beat
+// an unpaired surrogate escape, which beats field validation. In a mixed
+// stream each such line still gets its own ok:false record with the original
+// physical line number, valid lines around them keep coming out in input
+// order, stderr stays empty, and the process exits 1.
+func TestNormalizeCLIMultiProblemLinesExitOne(t *testing.T) {
+	input := []byte(`{"timestamp":"2026-01-02T00:00:00Z","action":"first"}` + "\n" +
+		`{"timestamp":"not-a-time","action":"\uD800","note":"x` + "\xff" + `"}` + "\n" +
+		"\n" +
+		`{"timestamp":"not-a-time","action":"\uD800"}` + "\n" +
+		`{"timestamp":"2026-01-02T00:00:02Z","action":"last"}` + "\n")
+
+	result := runNormalizeCLI(t, bytes.NewReader(input))
+
+	if result.exitCode != 1 {
+		t.Fatalf("multi-problem log lines must set exit status 1, got %d (stderr: %q)", result.exitCode, result.stderr)
+	}
+	if result.stderr != "" {
+		t.Fatalf("per-line failures belong in result records, not stderr, got %q", result.stderr)
+	}
+	if !utf8.ValidString(result.stdout) {
+		t.Fatalf("stdout must be valid UTF-8 even for corrupted input, got %q", result.stdout)
+	}
+
+	results := decodeStdoutResults(t, result.stdout)
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results for 5 physical lines, got %#v", results)
+	}
+	if results[0]["line"] != float64(1) || results[0]["ok"] != true {
+		t.Fatalf("the leading valid log must succeed on line 1: %#v", results[0])
+	}
+
+	byteFirst := results[1]
+	if byteFirst["line"] != float64(2) || byteFirst["ok"] != false {
+		t.Fatalf("the byte+escape+timestamp line must fail as line 2: %#v", byteFirst)
+	}
+	if _, exists := byteFirst["event"]; exists {
+		t.Fatalf("a failed line must not carry an event: %#v", byteFirst)
+	}
+	msg, _ := byteFirst["error"].(string)
+	if !strings.Contains(msg, "UTF-8") || strings.Contains(msg, "surrogate") {
+		t.Fatalf("invalid bytes must decide the failure over the escape and the timestamp, got %q", msg)
+	}
+
+	escapeFirst := results[2]
+	if escapeFirst["line"] != float64(4) || escapeFirst["ok"] != false {
+		t.Fatalf("the escape+timestamp line must fail as line 4: %#v", escapeFirst)
+	}
+	if _, exists := escapeFirst["event"]; exists {
+		t.Fatalf("a failed line must not carry an event: %#v", escapeFirst)
+	}
+	msg, _ = escapeFirst["error"].(string)
+	if !strings.Contains(msg, "surrogate") || strings.Contains(msg, "RFC3339") {
+		t.Fatalf("the unpaired escape must decide the failure over the timestamp, got %q", msg)
+	}
+
+	if results[3]["line"] != float64(5) || results[3]["ok"] != true {
+		t.Fatalf("the trailing valid log must still succeed on line 5: %#v", results[3])
+	}
+	if eventOf(t, results[3])["action"] != "last" {
+		t.Fatalf("line 5 event content mismatch: %#v", results[3])
+	}
+}
+
 // A duplicate top-level key written with a unicode escape is the same failure
 // as a literal repeated key. With one such line between legal logs (and a
 // blank line shifting physical numbers), the CLI must emit per-line JSON
