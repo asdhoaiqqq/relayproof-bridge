@@ -497,17 +497,19 @@ func (q *Queue) checkReplayExpiry(rec *Record, now int64) (Result, bool, error) 
 	token := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
 	if winner, taken := q.consumed[token]; taken && winner != id {
 		reason := "nonce combination already consumed by message " + winner
-		if err := q.terminalize(rec, now, StatusReplay, reason); err != nil {
+		o := newOutcome(rec, now, StatusReplay, reason)
+		if err := q.commitOutcome(rec, o); err != nil {
 			return Result{}, false, err
 		}
-		return Result{ID: id, Status: StatusReplay, Reason: reason}, true, nil
+		return o.result(), true, nil
 	}
 	if rec.Msg.ExpiresAt != 0 && now >= rec.Msg.ExpiresAt {
 		reason := "expired at " + strconv.FormatInt(rec.Msg.ExpiresAt, 10)
-		if err := q.terminalize(rec, now, StatusExpired, reason); err != nil {
+		o := newOutcome(rec, now, StatusExpired, reason)
+		if err := q.commitOutcome(rec, o); err != nil {
 			return Result{}, false, err
 		}
-		return Result{ID: id, Status: StatusExpired, Reason: reason}, true, nil
+		return o.result(), true, nil
 	}
 	return Result{}, false, nil
 }
@@ -518,10 +520,11 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 	id := rec.Msg.Message.ID
 	if !q.sources[rec.Msg.Message.From] {
 		reason := "unknown source chain " + rec.Msg.Message.From
-		if err := q.terminalize(rec, now, StatusUnknownSrc, reason); err != nil {
+		o := newOutcome(rec, now, StatusUnknownSrc, reason)
+		if err := q.commitOutcome(rec, o); err != nil {
 			return Result{}, err
 		}
-		return Result{ID: id, Status: StatusUnknownSrc, Reason: reason}, nil
+		return o.result(), nil
 	}
 	hs := q.headers[rec.Msg.Message.From]
 	if hs == nil || hs.trusted == nil || hs.trusted.Height < rec.Msg.Message.ProofAt {
@@ -530,55 +533,118 @@ func (q *Queue) processDue(rec *Record, now int64) (Result, error) {
 			cur = hs.trusted.Height
 		}
 		reason := fmt.Sprintf("waiting for trusted header covering height %d (current %d)", rec.Msg.Message.ProofAt, cur)
-		if err := q.markWaiting(rec, now, reason); err != nil {
+		o := newWaitingOutcome(rec, now, reason)
+		if err := q.commitOutcome(rec, o); err != nil {
 			return Result{}, err
 		}
-		return Result{ID: id, Status: StatusWaiting, Reason: reason}, nil
+		return o.result(), nil
 	}
 
 	// Deliver: success record and nonce consumption are one log entry. The
 	// coverage height is the highest trusted header actually accepted — never
 	// a higher untrusted header.
-	token := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
 	reason := "delivered; proof verified by trusted header at height " + strconv.FormatInt(hs.trusted.Height, 10)
-	if err := q.store.appendResult(now, rec, StatusSuccess, reason, rec.Attempts+1, &token, id); err != nil {
-		return Result{}, q.fail("deliver", err)
+	o := newOutcome(rec, now, StatusSuccess, reason)
+	o.consumeToken = newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+	o.consumeBy = id
+	if err := q.commitOutcome(rec, o); err != nil {
+		return Result{}, err
 	}
-	rec.Attempts++
-	rec.LastProcAt = now
-	rec.Status = StatusSuccess
-	rec.Reason = reason
-	rec.NextRetry = 0
-	q.consumed[token] = id
-	q.removeFromOrder(id)
-	return Result{ID: id, Status: StatusSuccess, Reason: reason}, nil
+	return o.result(), nil
 }
 
-func (q *Queue) terminalize(rec *Record, now int64, status, reason string) error {
-	if err := q.store.appendResult(now, rec, status, reason, rec.Attempts+1, nil, ""); err != nil {
-		return q.fail("terminalize", err)
+// outcome is one fully determined processing result: the status and reason the
+// message gets, which attempt it was, the retry instant a waiting result
+// schedules, and — for a success — the (source, destination, nonce) triple the
+// message consumes. Every processing path builds one and hands it to
+// commitOutcome, so the rule for how a result is persisted and then reflected
+// onto the live record is maintained in exactly one place.
+type outcome struct {
+	id        string
+	status    string
+	reason    string
+	now       int64
+	attempts  int
+	nextRetry int64 // waiting only; zero clears any prior retry
+
+	// success only: the consumed triple and the id of the consuming message.
+	consumeToken consumeToken
+	consumeBy    string
+}
+
+// newOutcome builds a non-waiting result (a terminal failure or a success).
+// Success callers must set consumeToken/consumeBy; terminal failures never
+// touch either and schedule no retry.
+func newOutcome(rec *Record, now int64, status, reason string) outcome {
+	return outcome{
+		id:       rec.Msg.Message.ID,
+		status:   status,
+		reason:   reason,
+		now:      now,
+		attempts: rec.Attempts + 1,
 	}
-	rec.Attempts++
-	rec.LastProcAt = now
-	rec.Status = status
-	rec.Reason = reason
-	rec.NextRetry = 0
-	q.removeFromOrder(rec.Msg.Message.ID)
+}
+
+// newWaitingOutcome builds a waiting result with the canonical saturated
+// backoff schedule for the new attempt.
+func newWaitingOutcome(rec *Record, now int64, reason string) outcome {
+	attempts := rec.Attempts + 1
+	return outcome{
+		id:        rec.Msg.Message.ID,
+		status:    StatusWaiting,
+		reason:    reason,
+		now:       now,
+		attempts:  attempts,
+		nextRetry: nextRetryAt(now, attempts),
+	}
+}
+
+// result renders the user-facing report row for a committed outcome.
+func (o outcome) result() Result {
+	return Result{ID: o.id, Status: o.status, Reason: o.reason}
+}
+
+// commitOutcome persists one processing result and, only once the write is
+// durably acknowledged, makes it take effect on the live record. Nothing
+// before a successful return changes the message: a failed write leaves the
+// record's prior status, reason, attempt count, processing time and retry
+// schedule untouched and leaves the nonce unconsumed, while the storage
+// failure poisons the queue so this instance refuses every later write. On
+// success the shared fields are applied once here; a success additionally
+// records the nonce consumption, and every settled (non-waiting) result leaves
+// the live processing order.
+func (q *Queue) commitOutcome(rec *Record, o outcome) error {
+	if err := q.store.appendOutcome(rec, o); err != nil {
+		return q.fail(o.failOp(), err)
+	}
+	rec.Attempts = o.attempts
+	rec.LastProcAt = o.now
+	rec.Status = o.status
+	rec.Reason = o.reason
+	rec.NextRetry = o.nextRetry
+	switch o.status {
+	case StatusSuccess:
+		q.consumed[o.consumeToken] = o.consumeBy
+		q.removeFromOrder(o.consumeBy)
+	case StatusWaiting:
+		// stays live and processable and keeps its place in processing order
+	default:
+		q.removeFromOrder(rec.Msg.Message.ID)
+	}
 	return nil
 }
 
-func (q *Queue) markWaiting(rec *Record, now int64, reason string) error {
-	attempt := rec.Attempts + 1
-	nextRetry := nextRetryAt(now, attempt)
-	if err := q.store.appendWaiting(now, rec, reason, attempt, nextRetry); err != nil {
-		return q.fail("schedule retry", err)
+// failOp names the storage operation in the ErrStorage message. The labels
+// preserve the historical per-path wording.
+func (o outcome) failOp() string {
+	switch o.status {
+	case StatusWaiting:
+		return "schedule retry"
+	case StatusSuccess:
+		return "deliver"
+	default:
+		return "terminalize"
 	}
-	rec.Attempts = attempt
-	rec.LastProcAt = now
-	rec.Status = StatusWaiting
-	rec.Reason = reason
-	rec.NextRetry = nextRetry
-	return nil
 }
 
 // retryDue reports whether a waiting record's next retry is reached at now.
