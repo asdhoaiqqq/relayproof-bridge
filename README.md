@@ -39,6 +39,96 @@ $BIN queue query --state $DIR --id m1
 $BIN queue query --state $DIR
 ```
 
+### 头信息与可信覆盖
+
+头信息按来源链分别保存。一条消息能否投递，取决于其来源链**已接受的最高
+可信头**是否达到消息的证明高度，与最近保存的头无关：
+
+- 首个可信头建立覆盖范围；更高的可信头扩大覆盖范围。
+- 较低的可信头、或任意高度的不可信头，都可以正常保存（成为该链最近保存
+  的头），但不会降低已有的可信高度；保存一个比可信头更高的不可信头，也
+  不能放行超出覆盖范围的消息。
+- 保存头信息不等于登记来源链：来源链未登记时，即使已保存该链的可信头，
+  其消息仍按 `unknown-source` 永久拒绝。
+- 投递成功的原因引用实际采用的可信高度
+  （`delivered; proof verified by trusted header at height N`），N 是已
+  接受的最高可信头高度，而不是最近保存的头的高度；查询结果中的成功原因
+  应据此解读。
+
+同高度更新的边界：
+
+- 新提交的可信头与当前最高可信头**同高且根相同**：正常接受，覆盖范围不
+  变（幂等）。
+- **同高但根不同**：返回可信头冲突，原可信头继续有效，队列仍可正常使用。
+  根按原字符串比较，空根也是合法输入（同高空根同样幂等接受）。命令行遇
+  到该冲突时输出 `error: trusted header conflict: different root at the
+  accepted height: ...` 并以退出码 16 结束；注意与消息内容冲突（同一 ID
+  提交不同内容，退出码 13）区分。
+- 不可信头即使同高且根不同，也正常保存，不改变可信覆盖范围，不触发冲突。
+- 较低可信头的根差异不属于上述冲突条件：它被正常保存，覆盖范围不变。
+
+写入头信息本身从不触发消息处理：不增加等待消息的尝试次数，也不提前或推
+迟已安排的重试时刻；等待消息只在其重试到期后的推进中重新判断。
+
+### 示例：更新头信息后的投递判断
+
+下面这组连续操作可离线复现，处理时间沿用用户指定 `--now` 的约定：
+
+```bash
+BIN=./relayproof
+DIR=/var/lib/relayproof-demo
+
+# 登记来源链，保存高度 100 的可信头，再保存高度 120 的不可信头
+$BIN queue register-source --state $DIR --chain chain-a
+$BIN queue header --state $DIR --chain chain-a --height 100 --root 0x100 --trusted
+$BIN queue header --state $DIR --chain chain-a --height 120 --root 0x120
+
+# 提交两条消息：证明高度 90（已被可信头 100 覆盖）与 110（尚未被覆盖）
+$BIN queue submit --state $DIR --id m90 --from chain-a --to chain-b \
+  --nonce 1 --proof-at 90 --payload hello
+$BIN queue submit --state $DIR --id m110 --from chain-a --to chain-b \
+  --nonce 2 --proof-at 110 --payload world
+
+# 首次推进，处理时间 1700000000000
+$BIN queue advance --state $DIR --now 1700000000000
+# {"nowMs":1700000000000,"results":[
+#   {"id":"m90","status":"success","reason":"delivered; proof verified by trusted header at height 100"},
+#   {"id":"m110","status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)"}]}
+```
+
+`m90` 成功，成功原因引用可信高度 100——更高的不可信头 120 不起作用；
+`m110` 等待，首次重试安排在 1700000001000（第 1 次尝试后退避 1 秒）：
+
+```bash
+$BIN queue query --state $DIR --id m110
+# {"id":"m110",...,"status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)","attempts":1,"nextRetryMs":1700000001000}
+```
+
+随后保存能覆盖 110 的可信头。写头不触发处理：`m110` 的尝试次数与已安排
+的重试时刻不变，查询结果与上面完全相同（原因文本仍记录上次处理时的可信
+高度 100，要到下次处理才更新）：
+
+```bash
+$BIN queue header --state $DIR --chain chain-a --height 110 --root 0x110 --trusted
+$BIN queue query --state $DIR --id m110
+# {"id":"m110",...,"status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)","attempts":1,"nextRetryMs":1700000001000}
+```
+
+重试尚未到期时推进，`m110` 不会被重新处理，结果为空：
+
+```bash
+$BIN queue advance --state $DIR --now 1700000000500
+# {"nowMs":1700000000500,"results":null}
+```
+
+重试到期后再推进，`m110` 成功，成功原因引用新的可信高度 110：
+
+```bash
+$BIN queue advance --state $DIR --now 1700000001000
+# {"nowMs":1700000001000,"results":[
+#   {"id":"m110","status":"success","reason":"delivered; proof verified by trusted header at height 110"}]}
+```
+
 ### 状态语义
 
 | 状态 | 含义 | 是否终结 |
