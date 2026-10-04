@@ -124,7 +124,13 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 		}
 		if len(line) > 0 {
 			lineNo++
-			if strings.TrimSpace(string(line)) != "" {
+			// Blank-line detection must use the same JSON-only whitespace
+			// set as trimJSONWhitespace, never strings.TrimSpace: a physical
+			// line containing only U+000B, U+000C, U+00A0, U+3000 and similar
+			// is not blank, it is a log line that is not a JSON object and
+			// must be processed so it fails with a syntax result instead of
+			// being swallowed with no record.
+			if len(trimJSONWhitespace(line)) > 0 {
 				result := NormalizeLine(lineNo, line)
 				if !result.OK {
 					failures++
