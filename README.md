@@ -39,6 +39,202 @@ $BIN queue query --state $DIR --id m1
 $BIN queue query --state $DIR
 ```
 
+### 头信息与可信覆盖范围
+
+`header` 按**来源链分别**保存头信息：每条链各自维护“最近保存的头”（任意
+可信度）与“已接受的最高可信头”。一条消息能否投递，只取决于其来源链已接受
+的**最高可信头**是否覆盖它的证明高度，与头的保存先后、最近一次保存了什么
+都无关；一条链的头也永远不会覆盖另一条链上的消息。
+
+- 首个 `--trusted` 头**建立**该链的可信覆盖范围：证明高度不超过该可信高度
+  的消息才可投递。
+- 更高的可信头**扩大**覆盖范围。投递成功原因中写出的高度是投递时实际采用
+  的可信高度，既不是消息自己的证明高度，也不是最近保存的头（例如最高可信
+  头在 100 时，证明高度 90 的消息成功原因仍写 “trusted header at height
+  100”）。
+- 较低的可信头、以及任意高度的不可信头（不带 `--trusted`，即使高度更高）
+  都可以正常保存，但不会降低已建立的可信高度，也不能用更高的不可信头放行
+  超出覆盖范围的消息。
+- **保存头信息不等于登记来源链**。没有 `register-source` 的链即使保存了可
+  信头，来自它的消息仍按既有未知来源规则终结为 `unknown-source`。
+- 写头只更新覆盖范围，本身不处理任何消息，不改变等待消息的尝试次数与已安
+  排的下次重试时刻，也不绕过退避等待；消息要等到下一次重试到期、再次处理
+  时才按新的覆盖范围判断。因此等待记录查询到的原因是上一次处理时写下的，
+  其中的 “current N” 可能暂时落后于刚写入的可信头，下一次到期处理后才会
+  刷新。
+
+#### 同高度更新：接受、幂等与头冲突
+
+新提交的**可信头**与该链当前最高可信头**同高度**时：
+
+- 根相同：正常接受（幂等，可重复提交）；
+- 根不同：返回可信头冲突 `ErrHeaderConflict`，命令行打印明确错误并以退出码
+  **16** 结束；**原可信头继续有效，队列仍可正常使用**。
+
+根按提交的**原字符串逐字节比较**，空根也是合法输入（省略 `--root` 即空
+根）：两个同为空根的提交正常接受，空根与非空根互为冲突。
+
+以下两种根差异**不属于**同高冲突，均正常保存：
+
+- 同高度但**不可信**的头根不同——照常保存，不改变可信覆盖范围；
+- **较低**可信头的根不同——它不是当前最高可信头，不构成冲突。
+
+注意与消息内容冲突区分：复用同一消息 ID 但内容不同返回的是
+`ErrConflict`、退出码 **13**；退出码 **16** 专指头冲突，原消息记录不受
+影响。
+
+### 连续示例：更新头后哪条消息先投递
+
+下例使用用户指定的处理时间（Unix 毫秒），可在全新临时目录中原样复现。
+初始可信高度为 100，随后保存一个高度 120 的**不可信**头：
+
+```text
+$ BIN=./relayproof                 # 或 go run ./cmd/relayproof
+$ DIR=$(mktemp -d)
+$ $BIN queue register-source --state $DIR --chain chain-a
+registered source chain chain-a
+$ $BIN queue header --state $DIR --chain chain-a --height 100 --root 0x100 --trusted
+stored header chain=chain-a height=100 trusted=true
+$ $BIN queue header --state $DIR --chain chain-a --height 120 --root 0x120
+stored header chain=chain-a height=120 trusted=false
+```
+
+提交证明高度分别为 90 和 110 的两条消息，并在 1700000000000 首次推进：
+
+```text
+$ $BIN queue submit --state $DIR --id m90 --from chain-a --to chain-b \
+    --nonce 7 --proof-at 90 --payload hello --expires-at 9000000000000
+{"id":"m90","status":"pending","reason":"awaiting first processing","attempts":0,"expiresAtMs":9000000000000}
+$ $BIN queue submit --state $DIR --id m110 --from chain-a --to chain-b \
+    --nonce 8 --proof-at 110 --payload world --expires-at 9000000000000
+{"id":"m110","status":"pending","reason":"awaiting first processing","attempts":0,"expiresAtMs":9000000000000}
+$ $BIN queue advance --state $DIR --now 1700000000000
+{"nowMs":1700000000000,"results":[{"id":"m90","status":"success","reason":"delivered; proof verified by trusted header at height 100"},{"id":"m110","status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)"}]}
+```
+
+- m90（证明高度 90）被可信头 100 覆盖，立即成功；成功原因引用的是实际采用
+  的可信高度 **100**，与最近保存的不可信头 120 无关。
+- m110（证明高度 110）没有被任何**可信**头覆盖（不可信的 120 不放行），进
+  入等待、不消费 nonce。首次处理在 1700000000000，第一档退避为 1 秒，故
+  下次重试时刻为 1700000001000：
+
+```text
+$ $BIN queue query --state $DIR --id m110
+{"id":"m110","from":"chain-a","to":"chain-b","nonce":8,"payload":"world","proofAtHeight":110,"expiresAtMs":9000000000000,"status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)","attempts":1,"nextRetryMs":1700000001000}
+```
+
+在重试到期**之前**写入能覆盖 110 的可信头，然后提前半秒推进：
+
+```text
+$ $BIN queue header --state $DIR --chain chain-a --height 120 --root 0x120 --trusted
+stored header chain=chain-a height=120 trusted=true
+$ $BIN queue advance --state $DIR --now 1700000000500
+{"nowMs":1700000000500,"results":null}
+$ $BIN queue query --state $DIR --id m110
+{"id":"m110","from":"chain-a","to":"chain-b","nonce":8,"payload":"world","proofAtHeight":110,"expiresAtMs":9000000000000,"status":"waiting","reason":"waiting for trusted header covering height 110 (current 100)","attempts":1,"nextRetryMs":1700000001000}
+```
+
+写头没有触发处理：1700000000500 早于下次重试 1700000001000，m110 仍是
+`waiting`，尝试次数保持 1，下次重试时刻保持 1700000001000，原因也仍是上
+次处理时写下的 “current 100”。等到重试时刻再推进，才按新的可信高度重新
+判断并成功，成功原因引用实际采用的可信高度 **120**：
+
+```text
+$ $BIN queue advance --state $DIR --now 1700000001000
+{"nowMs":1700000001000,"results":[{"id":"m110","status":"success","reason":"delivered; proof verified by trusted header at height 120"}]}
+```
+
+时间线汇总：`1700000000000` 首次推进 → m90 成功、m110 等待（重试安排在
+`1700000001000`）；`1700000000500` 已写入可信头 120 但重试未到期，仍等待；
+`1700000001000` 重试到期再推进，m110 成功。
+
+### 连续示例：同高度头冲突的边界
+
+在另一个全新目录中，当前最高可信头为高度 100、根 `0x100`。同高度同根正常
+接受；同高度异根的可信头返回冲突、退出码 16：
+
+```text
+$ D2=$(mktemp -d)
+$ $BIN queue register-source --state $D2 --chain chain-a
+registered source chain chain-a
+$ $BIN queue header --state $D2 --chain chain-a --height 100 --root 0x100 --trusted
+stored header chain=chain-a height=100 trusted=true
+$ $BIN queue header --state $D2 --chain chain-a --height 100 --root 0x100 --trusted; echo "exit=$?"
+stored header chain=chain-a height=100 trusted=true
+exit=0
+$ $BIN queue header --state $D2 --chain chain-a --height 100 --root 0xdead --trusted; echo "exit=$?"
+error: trusted header conflict: different root at the accepted height: chain "chain-a" height 100: submitted root "0xdead" conflicts with accepted root "0x100"
+exit=16
+```
+
+冲突后原可信头继续有效，队列照常可用：
+
+```text
+$ $BIN queue submit --state $D2 --id c1 --from chain-a --to chain-b \
+    --nonce 1 --proof-at 100 --payload x --expires-at 9000000000000
+{"id":"c1","status":"pending","reason":"awaiting first processing","attempts":0,"expiresAtMs":9000000000000}
+$ $BIN queue advance --state $D2 --now 1700000000000
+{"nowMs":1700000000000,"results":[{"id":"c1","status":"success","reason":"delivered; proof verified by trusted header at height 100"}]}
+```
+
+同高度异根的**不可信**头、以及异根的**较低**可信头都正常保存（退出码
+0），且可信覆盖范围仍是 100——证明高度 101 的消息继续等待：
+
+```text
+$ $BIN queue header --state $D2 --chain chain-a --height 100 --root 0xfeed; echo "exit=$?"
+stored header chain=chain-a height=100 trusted=false
+exit=0
+$ $BIN queue header --state $D2 --chain chain-a --height 50 --root 0x50 --trusted; echo "exit=$?"
+stored header chain=chain-a height=50 trusted=true
+exit=0
+$ $BIN queue submit --state $D2 --id c2 --from chain-a --to chain-b \
+    --nonce 2 --proof-at 101 --payload y --expires-at 9000000000000
+{"id":"c2","status":"pending","reason":"awaiting first processing","attempts":0,"expiresAtMs":9000000000000}
+$ $BIN queue advance --state $D2 --now 1700000100000
+{"nowMs":1700000100000,"results":[{"id":"c2","status":"waiting","reason":"waiting for trusted header covering height 101 (current 100)"}]}
+```
+
+作为对照，对仍在等待的 c2 用同一 ID 提交不同内容，是**消息内容**冲突（退
+出码 13），与头冲突（16）是两类错误：
+
+```text
+$ $BIN queue submit --state $D2 --id c2 --from chain-a --to chain-b \
+    --nonce 2 --proof-at 101 --payload CHANGED; echo "exit=$?"
+error: message id conflict: existing record has different content: message c2
+exit=13
+```
+
+空根按原字符串参与比较：两个空根提交幂等接受，空根与非空根同高相遇仍是头
+冲突（错误信息中会回显 accepted root ""）：
+
+```text
+$ D3=$(mktemp -d)
+$ $BIN queue register-source --state $D3 --chain x
+registered source chain x
+$ $BIN queue header --state $D3 --chain x --height 1 --root "" --trusted
+stored header chain=x height=1 trusted=true
+$ $BIN queue header --state $D3 --chain x --height 1 --root "" --trusted; echo "exit=$?"
+stored header chain=x height=1 trusted=true
+exit=0
+$ $BIN queue header --state $D3 --chain x --height 1 --root other --trusted; echo "exit=$?"
+error: trusted header conflict: different root at the accepted height: chain "x" height 1: submitted root "other" conflicts with accepted root ""
+exit=16
+```
+
+保存头不等于登记来源：只给未登记的链保存可信头，来自它的消息在推进时仍终
+结为 `unknown-source`：
+
+```text
+$ D4=$(mktemp -d)
+$ $BIN queue header --state $D4 --chain chain-ghost --height 100 --root 0x1 --trusted
+stored header chain=chain-ghost height=100 trusted=true
+$ $BIN queue submit --state $D4 --id g1 --from chain-ghost --to chain-b \
+    --nonce 1 --proof-at 1 --payload z --expires-at 9000000000000
+{"id":"g1","status":"pending","reason":"awaiting first processing","attempts":0,"expiresAtMs":9000000000000}
+$ $BIN queue advance --state $D4 --now 1700000000000
+{"nowMs":1700000000000,"results":[{"id":"g1","status":"unknown-source","reason":"unknown source chain chain-ghost"}]}
+```
+
 ### 状态语义
 
 | 状态 | 含义 | 是否终结 |
