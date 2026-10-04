@@ -128,6 +128,11 @@ type store struct {
 	snap func() *loadedState
 	// injectErr is a test hook forcing append to fail after opening the file.
 	injectErr error
+	// injectErrOnCall is a test hook that, when positive, delays injectErr
+	// until this 1-based append call number (later appends keep failing too);
+	// zero means injectErr fails every append.
+	injectErrOnCall int
+	appendCalls     int
 }
 
 // loadedState is the fully replayed (or live) queue state.
@@ -666,7 +671,8 @@ func (s *store) forceClose() {
 
 // append writes one framed, checksummed, fsynced record.
 func (s *store) append(e *logEntry) error {
-	if s.injectErr != nil {
+	s.appendCalls++
+	if s.injectErr != nil && (s.injectErrOnCall <= 0 || s.appendCalls >= s.injectErrOnCall) {
 		return s.injectErr
 	}
 	body, err := json.Marshal(e)
@@ -708,35 +714,29 @@ func (s *store) appendSubmit(rec *Record) error {
 	})
 }
 
-// appendResult records one processing outcome. On success the consumed triple
+// appendOutcome records one processing result. Every result carries the
+// processing time, the post-attempt attempt count and the resulting status and
+// reason; a waiting result additionally carries the retry instant the queue
+// layer already computed and saturated, so the log never carries an overflowed
+// negative schedule. On success the consumed triple
 // (consumeFrom/consumeTo/consumeNonce) and its consumer are part of the same
-// durable record, committing together atomically. token is nil for every
+// durable record, committing together atomically; oc.consume is nil for every
 // non-success status.
-func (s *store) appendResult(now int64, rec *Record, status, reason string, attempts int, token *consumeToken, consumeBy string) error {
+func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
 	e := &logEntry{
 		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
-		Status: status, Reason: reason, Attempts: attempts,
+		Status: oc.status, Reason: oc.reason, Attempts: attempts, NextRetry: nextRetry,
 	}
-	if status == StatusSuccess {
-		if token == nil || consumeBy == "" {
+	if oc.status == StatusSuccess {
+		if oc.consume == nil {
 			return fmt.Errorf("internal error: success result for %q missing nonce consumption", rec.Msg.Message.ID)
 		}
-		e.ConsumeFrom = token.from
-		e.ConsumeTo = token.to
-		e.ConsumeNonce = token.nonce
-		e.ConsumeBy = consumeBy
+		e.ConsumeFrom = oc.consume.from
+		e.ConsumeTo = oc.consume.to
+		e.ConsumeNonce = oc.consume.nonce
+		e.ConsumeBy = rec.Msg.Message.ID
 	}
 	return s.append(e)
-}
-
-// appendWaiting records a waiting outcome with a retry instant the queue
-// layer already computed and saturated, so the log never carries an overflowed
-// negative schedule.
-func (s *store) appendWaiting(now int64, rec *Record, reason string, attempts int, nextRetry int64) error {
-	return s.append(&logEntry{
-		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
-		Status: StatusWaiting, Reason: reason, Attempts: attempts, NextRetry: nextRetry,
-	})
 }
 
 func (s *store) appendAdvance(now int64) error {
