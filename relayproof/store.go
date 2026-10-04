@@ -497,6 +497,44 @@ func applyRecoveredState(s *loadedState, rec *Record, e *logEntry) {
 	}
 }
 
+// validateRecoveryTime validates the processing time (e.Now) carried by a
+// post-processing record — a plain result or a compacted snapshot.
+//
+// Every processing time is a non-negative Unix-millisecond instant. A plain
+// result is one incremental outcome, so its time must never move backwards:
+// neither relative to the same message's prior result nor relative to anything
+// the log has already confirmed queue-wide — a result or snapshot for a
+// different message, or an advance checkpoint. Confirmed processing results
+// count even when the current round's advance checkpoint was never saved, so
+// a later result cannot hide behind a missing checkpoint. Equal times stay
+// legal and zero is a valid processing time.
+//
+// A compacted snapshot stores each message's last historical processing
+// instant, ordered only by first submission, so those instants are not
+// expected to increase; snapshots therefore get only the non-negative check
+// and never the queue-wide floor (a 6000ms message submitted before a 2000ms
+// message is a legal snapshot). The restored queue time is still the maximum
+// of every saved instant and the advance checkpoints, applied via
+// applyRecoveredState.
+func validateRecoveryTime(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
+	if e.Now < 0 {
+		return fmt.Errorf("%w: negative processing time %d in %s entry for %q",
+			ErrCorrupt, e.Now, rk.waitingNoun, e.ID)
+	}
+	if rk != recoveryResult {
+		return nil
+	}
+	if rec.Attempts > 0 && e.Now < rec.LastProcAt {
+		return fmt.Errorf("%w: result time %d before prior time %d for %q",
+			ErrCorrupt, e.Now, rec.LastProcAt, e.ID)
+	}
+	if e.Now < s.now {
+		return fmt.Errorf("%w: result time %d before confirmed queue time %d for %q",
+			ErrCorrupt, e.Now, s.now, e.ID)
+	}
+	return nil
+}
+
 func applyEntry(s *loadedState, e *logEntry) error {
 	corrupt := func(msg string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
@@ -557,9 +595,12 @@ func applyEntry(s *loadedState, e *logEntry) error {
 	case kindResult:
 		// A plain result is one incremental processing outcome: it applies
 		// only to a known, still non-terminal record, attempts must advance by
-		// exactly one, and the processing time must never move backwards. The
-		// per-status validation (waiting schedule, success consumption,
-		// terminal fields) is shared with compacted state entries.
+		// exactly one, and the processing time must never move backwards — not
+		// relative to this message's prior result and not relative to anything
+		// already confirmed queue-wide (another message's saved result, or an
+		// advance checkpoint). The per-status validation (waiting schedule,
+		// success consumption, terminal fields) is shared with compacted state
+		// entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)
@@ -567,8 +608,8 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if isTerminal(rec.Status) {
 			return corrupt("result for terminal id %q", e.ID)
 		}
-		if rec.Attempts > 0 && e.Now < rec.LastProcAt {
-			return corrupt("result time %d before prior time %d for %q", e.Now, rec.LastProcAt, e.ID)
+		if err := validateRecoveryTime(s, rec, e, recoveryResult); err != nil {
+			return err
 		}
 		if e.Attempts != rec.Attempts+1 {
 			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
@@ -584,14 +625,21 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// A compacted snapshot stores the message's full current status after
 		// >=1 attempts: it may restore an attempt count greater than one
 		// directly, but it applies only to a known record and never twice for
-		// the same message. The per-status validation is shared with plain
-		// result entries; the two kinds stay distinct on disk.
+		// the same message. Snapshot processing times need not increase across
+		// messages (entries follow first-submission order, not last-processing
+		// order), so only the non-negative time rule applies here; the restored
+		// queue time is the maximum of all saved instants and checkpoints. The
+		// per-status validation is shared with plain result entries; the two
+		// kinds stay distinct on disk.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("state for unknown id %q", e.ID)
 		}
 		if rec.Attempts != 0 {
 			return corrupt("duplicate state for id %q", e.ID)
+		}
+		if err := validateRecoveryTime(s, rec, e, recoveryState); err != nil {
+			return err
 		}
 		if err := validateRecoveryStatus(e, recoveryState); err != nil {
 			return err
