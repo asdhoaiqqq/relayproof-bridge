@@ -51,6 +51,17 @@ import (
 // not match the record it is attached to — a genuinely inconsistent old
 // record — rejects the whole directory with ErrCorrupt instead of silently
 // accepting or "repairing" the bad entry.
+//
+// Processing-time validation on replay: a plain result's time must be a
+// non-negative Unix-millisecond instant and no earlier than any queue-wide
+// time the log has already confirmed — an advance checkpoint or any earlier
+// result or snapshot, of any message — because no legal advance can produce
+// an outcome stamped before the time the queue had already reached. A
+// compacted snapshot's time must likewise be non-negative, but snapshots need
+// not be time-ordered among themselves: each records its own message's last
+// processing instant in first-submission order. A complete, checksum-valid
+// record that violates these rules is corrupt (ErrCorrupt), never a
+// truncatable torn tail, so the log's length and bytes are preserved.
 
 const (
 	logName          = "queue.log"
@@ -430,6 +441,24 @@ var (
 	recoveryState  = recoveryKind{waitingNoun: "state", entryNoun: "state"}
 )
 
+// validateRecoveryTime is the shared processing-time floor for a result entry
+// and a compacted state entry: the time is a Unix-millisecond instant and can
+// never be negative (zero is a valid processing time). The additional
+// monotonicity rule — a plain result may not predate any queue-wide time the
+// log has already confirmed — lives in applyEntry, because it does not apply
+// to snapshots: compaction writes snapshots in first-submission order, each
+// stamped with its own message's last processing instant, so a later snapshot
+// may legitimately carry an earlier time than the ones before it.
+func validateRecoveryTime(e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	if e.Now < 0 {
+		return corrupt("%s time %d is negative for %q", rk.waitingNoun, e.Now, e.ID)
+	}
+	return nil
+}
+
 // validateRecoveryStatus is the first shared check for a result entry and a
 // compacted state entry: the carried status must be one of the known statuses
 // and must never be pending (pending is established by the submit entry, not
@@ -557,9 +586,15 @@ func applyEntry(s *loadedState, e *logEntry) error {
 	case kindResult:
 		// A plain result is one incremental processing outcome: it applies
 		// only to a known, still non-terminal record, attempts must advance by
-		// exactly one, and the processing time must never move backwards. The
-		// per-status validation (waiting schedule, success consumption,
-		// terminal fields) is shared with compacted state entries.
+		// exactly one, and the processing time must be a non-negative instant
+		// that never moves backwards — neither against the message's own prior
+		// processing nor against any queue-wide time the log has already
+		// confirmed: an advance checkpoint, or any earlier result or snapshot
+		// of any message, checkpointed or not. A result stamped earlier than
+		// that is an outcome no legal advance can have produced, however
+		// intact and well-checksummed the record is. The per-status
+		// validation (waiting schedule, success consumption, terminal fields)
+		// is shared with compacted state entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)
@@ -567,8 +602,17 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if isTerminal(rec.Status) {
 			return corrupt("result for terminal id %q", e.ID)
 		}
+		if err := validateRecoveryTime(e, recoveryResult); err != nil {
+			return err
+		}
+		// s.now never drops below any record's LastProcAt, so the same-message
+		// check is the queue-wide one restricted to this record; it stays
+		// first to keep its historical error wording.
 		if rec.Attempts > 0 && e.Now < rec.LastProcAt {
 			return corrupt("result time %d before prior time %d for %q", e.Now, rec.LastProcAt, e.ID)
+		}
+		if e.Now < s.now {
+			return corrupt("result time %d before known time %d for %q", e.Now, s.now, e.ID)
 		}
 		if e.Attempts != rec.Attempts+1 {
 			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
@@ -584,14 +628,22 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// A compacted snapshot stores the message's full current status after
 		// >=1 attempts: it may restore an attempt count greater than one
 		// directly, but it applies only to a known record and never twice for
-		// the same message. The per-status validation is shared with plain
-		// result entries; the two kinds stay distinct on disk.
+		// the same message. Its processing time must be non-negative, but —
+		// unlike a plain result — it need not exceed the times of the
+		// snapshots before it: compaction writes snapshots in first-submission
+		// order, each stamped with its own message's last processing instant,
+		// so their times are not ordered among themselves. The per-status
+		// validation is shared with plain result entries; the two kinds stay
+		// distinct on disk.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("state for unknown id %q", e.ID)
 		}
 		if rec.Attempts != 0 {
 			return corrupt("duplicate state for id %q", e.ID)
+		}
+		if err := validateRecoveryTime(e, recoveryState); err != nil {
+			return err
 		}
 		if err := validateRecoveryStatus(e, recoveryState); err != nil {
 			return err
