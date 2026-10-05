@@ -2,6 +2,7 @@ package relayproof
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 )
 
 // On-disk format (queue.log):
@@ -52,6 +54,19 @@ import (
 // not match the record it is attached to — a genuinely inconsistent old
 // record — rejects the whole directory with ErrCorrupt instead of silently
 // accepting or "repairing" the bad entry.
+//
+// Header roots are arbitrary byte strings and must survive the log
+// byte-for-byte: roots compare as their exact bytes, so two roots that differ
+// in any byte are different roots. JSON string encoding silently rewrites
+// invalid UTF-8 bytes to U+FFFD, which would merge distinct roots (and make a
+// resubmitted original root conflict with its own saved value after a
+// reopen). A root that is valid UTF-8 — including the empty root — keeps the
+// historical plain "root" field, so existing logs keep their meaning
+// byte-for-byte; a root holding invalid UTF-8 bytes is stored base64-encoded
+// in "rootB64" instead, preserving the exact byte sequence across save,
+// reopen and compaction. Roots an older build already rewrote to replacement
+// characters stay those characters on replay — the lost bytes are never
+// guessed.
 //
 // Processing-time validation on replay: a plain result's time must be a
 // non-negative Unix-millisecond instant and no earlier than any queue-wide
@@ -96,6 +111,11 @@ type logEntry struct {
 	Root    string `json:"root,omitempty"`
 	Trusted bool   `json:"trusted,omitempty"`
 
+	// RootB64 carries a header root's raw bytes base64-encoded when the root
+	// is not valid UTF-8; see setRoot/headerRoot. Never set together with
+	// Root.
+	RootB64 string `json:"rootB64,omitempty"`
+
 	Seq       int64  `json:"seq,omitempty"`
 	ID        string `json:"id,omitempty"`
 	From      string `json:"from,omitempty"`
@@ -123,6 +143,40 @@ type logEntry struct {
 	// is accepted only while replaying logs written by older builds and is
 	// never written anymore.
 	ConsumeKey string `json:"consumeKey,omitempty"`
+}
+
+// setRoot encodes a header root for the log without altering its bytes. A
+// root that is valid UTF-8 (including the empty root) keeps the historical
+// plain "root" field, so logs stay byte-compatible with older builds. A root
+// holding invalid UTF-8 bytes would be silently rewritten to U+FFFD by JSON
+// string encoding, so it is instead stored base64-encoded in "rootB64",
+// preserving the exact byte sequence across save, reopen and compaction.
+func (e *logEntry) setRoot(root string) {
+	if utf8.ValidString(root) {
+		e.Root = root
+		return
+	}
+	e.RootB64 = base64.StdEncoding.EncodeToString([]byte(root))
+}
+
+// headerRoot decodes a header entry's root back to its exact submitted
+// bytes. Entries written before rootB64 existed carry only "root" and are
+// taken at face value — including roots an old build had already rewritten to
+// replacement characters, which stay those characters; the lost bytes are
+// never guessed. An entry carrying both fields, or a rootB64 that does not
+// decode, is an inconsistent record no build writes and is corrupt.
+func (e *logEntry) headerRoot() (string, error) {
+	if e.RootB64 == "" {
+		return e.Root, nil
+	}
+	if e.Root != "" {
+		return "", fmt.Errorf("header entry carries both root and rootB64")
+	}
+	raw, err := base64.StdEncoding.DecodeString(e.RootB64)
+	if err != nil {
+		return "", fmt.Errorf("header entry carries undecodable rootB64: %v", err)
+	}
+	return string(raw), nil
 }
 
 // legacyNonceKey reproduces the consumption string used by older builds:
@@ -584,6 +638,10 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if e.Chain == "" || e.Height < 0 {
 			return corrupt("bad header entry: %+v", e)
 		}
+		root, err := e.headerRoot()
+		if err != nil {
+			return corrupt("bad header entry: %v", err)
+		}
 		// Replay is permissive: historical same-height coverage is never
 		// rejected as a conflict, and recovery relies only on the header
 		// records actually kept in the log. The latest header is the last one
@@ -595,7 +653,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			hs = &headerState{}
 			s.headers[e.Chain] = hs
 		}
-		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted}
+		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: root, Trusted: e.Trusted}
 		if e.Trusted && (hs.trusted == nil || e.Height >= hs.trusted.Height) {
 			t := hs.latest
 			hs.trusted = &t
@@ -799,7 +857,9 @@ func (s *store) appendRegisterSource(chain string) error {
 }
 
 func (s *store) appendHeader(h Header) error {
-	return s.append(&logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Root: h.Root, Trusted: h.Trusted})
+	e := &logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Trusted: h.Trusted}
+	e.setRoot(h.Root)
+	return s.append(e)
 }
 
 func (s *store) appendSubmit(rec *Record) error {
@@ -866,10 +926,14 @@ func (s *store) compact(state *loadedState) error {
 		// highest trusted as the max-height trusted entry, so this order
 		// restores both exactly.
 		if hs.trusted != nil {
-			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.trusted.Chain, Height: hs.trusted.Height, Root: hs.trusted.Root, Trusted: hs.trusted.Trusted})
+			e := &logEntry{T: kindHeader, Chain: hs.trusted.Chain, Height: hs.trusted.Height, Trusted: hs.trusted.Trusted}
+			e.setRoot(hs.trusted.Root)
+			entries = append(entries, e)
 		}
 		if hs.trusted == nil || hs.latest != *hs.trusted {
-			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.latest.Chain, Height: hs.latest.Height, Root: hs.latest.Root, Trusted: hs.latest.Trusted})
+			e := &logEntry{T: kindHeader, Chain: hs.latest.Chain, Height: hs.latest.Height, Trusted: hs.latest.Trusted}
+			e.setRoot(hs.latest.Root)
+			entries = append(entries, e)
 		}
 	}
 
