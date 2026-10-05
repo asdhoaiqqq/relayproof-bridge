@@ -227,15 +227,21 @@ func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 // line already read has been processed in order; any unterminated fragment
 // delivered together with the read error is part of the failed read rather
 // than a complete log line, so it is neither normalized nor counted and gets
-// no result of its own. A write error is returned wrapped with ErrLogWrite
-// and leaves the failure count unchanged: an output end that acknowledges
-// fewer bytes than offered with a nil error (an io.Writer contract
-// violation) ends the run the same way, with io.ErrShortWrite kept in the
-// error chain instead of retried until it recovers; bytes already accepted
-// remain as the prefix of the would-be output, including an incomplete final
-// JSON record. When both sides fail, the earlier read error is reported. A
-// clean EOF is not an error, including when the final complete line has no
-// trailing newline.
+// no result of its own. A read error is recorded at the exact Read call that
+// returns it, including when that call hands back complete newline-ended
+// logs in the same delivery, so it stays the primary failure even when the
+// output later fails while emitting those very results: the write failure is
+// shown in the message text but is not wrapped, and neither ErrLogWrite nor
+// the write's cause matches via errors.Is. Conversely, a write failure with
+// no read error in hand is reported as such immediately, without reading any
+// further input to decide precedence. A write error is returned wrapped with
+// ErrLogWrite and leaves the failure count unchanged: an output end that
+// acknowledges fewer bytes than offered with a nil error (an io.Writer
+// contract violation) ends the run the same way, with io.ErrShortWrite kept
+// in the error chain instead of retried until it recovers; bytes already
+// accepted remain as the prefix of the would-be output, including an
+// incomplete final JSON record. A clean EOF is not an error, including when
+// the final complete line has no trailing newline.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	return NormalizeReaderFiltered(r, w, nil)
 }
@@ -250,29 +256,36 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 // was inside, outside, or absent from the network, and later lines keep
 // processing. A nil filter reproduces NormalizeReader exactly.
 func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter) (failures int, err error) {
-	reader := bufio.NewReader(r)
 	// Guard the output end before buffering: a result that exceeds the
 	// 4 KiB buffer is forwarded straight to the underlying Writer, so the
 	// Flush path alone cannot catch a nil-error short acknowledgement there.
 	bw := bufio.NewWriter(shortWriteDetectingWriter{w: w})
-	var readErr error // first stream read error, reported even if flushing fails
+	var readErr error // first stream read error, always the primary failure
+	// readErrorWins reports a write fault after a read fault has already been
+	// delivered: the read failure and its original cause stay the only error
+	// chain (both reachable via errors.Is), while the later write fault only
+	// contributes its message text and must not replace or join the chain.
+	readErrorWins := func(writeErr error) error {
+		wrapped := fmt.Errorf("%w: %w", ErrLogRead, readErr)
+		if writeErr != nil {
+			wrapped = fmt.Errorf("%w: %v", wrapped, writeErr)
+		}
+		return wrapped
+	}
 	defer func() {
 		flushErr := bw.Flush()
 		if err != nil {
-			return // a mid-stream error was already wrapped above
+			// A mid-stream error was already wrapped above; a write fault met
+			// there was classified against readErr at the instant it fired.
+			return
 		}
 		switch {
 		case readErr != nil:
-			// The original read failure must survive a write failure
-			// during shutdown: both the read marker and the underlying
-			// cause stay reachable via errors.Is, while the later flush
-			// failure only contributes its text (it must not mask the
-			// original cause).
-			wrapped := fmt.Errorf("%w: %w", ErrLogRead, readErr)
-			if flushErr != nil {
-				wrapped = fmt.Errorf("%w: %v", wrapped, flushErr)
-			}
-			err = wrapped
+			// The original read failure must survive a write failure during
+			// shutdown: both the read marker and the underlying cause stay
+			// reachable via errors.Is, while the later flush failure only
+			// contributes its text (it must not mask the original cause).
+			err = readErrorWins(flushErr)
 		case flushErr != nil:
 			err = fmt.Errorf("%w: %w", ErrLogWrite, flushErr)
 		}
@@ -280,45 +293,112 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 	encoder := json.NewEncoder(bw)
 	encoder.SetEscapeHTML(false)
 
+	// Drive the upstream Reader directly instead of bufio.Reader.ReadBytes.
+	// ReadBytes latches an error that arrives together with a
+	// delimiter-ended chunk: the complete line comes back with a nil error and
+	// the fault is only returned on the NEXT call. Emitting that line could
+	// then fail on the output first, and the plain write return would mask the
+	// already-delivered read cause. Owning the loop makes every (bytes, err)
+	// pair observable at the exact call it arrives, so a non-EOF fault is
+	// recorded before the bytes that came with it are processed and can never
+	// be reclassified by a write fault that follows in processing order. A
+	// clean EOF is recorded as ordinary end-of-input and is never a fault.
+	var pending []byte
+	chunk := make([]byte, 64*1024)
 	lineNo := 0
+	emptyReads := 0
+	// processLine normalizes and emits one complete physical line (including
+	// its trailing newline). It reports only an output failure; per-line
+	// normalization failures are counted and emitted as results instead.
+	processLine := func(raw []byte) error {
+		lineNo++
+		if strings.TrimSpace(string(raw)) == "" {
+			return nil
+		}
+		result := NormalizeLine(lineNo, raw)
+		emit := true
+		if !result.OK {
+			failures++
+		} else if filter != nil && !filter.admits(result.Event.SourceIP) {
+			// A valid event whose normalized source is outside the selected
+			// network (or absent, or still IPv6) is filtered out: no result and
+			// no failure. The filter never runs on failed lines, so a bad
+			// address outside the network is still reported as a failure.
+			emit = false
+		}
+		if !emit {
+			return nil
+		}
+		return encoder.Encode(result)
+	}
+	// writeFailure classifies an output fault: once a read fault is in hand it
+	// stays primary even though the write fired first in time; otherwise this
+	// is the ordinary write-failure report and processing stops without
+	// reading any further input to decide precedence.
+	writeFailure := func(werr error) error {
+		if readErr != nil {
+			return readErrorWins(werr)
+		}
+		return fmt.Errorf("%w: %w", ErrLogWrite, werr)
+	}
+
 	for {
-		line, rerr := reader.ReadBytes('\n')
-		complete := rerr == nil || errors.Is(rerr, io.EOF)
-		if !complete {
-			// The read failed mid-line: the bytes in hand are a fragment
-			// of the failed read, not a complete log line. Keep the line
-			// numbering of processed lines stable, emit nothing for the
-			// fragment, and surface only the read failure on return.
-			readErr = rerr
-			return failures, nil
-		}
-		if len(line) > 0 {
-			lineNo++
-			if strings.TrimSpace(string(line)) != "" {
-				result := NormalizeLine(lineNo, line)
-				emit := true
-				if !result.OK {
-					failures++
-				} else if filter != nil && !filter.admits(result.Event.SourceIP) {
-					// A valid event whose normalized source is outside the
-					// selected network (or absent, or still IPv6) is
-					// filtered out: no result and no failure. The filter
-					// never runs on failed lines, so a bad address outside
-					// the network is still reported as a failure.
-					emit = false
-				}
-				if emit {
-					if encErr := encoder.Encode(result); encErr != nil {
-						return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
-					}
-				}
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
+		n, rerr := r.Read(chunk)
+		if n > 0 {
+			pending = append(pending, chunk[:n]...)
+			emptyReads = 0
+		} else if rerr == nil {
+			// A well-behaved Reader never returns (0, nil); bound the
+			// retries instead of spinning without progress, matching bufio.
+			emptyReads++
+			if emptyReads > 100 {
+				readErr = io.ErrNoProgress
 				return failures, nil
 			}
+			continue
+		}
+		eof := errors.Is(rerr, io.EOF)
+		fault := rerr != nil && !eof
+		if fault {
+			// The fault is recorded before the bytes delivered with it are
+			// touched, so it survives even if pushing their results out fails.
 			readErr = rerr
+		}
+
+		// Process every newline-ended line the delivered bytes complete.
+		for {
+			i := bytes.IndexByte(pending, '\n')
+			if i < 0 {
+				break
+			}
+			raw := pending[:i+1]
+			werr := processLine(raw)
+			pending = pending[i+1:]
+			if werr != nil {
+				return failures, writeFailure(werr)
+			}
+		}
+		if len(pending) == 0 {
+			// Release the grown accumulator once every delivered byte is a
+			// processed complete line, so retention tracks the longest line
+			// rather than the whole stream.
+			pending = nil
+		}
+
+		switch {
+		case fault:
+			// The newline-less remainder belongs to the failed read: it is
+			// neither normalized nor counted and gets no result of its own.
+			// Stop immediately; no further input is read to set precedence.
+			return failures, nil
+		case eof:
+			// A clean EOF is normal completion: any remaining bytes are the
+			// final complete line without a trailing newline.
+			if len(pending) > 0 {
+				if werr := processLine(pending); werr != nil {
+					return failures, writeFailure(werr)
+				}
+			}
 			return failures, nil
 		}
 	}
