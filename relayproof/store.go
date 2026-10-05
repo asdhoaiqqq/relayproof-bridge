@@ -68,6 +68,22 @@ import (
 // characters stay those characters on replay — the lost bytes are never
 // guessed.
 //
+// Message payloads have the same contract and use the same encoding: the Go
+// submit interface accepts any string without requiring valid UTF-8 (empty
+// text, NUL bytes, stray 0xFF/0xFE bytes or text mixed with them), and a
+// payload read back after a reopen or compaction must equal the submitted
+// bytes exactly, since payloads participate in same-id content comparison. A
+// valid-UTF-8 payload keeps the historical plain "payload" field, so existing
+// logs and the CLI stay compatible; an invalid-UTF-8 payload is stored
+// base64-encoded in "payloadB64". The bytes 0xFF, 0xFE and the legal
+// character U+FFFD are three different payloads and are never conflated.
+// Payloads an older build already rewrote to replacement characters stay
+// those characters on replay — again, the lost bytes are never guessed. A
+// checksum-valid record carrying an undecodable payloadB64, or both payload
+// fields at once, is no record any build writes and rejects the directory
+// with ErrCorrupt, leaving the file untouched — it is never read back as an
+// empty or replacement-filled payload.
+//
 // Processing-time validation on replay: a plain result's time must be a
 // non-negative Unix-millisecond instant and no earlier than any queue-wide
 // time the log has already confirmed — an advance checkpoint or any earlier
@@ -125,6 +141,11 @@ type logEntry struct {
 	ProofAt   int64  `json:"proofAt,omitempty"`
 	ExpiresAt int64  `json:"expiresAt,omitempty"`
 
+	// PayloadB64 carries a message payload's raw bytes base64-encoded when the
+	// payload is not valid UTF-8; see setPayload/entryPayload. Never set
+	// together with Payload.
+	PayloadB64 string `json:"payloadB64,omitempty"`
+
 	Now       int64  `json:"now,omitempty"`
 	Status    string `json:"status,omitempty"`
 	Reason    string `json:"reason,omitempty"`
@@ -175,6 +196,42 @@ func (e *logEntry) headerRoot() (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(e.RootB64)
 	if err != nil {
 		return "", fmt.Errorf("header entry carries undecodable rootB64: %v", err)
+	}
+	return string(raw), nil
+}
+
+// setPayload encodes a message payload for the log without altering its
+// bytes. A payload that is valid UTF-8 (including the empty payload) keeps
+// the historical plain "payload" field, so logs stay byte-compatible with
+// older builds and the CLI text interface. A payload holding invalid UTF-8
+// bytes would be silently rewritten to U+FFFD by JSON string encoding, so it
+// is instead stored base64-encoded in "payloadB64", preserving the exact
+// byte sequence and order across save, reopen and compaction.
+func (e *logEntry) setPayload(payload string) {
+	if utf8.ValidString(payload) {
+		e.Payload = payload
+		return
+	}
+	e.PayloadB64 = base64.StdEncoding.EncodeToString([]byte(payload))
+}
+
+// entryPayload decodes a submit entry's payload back to its exact submitted
+// bytes. Entries written before payloadB64 existed carry only "payload" and
+// are taken at face value — including payloads an old build had already
+// rewritten to replacement characters, which stay those characters; the lost
+// bytes are never guessed. An entry carrying both fields, or a payloadB64
+// that does not decode, is an inconsistent record no build writes and is
+// corrupt; it is never read back as an empty or replacement-filled payload.
+func (e *logEntry) entryPayload() (string, error) {
+	if e.PayloadB64 == "" {
+		return e.Payload, nil
+	}
+	if e.Payload != "" {
+		return "", fmt.Errorf("submit entry carries both payload and payloadB64")
+	}
+	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
+	if err != nil {
+		return "", fmt.Errorf("submit entry carries undecodable payloadB64: %v", err)
 	}
 	return string(raw), nil
 }
@@ -668,6 +725,10 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if e.Seq != s.nextSeq {
 			return corrupt("submit seq %d out of order, expected %d", e.Seq, s.nextSeq)
 		}
+		payload, err := e.entryPayload()
+		if err != nil {
+			return corrupt("bad submit entry: %v", err)
+		}
 		s.records[e.ID] = &Record{
 			Msg: Envelope{
 				Message: Message{
@@ -675,7 +736,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 					From:    e.From,
 					To:      e.To,
 					Nonce:   e.Nonce,
-					Payload: e.Payload,
+					Payload: payload,
 					ProofAt: e.ProofAt,
 				},
 				ExpiresAt: e.ExpiresAt,
@@ -864,10 +925,12 @@ func (s *store) appendHeader(h Header) error {
 
 func (s *store) appendSubmit(rec *Record) error {
 	m := rec.Msg.Message
-	return s.append(&logEntry{
+	e := &logEntry{
 		T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
-		Nonce: m.Nonce, Payload: m.Payload, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
-	})
+		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
+	}
+	e.setPayload(m.Payload)
+	return s.append(e)
 }
 
 // appendOutcome records one processing result. Every result carries the
@@ -947,10 +1010,12 @@ func (s *store) compact(state *loadedState) error {
 	for _, seq := range seqs {
 		rec := bySeq[seq]
 		m := rec.Msg.Message
-		entries = append(entries, &logEntry{
+		se := &logEntry{
 			T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
-			Nonce: m.Nonce, Payload: m.Payload, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
-		})
+			Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
+		}
+		se.setPayload(m.Payload)
+		entries = append(entries, se)
 		if rec.Attempts > 0 {
 			re := &logEntry{
 				T: kindState, Now: rec.LastProcAt, ID: m.ID,
