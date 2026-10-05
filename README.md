@@ -31,13 +31,24 @@ $BIN queue header --state $DIR --chain chain-a --height 100 --root 0x100 --trust
 $BIN queue submit --state $DIR --id m1 --from chain-a --to chain-b \
   --nonce 7 --proof-at 100 --payload hello --expires-at 9000000000000
 
-# 由用户提供处理时间（Unix 毫秒）推进；相同时间可重复推进，倒退被拒绝
+# 由用户提供处理时间（Unix 毫秒）推进；相同时间可重复推进，倒退被拒绝；
+# results 按发生顺序列出本次推进内的处理结果，同一消息可能出现多条
 $BIN queue advance --state $DIR --now 1700000000000
 
 # 查询：原消息、状态、具体原因、下次重试时间
 $BIN queue query --state $DIR --id m1
 $BIN queue query --state $DIR
 ```
+
+### 推进结果（results）与消息当前状态（query）
+
+`advance` 输出的 `results` 按发生顺序保留**本次推进**内的每一条处理结果：
+一条消息在同一次推进中被处理多次时，会相应出现多条记录（例如先进入等待，
+随后在同一次推进末尾的重放/过期复查中被终结）。`query` 返回的则是消息的
+**当前**状态——单个状态快照，不保留历史。因此 results 中的 `waiting` 条目
+只表示“本次推进中曾有一次处理进入等待”，并不保证推进结束后它仍在等待；
+推进结束后的状态、尝试次数与重试安排一律以 `query` 为准。本文示例中的时间
+均为用户提供的 Unix 毫秒处理时间，`--expires-at 0` 表示不过期。
 
 ### 头信息与可信覆盖范围
 
@@ -148,6 +159,91 @@ $ $BIN queue advance --state $DIR --now 1700000001000
 `1700000001000`）；`1700000000500` 已写入可信头 120 但重试未到期，仍等待；
 `1700000001000` 重试到期再推进，m110 成功。
 
+### 连续示例：一次推进内先等待、后重放
+
+本例在全新目录中原样复现：登记来源链 `a`，保存高度 100 的可信头，依次提
+交两条发往 `b`、nonce 同为 7 的消息 `early`（证明高度 101）和 `later`（证
+明高度 100）；两条消息都不过期（`--expires-at 0`）。然后在处理时间 1000
+推进一次：
+
+```text
+$ BIN=./relayproof                 # 或 go run ./cmd/relayproof
+$ DIR=$(mktemp -d)
+$ $BIN queue register-source --state $DIR --chain a
+registered source chain a
+$ $BIN queue header --state $DIR --chain a --height 100 --root 0x100 --trusted
+stored header chain=a height=100 trusted=true
+$ $BIN queue submit --state $DIR --id early --from a --to b \
+    --nonce 7 --proof-at 101 --payload early --expires-at 0
+{"id":"early","status":"pending","reason":"awaiting first processing","attempts":0}
+$ $BIN queue submit --state $DIR --id later --from a --to b \
+    --nonce 7 --proof-at 100 --payload later --expires-at 0
+{"id":"later","status":"pending","reason":"awaiting first processing","attempts":0}
+$ $BIN queue advance --state $DIR --now 1000
+{"nowMs":1000,"results":[{"id":"early","status":"waiting","reason":"waiting for trusted header covering height 101 (current 100)"},{"id":"later","status":"success","reason":"delivered; proof verified by trusted header at height 100"},{"id":"early","status":"replay","reason":"nonce combination already consumed by message later"}]}
+```
+
+`results` 按发生顺序完整记录了这一次推进的处理过程：
+
+1. **early 等待**：early 先提交、先处理，但它的证明高度 101 没有被可信头
+   100 覆盖，进入等待并安排退避重试，**不消费 nonce**——等待中的消息不会
+   替自己、也不会替别人占用 nonce。
+2. **later 成功**：later 的证明高度 100 被可信头 100 覆盖，投递成功并消费
+   `(a, b, 7)`。成功原因引用的是投递时实际采用的可信头高度 **100**。
+3. **early 判为重放**：每次推进末尾都会对所有未终结消息复查重放与过期，刚
+   刚安排的退避不能屏蔽这次复查。later 已经消费了 nonce，early 随即在同一
+   次推进中终结为 `replay`，原因指向真正成功的消息 **later**。
+
+所以消费 nonce 的是 later：**先提交只决定先处理，不决定谁先消费 nonce**；
+nonce 只在真正投递成功时才被消费。
+
+推进结束后分别查询，看到的是两条消息各自的当前状态：
+
+```text
+$ $BIN queue query --state $DIR --id early
+{"id":"early","from":"a","to":"b","nonce":7,"payload":"early","proofAtHeight":101,"status":"replay","reason":"nonce combination already consumed by message later","attempts":2}
+$ $BIN queue query --state $DIR --id later
+{"id":"later","from":"a","to":"b","nonce":7,"payload":"later","proofAtHeight":100,"status":"success","reason":"delivered; proof verified by trusted header at height 100","attempts":1}
+```
+
+- early 的当前状态是 `replay`、尝试次数为 **2**、已没有下次重试时间。它在
+  本次推进中经历了两次处理（第一次等待、第二次重放），所以 `results` 里它
+  的两条记录都应保留；其中的 waiting 条目不表示推进结束后仍在等待。第一
+  次处理（时间 1000，第一档退避 1 秒）曾把重试安排在 **2000**，但随后的
+  重放终结了这条消息，该安排随之取消——查询结果不再含 `nextRetryMs`。查
+  询仍返回原消息的内容（`a → b`、nonce 7、payload `early`、证明高度 101）
+  与最终原因（指向 later）。
+- later 的当前状态是 `success`、尝试次数为 **1**、也没有下次重试时间。
+
+#### 边界：两条都未覆盖时，相同 nonce 不会判重放
+
+若最初保存的是高度 **99** 的可信头，则 early（证明高度 101）和 later（证
+明高度 100）都不满足覆盖条件。推进后两条各自等待、各有一次尝试并分别安排
+重试，nonce 仍未被任何消息消费，**不会仅因 nonce 相同就判其中一条重放**：
+
+```text
+$ D2=$(mktemp -d)
+$ $BIN queue register-source --state $D2 --chain a
+registered source chain a
+$ $BIN queue header --state $D2 --chain a --height 99 --root 0x99 --trusted
+stored header chain=a height=99 trusted=true
+$ $BIN queue submit --state $D2 --id early --from a --to b \
+    --nonce 7 --proof-at 101 --payload early --expires-at 0
+{"id":"early","status":"pending","reason":"awaiting first processing","attempts":0}
+$ $BIN queue submit --state $D2 --id later --from a --to b \
+    --nonce 7 --proof-at 100 --payload later --expires-at 0
+{"id":"later","status":"pending","reason":"awaiting first processing","attempts":0}
+$ $BIN queue advance --state $D2 --now 1000
+{"nowMs":1000,"results":[{"id":"early","status":"waiting","reason":"waiting for trusted header covering height 101 (current 99)"},{"id":"later","status":"waiting","reason":"waiting for trusted header covering height 100 (current 99)"}]}
+$ $BIN queue query --state $D2 --id early
+{"id":"early","from":"a","to":"b","nonce":7,"payload":"early","proofAtHeight":101,"status":"waiting","reason":"waiting for trusted header covering height 101 (current 99)","attempts":1,"nextRetryMs":2000}
+$ $BIN queue query --state $D2 --id later
+{"id":"later","from":"a","to":"b","nonce":7,"payload":"later","proofAtHeight":100,"status":"waiting","reason":"waiting for trusted header covering height 100 (current 99)","attempts":1,"nextRetryMs":2000}
+```
+
+相同 nonce 在提交时并不互斥；只有当其中一条先被可信头覆盖、真正投递成功
+并消费 nonce 后，其余消息才会在处理时记为 `replay`。
+
 ### 连续示例：同高度头冲突的边界
 
 在另一个全新目录中，当前最高可信头为高度 100、根 `0x100`。同高度同根正常
@@ -254,7 +350,10 @@ $ $BIN queue advance --state $D4 --now 1700000000000
   字符拼接三个值，因此 `a:b→c` 与 `a→b:c`（以及 `a␀b→c` 与 `a→b␀c`，
   仅能通过 Go 接口提交）即使 nonce 相同也互不影响，各自最多成功一次。
 - 每次推进先按首次提交顺序处理到期消息（新消息在下一次推进时首次处理），
-  随后对所有未终结消息重新检查重放与过期；两者同时满足时按重放处理。
+  随后对所有未终结消息重新检查重放与过期；两者同时满足时按重放处理。因此
+  同一条消息可能在一次推进的 `results` 中出现多条（如先等待、随后被重放
+  终结），两条记录都保留；`results` 是本次处理过程的顺序记录，消息推进后
+  的最终状态、尝试次数与重试安排以 `query` 为准。
 - 来源已登记但头不可信或高度不足时保持等待、不消费 nonce；更新头信息不
   绕过重试时间。等待重试间隔依次为 1、2、4、8、16、32 秒，之后 60 秒封顶，
   从实际处理时间计算；一次推进跨过多个间隔也只处理一次。重试时刻按
