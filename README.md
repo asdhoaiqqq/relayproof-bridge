@@ -285,7 +285,10 @@ UTC 时区、动作首尾带空白、IPv6 用等价的冗长写法；未知字�
 - 成功：`{"line":行号,"ok":true,"event":...}`，`event` 为规范化后的事件；
 - 失败：`{"line":行号,"ok":false,"error":"原因"}`，带原始物理行号与原因，
   不带 `event` 字段。某行失败不会阻止后续日志处理，后续行仍按原顺序输出。
-- 空白行不产生任何输出，但仍占用一个物理行号。
+- 空白行不产生任何输出，但仍占用一个物理行号。这里的“空白行”按 Unicode 空白
+  判定，含整行只有 U+00A0/U+3000 等特殊空白的行；它们被跳过并不意味着这些字符
+  能充当 JSON 分隔符——区别详见
+  [空白字符：整行、JSON 分隔符与字符串内容](#空白字符整行json-分隔符与字符串内容)。
 
 **标准错误**只用于流级诊断，不会逐行重复失败原因——每行失败的具体原因只出现在
 标准输出对应记录的 `error` 字段里。仅有日志行失败、输入输出正常结束时，标准错误
@@ -301,6 +304,185 @@ UTC 时区、动作首尾带空白、IPv6 用等价的冗长写法；未知字�
 
 因此批量规范化后应先看退出状态：`1` 只是其中几条日志无效，`2` 才表示本次
 输入输出已经中断。
+
+### 空白字符：整行、JSON 分隔符与字符串内容
+
+`normalize` 按换行划分物理行。同一个“空白”字符落在不同位置，结果完全不同，
+按三种位置说明；下列结论都可用本节命令离线复现。
+
+| 位置 | 哪些字符算空白 | 结果 |
+|---|---|---|
+| 独占一整行 | 任意 Unicode 空白（见位置一） | 整行跳过：占用行号、无输出、不计失败 |
+| JSON 对象之外或成员之间 | 仅空格 U+0020、水平制表 U+0009、回车 U+000D、换行 U+000A 四种 | 其余字符（含 U+00A0、U+3000、U+000B）令该行因 JSON 语法错误失败 |
+| JSON 字符串值内部（`action`、未知字段等） | 不是分隔符，是普通字符 | 按该字段的值规则处理（`action` 去首尾空白；未知字段原样进 `extra`） |
+
+#### 位置一：整行只有空白 —— 跳过
+
+`NormalizeReader` 对每个物理行先做“是否为空白行”判定：去掉 Unicode 空白后为
+空就跳过。因此仅含不换行空格 U+00A0（UTF-8 字节 `c2 a0`）、全角空格 U+3000
+（`e3 80 80`）、垂直制表 U+000B、换页 U+000C，或只由空格/制表/回车/换行混合
+而成的行，都与空行同等对待。被跳过的行**仍占用一个物理行号**，不产生结果，也
+**不计入失败**。
+
+例：两条合法日志中间夹一行只有 U+00A0 的行（退出状态 `0`，标准错误为空）。
+
+```bash
+NBSP=$'\xc2\xa0'   # 仅含不换行空格 U+00A0 的一行；换成 $'\xe3\x80\x80' 即全角空格 U+3000
+printf '%s\n%s\n%s\n' \
+  '{"timestamp":"2026-10-04T08:30:00Z","action":"login"}' \
+  "$NBSP" \
+  '{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}' \
+  | ./bin/relayproof normalize
+echo "normalize exit=${PIPESTATUS[1]}"
+```
+
+逐行输出（中间行占用第 2 行但没有任何记录，所以两条成功记录是 `line:1` 与
+`line:3`）：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+{"line":3,"ok":true,"event":{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}}
+```
+
+注意：**整行被跳过，不表示这些字符能当 JSON 分隔符。** 空白行判定按 Unicode
+空白处理；只要同一行还带有 JSON 对象，对象之外与成员之间就只认下面位置二的
+四种 JSON 空白。
+
+#### 位置二：对象之外、成员之间只接受四种 JSON 空白
+
+RFC 8259 的 JSON 语法只允许空格（U+0020）、水平制表（U+0009）、回车
+（U+000D）、换行（U+000A）出现在记号之间。规范化在解析前只裁掉文档首尾的这
+四种字符（刻意不用会额外吞掉 U+00A0、U+3000、U+000B 的 `bytes.TrimSpace`），
+目的就是让非法分隔符原样到达解析器并被拒绝，而不是被悄悄删除。
+
+- **换行 U+000A 会结束当前物理行。** `normalize` 是逐行入口，不能用换行把一个
+  对象拆成多行喂入；拆开的两半各自成行、各自失败（退出状态 `1`，标准错误为空）：
+
+  ```console
+  $ printf '%s\n%s\n' '{"timestamp":"2026-10-04T08:30:00Z",' '"action":"login"}' \
+      | ./bin/relayproof normalize
+  {"line":1,"ok":false,"error":"invalid JSON: EOF"}
+  {"line":2,"ok":false,"error":"log must be a JSON object"}
+  ```
+
+- **U+00A0、U+3000、垂直制表 U+000B 出现在对象前后或成员之间，都是 JSON 语法
+  错误。** 例：三行输入，第 2 行的对象前多了一个 U+00A0，前后各一条合法日志：
+
+  ```bash
+  NBSP=$'\xc2\xa0'
+  printf '%s\n%s\n%s\n' \
+    '{"timestamp":"2026-10-04T08:30:00Z","action":"login"}' \
+    "${NBSP}{\"timestamp\":\"2026-10-04T08:31:00Z\",\"action\":\"deny\"}" \
+    '{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}' \
+    | ./bin/relayproof normalize
+  echo "normalize exit=${PIPESTATUS[1]}"
+  ```
+
+  逐行输出：失败记录带**原物理行号** `line:2`、`ok:false` 和原因，不带 `event`；
+  第 3 行不受影响、继续输出。退出状态为 `1`，标准错误为空：
+
+  ```json
+  {"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+  {"line":2,"ok":false,"error":"invalid JSON: invalid character 'Â' looking for beginning of value"}
+  {"line":3,"ok":true,"event":{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}}
+  ```
+
+  原因里的 `Â` 是 U+00A0 的 UTF-8 首字节 `c2` 被解析器按字节报告的结果，它不会
+  被当作空格。同一位置换成 U+3000 报 `invalid character 'ã' after object
+  key:value pair`（`ã` 对应其首字节 `e3`），换成 U+000B 报
+  `invalid character '\v' ...`。把该字符放到成员之间（例如整行用
+  `$'{"timestamp":"2026-10-04T08:30:00Z"\xc2\xa0,"action":"login"}'` 给出）同样
+  失败，原因后缀为 `after object key:value pair`。
+
+- **对象之外的反斜杠文本不是空格，也不是转义。** 在字符串**外面**写下六个 ASCII
+  字符——反斜杠、`u`、`0`、`0`、`a`、`0`，即展示记法 `\u00a0`——它不会被当成
+  不换行空格，甚至不是合法记号：
+
+  ```console
+  $ printf '%s\n' "$(printf '\\u00a0'){\"timestamp\":\"2026-10-04T08:30:00Z\",\"action\":\"login\"}" \
+      | ./bin/relayproof normalize
+  {"line":1,"ok":false,"error":"invalid JSON: invalid character '\\' looking for beginning of value"}
+  ```
+
+  `\u00a0` 这种 `\uXXXX` 形式的转义只在 **JSON 字符串内部**才会被解释（见位置
+  三）；对象之外那只是一个以反斜杠开头的语法错误。不要把展示用的转义记法
+  `\u00a0` 与真正的 U+00A0 字符混为一谈。
+
+#### 位置三：字符串内容里是普通字符
+
+进入 JSON 字符串后，这些字符是字符串值的一部分，不再是分隔符。
+
+- **`action`：去首尾空白，保留中间字符，纯空白动作失败。** 去空白用的是按
+  Unicode 识别空白的 `strings.TrimSpace`，因此 U+00A0、U+3000 与普通空格一样
+  会被从首尾去掉，而字符串中部的字符原样保留。下例的动作在首尾和中部各放一个
+  U+00A0：
+
+  ```bash
+  NBSP=$'\xc2\xa0'
+  printf '%s\n' "{\"timestamp\":\"2026-10-04T08:30:00Z\",\"action\":\"${NBSP}lo${NBSP}gin${NBSP}\"}" \
+    | ./bin/relayproof normalize
+  ```
+
+  标准输出（首尾两个 U+00A0 被去掉，中部的保留；退出状态 `0`）：
+
+  ```json
+  {"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"lo gin"}}
+  ```
+
+  中部那个 U+00A0 在终端里与普通空格难以区分，用 `cat -v` 可看到它的 UTF-8
+  字节（`M-BM- ` 即 `c2 a0`）：
+
+  ```text
+  ...,"action":"loM-BM- gin"}}
+  ```
+
+  若动作值改用 JSON 转义拼写，即在字符串内部写六字符转义
+  `"action":"\u00a0lo\u00a0gin\u00a0"`，JSON 解析会在字符串内部把它还原成同一个
+  U+00A0，规范化后的字节与上例完全相同；这与位置二中“字符串之外的反斜杠文本
+  非法”并不矛盾。若整个动作去掉首尾空白后为空（例如 `"action":"   "`、
+  `"action":"\u00a0"`，或全为 U+3000），则失败为
+  `field "action": action must not be empty`（退出状态 `1`）。
+
+- **未知字段：首尾空白作为证据原样保留。** 未参与映射的字段进入 `extra`（见
+  [扩展字段 extra：成员边界与证据值保留](#扩展字段-extra成员边界与证据值保留)），
+  映射不会进入这些字符串，更不会做动作那样的去首尾空白：
+
+  ```bash
+  NBSP=$'\xc2\xa0'
+  printf '%s\n' "{\"timestamp\":\"2026-10-04T08:30:00Z\",\"action\":\"login\",\"note\":\"${NBSP}hi${NBSP}\"}" \
+    | ./bin/relayproof normalize
+  ```
+
+  输出中 `note` 首尾的 U+00A0 都还在（退出状态 `0`）；`cat -v` 下清晰可见
+  （`M-BM- ` 即 U+00A0）：
+
+  ```text
+  ...,"extra":{"note":"M-BM- hiM-BM- "}}
+  ```
+
+  未知字段的值以原始 JSON（`json.RawMessage`）携带：源日志若直接写 U+00A0
+  字节，输出就保留这两个字节；源日志若写成 `\u00a0` 转义，输出也保留这段转义
+  拼写。无论哪种写法，首尾空白都不会被修剪。
+
+#### Go 入口差异：NormalizeReader 跳过整行，NormalizeLine 不跳过
+
+上述“整行只有空白就跳过”是 `NormalizeReader` 逐行读取时的判定。直接调用
+`NormalizeLine(lineNo int, raw []byte)` 时没有这一步：它只裁掉文档首尾的四种
+JSON 空白（空格、制表、回车、换行），随后按 JSON 解析。因此把同一行只有
+U+00A0 的内容直接交给 `NormalizeLine`，得到的是一条 JSON 语法失败结果，而不是
+“跳过”：
+
+```go
+res := relayproof.NormalizeLine(2, []byte("\xc2\xa0\n"))
+```
+
+```json
+{"line":2,"ok":false,"error":"invalid JSON: invalid character 'Â' looking for beginning of value"}
+```
+
+需要“空白行跳过、物理行号连续、失败计数”这套逐行语义时应使用 `NormalizeReader`
+（命令行 `normalize` 就是它的薄封装）；只有在自行按行读取、且希望每个物理行都
+拿到一条结果时，才直接调用 `NormalizeLine`。
 
 ### 离线示例
 
@@ -373,6 +555,12 @@ func normalizeLogs(r io.Reader, w io.Writer) error {
   输入输出成功：流在第一条日志之前就故障时 `failures` 同样为零，但 `err` 非空。
   对应到命令入口，这类可捕获的输入输出故障一律以退出 `2` 结束，并在标准错误
   给出以 `normalize:` 开头的诊断。
+
+入口差异：空白行（含整行只有 U+00A0、U+3000 等特殊空白的行）被整体跳过、占用
+行号却无结果，是 `NormalizeReader` 逐行读取时的规则。若绕过它直接调用
+`NormalizeLine(lineNo, raw)`，同一行特殊空白不会被跳过，而是返回一条 JSON 语法
+失败结果；详细对比与示例见
+[空白字符：整行、JSON 分隔符与字符串内容](#空白字符整行json-分隔符与字符串内容)。
 
 正常文件结束与读取中断的区别：
 
