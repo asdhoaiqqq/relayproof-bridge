@@ -104,11 +104,40 @@ var (
 	ErrLogWrite = errors.New("log stream write failure")
 )
 
+// NormalizeOptions controls stream-level behavior beyond the defaults. The
+// zero value reproduces NormalizeReader exactly: every successful event is
+// emitted. Fields may be added over time; callers constructing the struct
+// with named fields stay source-compatible.
+type NormalizeOptions struct {
+	// SourceFilter, when non-nil, restricts which successful events are
+	// emitted to those whose fully normalized source_ip is an IPv4 address
+	// inside the network. Successful events with no source address, with a
+	// source that stayed IPv6, or with an IPv4 source outside the network
+	// produce no output and are not counted as failures. Per-line
+	// normalization failures are never filtered: their result records and
+	// the failure count follow the same rules as without a filter.
+	SourceFilter *SourceCIDR
+}
+
 // NormalizeReader streams newline-delimited JSON logs from r and writes one
-// NormalizeResult JSON object per non-blank physical line to w. Blank lines
-// produce no output but still advance the physical line counter. It returns
-// the number of complete lines that failed normalization; processing of
-// later lines continues after any per-line failure.
+// NormalizeResult JSON object per non-blank physical line to w. It is the
+// default, unfiltered entry point and is exactly equivalent to
+// NormalizeReaderOptions(r, w, NormalizeOptions{}).
+func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
+	return NormalizeReaderOptions(r, w, NormalizeOptions{})
+}
+
+// NormalizeReaderOptions is NormalizeReader with explicit stream options. A
+// non-nil opts.SourceFilter suppresses successful events outside the named
+// IPv4 network while leaving line numbering, blank-line handling, per-line
+// failures, and the read/write error contract untouched.
+//
+// Blank lines produce no output but still advance the physical line counter.
+// It returns the number of complete lines that failed normalization;
+// processing of later lines continues after any per-line failure. A filtered
+// successful line is neither a failure nor an emitted record, but it keeps
+// its physical line number: filtered lines and blank lines never renumber
+// later lines.
 //
 // Stream-level failures are distinct from bad log lines: a read error stops
 // processing and is returned wrapped with ErrLogRead, after every complete
@@ -119,7 +148,7 @@ var (
 // and leaves the failure count unchanged. When both sides fail, the earlier
 // read error is reported. A clean EOF is not an error, including when the
 // final complete line has no trailing newline.
-func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
+func NormalizeReaderOptions(r io.Reader, w io.Writer, opts NormalizeOptions) (failures int, err error) {
 	reader := bufio.NewReader(r)
 	bw := bufio.NewWriter(w)
 	var readErr error // first stream read error, reported even if flushing fails
@@ -166,8 +195,18 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 				if !result.OK {
 					failures++
 				}
-				if encErr := encoder.Encode(result); encErr != nil {
-					return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
+				// A successful event outside the requested source network
+				// is suppressed rather than failed: it keeps its physical
+				// line number but produces no record, and a filter never
+				// hides a bad log line.
+				emit := true
+				if result.OK && opts.SourceFilter != nil && !opts.SourceFilter.MatchesEvent(result.Event) {
+					emit = false
+				}
+				if emit {
+					if encErr := encoder.Encode(result); encErr != nil {
+						return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
+					}
 				}
 			}
 		}

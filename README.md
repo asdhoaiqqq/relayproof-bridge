@@ -19,6 +19,7 @@ go test ./...
 
 ```bash
 go run ./cmd/relayproof normalize < logs.jsonl
+go run ./cmd/relayproof normalize --source-cidr=192.0.2.0/24 < logs.jsonl
 ```
 
 ### 字段规则
@@ -45,6 +46,69 @@ go run ./cmd/relayproof normalize < logs.jsonl
   失败，绝不把损坏字符替换成“�”后再做字段映射、别名比较或存入 extra，也不通过
   删除字节、补齐转义或替换字符来修复。合法中文、表情、正确配对的代理项转义以及
   用户明确输入的合法“�”字符照常可用；`\\` 转义后的 `uD800` 只是普通文本，原样保留。
+
+### 按来源网段筛选成功事件：--source-cidr
+
+`normalize` 接受可选参数 `--source-cidr`，把成功记录限制在一个 IPv4 来源网段内。
+参数值为点分十进制 IPv4 地址加一个斜线和 0 至 32 的前缀长度，例如
+`192.0.2.0/24`；一次只能指定一个网段，`--source-cidr 192.0.2.0/24`（空格分隔）
+与 `--source-cidr=192.0.2.0/24`（等号分隔）两种写法等价。
+
+- **筛选基准是完整规范化后的 `source_ip`。** 标准名 `source_ip` 与别名 `src_ip`
+  仍沿用既有的映射、各自校验与别名冲突判断；筛选发生在一行已经成功规范化之后，
+  不改变任何字段规则。
+- **主机位按网段解释。** 地址中的主机位在解析时即被掩掉，`192.0.2.123/24` 与
+  `192.0.2.0/24` 的筛选范围完全相同；`/32` 只匹配该地址本身，`/0` 匹配所有规范
+  化后的 IPv4 来源。
+- **IPv4 与 IPv4-mapped IPv6 一视同仁。** 规范化后 `192.0.2.1` 与
+  `::ffff:192.0.2.1` 是同一个来源，命中同一条筛选；而 `::192.0.2.1`
+  （已弃用的 IPv4-compatible 形式）仍然是一个 IPv6 地址，不会因为末尾 32 位与
+  IPv4 地址相同而命中 IPv4 网段，普通 IPv6 来源同理。
+- **三类成功事件不输出、也不计失败：** 合法事件没有来源地址；来源仍是 IPv6；
+  来源是网段之外的 IPv4。被筛掉的成功记录不出现在标准输出，`failures` 不增加，
+  命令退出状态也不因“一条成功都没剩下”而变为非零——全部合法但全部落在网段之外
+  时，标准输出为空、退出 `0`。
+- **命中的成功记录沿用现有 JSON 结构和内容，不增加任何筛选标记**（没有
+  `matched`/`cidr` 之类的成员）。输出保持输入次序；`line` 仍是原始物理行号，
+  被筛掉的行与空白行都不会让后续行重新编号。时间与动作的规范化、`extra` 的
+  成员边界以及大整数等证据的数字写法均保持原有规则，末行没有换行时仍照常处理。
+- **筛选不能掩盖坏日志。** 即使某行地址不在所选网段、缺少来源地址，或来源是
+  IPv6，只要该行按既有规则规范化失败，仍照常输出带原物理行号与原有错误原因的
+  `ok:false` 记录（且没有 `event`），后续日志继续处理。因此“有任意失败行就退出
+  `1`、全部合法退出 `0`（哪怕没有任何成功记录）、读取或写出故障退出 `2`”这套
+  退出状态在筛选开启时完全不变。
+- **参数本身的问题在读取日志之前以退出 `2` 结束：** 缺值（只给
+  `--source-cidr` 而没有后续值）、空值（`--source-cidr=`）、不是上述 IPv4 网段
+  （无斜线、前缀不在 0-32、八段越界、前导零写法、IPv6 网段等），或重复指定，
+  都在打开/读取标准输入之前报错：标准错误给出一行以 `normalize:` 开头的参数
+  诊断，标准输出为空。
+- **未指定该参数时行为完全不变；** 同一筛选功能的 Go 入口见下文
+  [在 Go 代码中通过 NormalizeReader 接入](#在-go-代码中通过-normalizereader-接入)，
+  既有的 `NormalizeReader`、`NormalizeLine` 公共入口保持兼容。
+
+#### 例：一个 /24 网段内的成功记录与网段之外的失败记录
+
+```bash
+printf '%s\n' \
+  '{"timestamp":"2026-10-04T08:00:00Z","action":"login","source_ip":"192.0.2.5"}' \
+  '{"timestamp":"2026-10-04T08:01:00Z","action":"login","source_ip":"198.51.100.7"}' \
+  '{"timestamp":"2026-10-04T08:02:00Z","action":"login","source_ip":"::ffff:192.0.2.1"}' \
+  '{"timestamp":"2026-10-04T08:03:00Z","action":"login","source_ip":"::192.0.2.1"}' \
+  '{"timestamp":"2026-10-04T08:04:00Z","action":"login"}' \
+  '{"timestamp":"not-a-time","action":"login","source_ip":"10.0.0.9"}' \
+  | ./bin/relayproof normalize --source-cidr 192.0.2.123/24
+echo "exit=$?"
+```
+
+第 2、4、5 行是合法但落在网段之外（或没有）IPv4 来源的成功事件，被筛掉且不留
+记录；第 3 行的 IPv4-mapped IPv6 与第 1 行一样命中；第 6 行虽然地址在网段之外，
+仍是一条失败记录。物理行号保持原样，退出状态为 `1`，标准错误为空：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:00:00Z","source_ip":"192.0.2.5","action":"login"}}
+{"line":3,"ok":true,"event":{"timestamp":"2026-10-04T08:02:00Z","source_ip":"192.0.2.1","action":"login"}}
+{"line":6,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+```
 
 ### 多处错误的报告顺序
 
@@ -289,6 +353,9 @@ UTC 时区、动作首尾带空白、IPv6 用等价的冗长写法；未知字�
   判定，含整行只有 U+00A0/U+3000 等特殊空白的行；它们被跳过并不意味着这些字符
   能充当 JSON 分隔符——区别详见
   [空白字符：整行、JSON 分隔符与字符串内容](#空白字符整行json-分隔符与字符串内容)。
+- 启用 `--source-cidr` 时，落在所选 IPv4 网段之外的**成功**事件同样不产生任何
+  输出（也不是失败），但失败记录不受筛选影响；详见
+  [按来源网段筛选成功事件：--source-cidr](#按来源网段筛选成功事件--source-cidr)。
 
 **标准错误**只用于流级诊断，不会逐行重复失败原因——每行失败的具体原因只出现在
 标准输出对应记录的 `error` 字段里。仅有日志行失败、输入输出正常结束时，标准错误
@@ -543,6 +610,32 @@ func normalizeLogs(r io.Reader, w io.Writer) error {
     return nil
 }
 ```
+
+需要 `--source-cidr` 同款筛选时，使用
+`relayproof.NormalizeReaderOptions(r, w, opts)`，并把 `ParseSourceCIDR` 解析出的
+网段放进 `NormalizeOptions{SourceFilter: ...}`；解析失败对应命令行的参数错误，
+应在读取日志之前处理。筛选只影响成功事件是否写出，不改变上面 `failures`/`err`
+的任何约定：
+
+```go
+func normalizeLogsInCIDR(r io.Reader, w io.Writer, cidrText string) error {
+    filter, err := relayproof.ParseSourceCIDR(cidrText) // 如 "192.0.2.123/24"
+    if err != nil {
+        return err // 命令入口对应退出 2，且在读取日志之前
+    }
+    failures, err := relayproof.NormalizeReaderOptions(r, w, relayproof.NormalizeOptions{
+        SourceFilter: filter,
+    })
+    // err/failures 的判断与上面的例子完全相同；被筛掉的成功事件既不在输出里，
+    // 也不计入 failures。
+    _ = failures
+    return err
+}
+```
+
+`NormalizeReader` 与 `NormalizeLine` 的签名和行为保持不变；
+`NormalizeReader(r, w)` 等价于
+`NormalizeReaderOptions(r, w, NormalizeOptions{})`。
 
 两个返回值含义不同，必须分开判断：
 
