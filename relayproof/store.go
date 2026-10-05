@@ -66,7 +66,13 @@ import (
 // in "rootB64" instead, preserving the exact byte sequence across save,
 // reopen and compaction. Roots an older build already rewrote to replacement
 // characters stay those characters on replay — the lost bytes are never
-// guessed.
+// guessed. The two representations are mutually exclusive by key presence: a
+// record that carries "root" and "rootB64" together — even when one is the
+// empty string, and even when the two happen to decode to the same bytes — is
+// an inconsistent record no build writes and rejects the directory with
+// ErrCorrupt. The empty string counts as a present key, so the legal empty
+// root ("root":"" alone, or neither key on old records) is never confused
+// with a dual-root record.
 //
 // Message payloads have the same contract and use the same encoding: the Go
 // submit interface accepts any string without requiring valid UTF-8 (empty
@@ -152,6 +158,16 @@ type logEntry struct {
 	// Root.
 	RootB64 string `json:"rootB64,omitempty"`
 
+	// rootPresent and rootB64Present report whether the replayed JSON record
+	// literally carried the "root"/"rootB64" keys, distinct from the decoded
+	// value (which may be the empty string). They are set only by
+	// UnmarshalJSON and never marshalled: the empty root is written as
+	// "root":"" (rootPresent alone on replay), while a record that names both
+	// representations — even when one of them is the empty string — is
+	// corrupt no matter what the two decode to.
+	rootPresent    bool
+	rootB64Present bool
+
 	Seq       int64  `json:"seq,omitempty"`
 	ID        string `json:"id,omitempty"`
 	From      string `json:"from,omitempty"`
@@ -199,6 +215,28 @@ type logEntry struct {
 	// is accepted only while replaying logs written by older builds and is
 	// never written anymore.
 	ConsumeKey string `json:"consumeKey,omitempty"`
+}
+
+// UnmarshalJSON decodes a log record while recording which root keys the
+// record literally carried. The plain/base64 split needs presence, not just
+// the decoded value: the empty root is a legal value written as "root":"", so
+// the empty string cannot double as the signal that the key was omitted. The
+// exported fields decode exactly as with the default unmarshalling (the alias
+// avoids listing them by hand); only the two presence flags are extra.
+func (e *logEntry) UnmarshalJSON(data []byte) error {
+	type plain logEntry
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*e = logEntry(p)
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	_, e.rootPresent = keys["root"]
+	_, e.rootB64Present = keys["rootB64"]
+	return nil
 }
 
 // bytesField is the shared inverse of the plain/base64 field split: with no
@@ -295,14 +333,18 @@ func (e *logEntry) setRoot(root string) {
 // bytes. Entries written before rootB64 existed carry only "root" and are
 // taken at face value — including roots an old build had already rewritten to
 // replacement characters, which stay those characters; the lost bytes are
-// never guessed. An entry carrying both fields, or a rootB64 that does not
-// decode, is an inconsistent record no build writes and is corrupt.
+// never guessed. An entry carrying both fields at once, or a rootB64 that does
+// not decode, is an inconsistent record no build writes and is corrupt. The
+// two representations are mutually exclusive by key presence: an explicitly
+// empty "root":"" is a legal plain root, but "root":"" together with any
+// rootB64 — even one that decodes to the same bytes, or to the empty root —
+// still carries two representations and is rejected.
 func (e *logEntry) headerRoot() (string, error) {
-	if e.RootB64 == "" {
-		return e.Root, nil
-	}
-	if e.Root != "" {
+	if e.rootPresent && e.rootB64Present {
 		return "", fmt.Errorf("header entry carries both root and rootB64")
+	}
+	if !e.rootB64Present {
+		return e.Root, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(e.RootB64)
 	if err != nil {

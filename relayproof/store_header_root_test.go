@@ -197,11 +197,29 @@ func TestHeaderRootLegacyReplacementCharTakenAtFaceValue(t *testing.T) {
 // A rootB64 entry must decode unambiguously: an entry carrying both root and
 // rootB64, or an undecodable rootB64, is an inconsistent record no build
 // writes and rejects the directory as corrupt, leaving every byte untouched.
+//
+// Presence is judged by key, not by value: "root":"" is a legal empty root on
+// its own, but together with any rootB64 it is two representations at once —
+// even when one side is empty, and even when the two decode to the same
+// bytes. Every such record below is complete and checksum-valid and sits at
+// the end of the log, so it must be rejected as corruption, never dropped as a
+// torn tail; trusted and untrusted headers alike.
 func TestHeaderRootB64InconsistentRecordsRejected(t *testing.T) {
-	for name, e := range map[string]*logEntry{
+	// Struct-built cases: omitempty drops an empty Root, so the non-empty
+	// plain clash and the undecodable base64 can use the typed entry.
+	structEntries := map[string]*logEntry{
 		"both root and rootB64": {T: kindHeader, Chain: "a", Height: 1, Root: "x", RootB64: "eA==", Trusted: true},
 		"undecodable rootB64":   {T: kindHeader, Chain: "a", Height: 1, RootB64: "!!!not-base64!!!", Trusted: true},
-	} {
+	}
+	// Raw-JSON cases: the "root":"" key must literally be present, which the
+	// omitempty struct tag would erase on marshal.
+	rawPayloads := map[string]string{
+		"empty root plus rootB64 of 0xff (trusted)":    `{"t":"header","chain":"a","height":1,"trusted":true,"root":"","rootB64":"/w=="}`,
+		"empty root plus rootB64 of 0xff (untrusted)":  `{"t":"header","chain":"a","height":1,"trusted":false,"root":"","rootB64":"/w=="}`,
+		"empty root plus empty rootB64, equal decoded": `{"t":"header","chain":"a","height":1,"trusted":true,"root":"","rootB64":""}`,
+		"plain and rootB64 decode to the same bytes":   `{"t":"header","chain":"a","height":1,"trusted":true,"rootB64":"eA==","root":"x"}`,
+	}
+	for name, e := range structEntries {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			var raw []byte
@@ -210,6 +228,64 @@ func TestHeaderRootB64InconsistentRecordsRejected(t *testing.T) {
 			raw = append(raw, encodeFrame(mustMarshal(e))...)
 			writeRawLog(t, dir, raw)
 			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+	for name, payload := range rawPayloads {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(payload))...)
+			writeRawLog(t, dir, raw)
+			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+}
+
+// The empty root keeps its long-standing meaning through every legal on-disk
+// shape, and a sole rootB64 still restores its bytes: the new presence-based
+// clash check must never mistake an omitted key for an empty-but-present one.
+func TestHeaderRootEmptyOmittedAndSoleB64StillAccepted(t *testing.T) {
+	rootFF := string([]byte{0xFF})
+	cases := map[string]struct {
+		payload      string
+		wantRoot     string
+		conflictRoot string
+	}{
+		"explicit empty root": {
+			payload:      `{"t":"header","chain":"a","height":10,"trusted":true,"root":""}`,
+			wantRoot:     "",
+			conflictRoot: "other",
+		},
+		"both root keys omitted (historical empty root)": {
+			payload:      `{"t":"header","chain":"a","height":10,"trusted":true}`,
+			wantRoot:     "",
+			conflictRoot: "other",
+		},
+		"sole rootB64 restores its bytes": {
+			payload:      `{"t":"header","chain":"a","height":10,"trusted":true,"rootB64":"/w=="}`,
+			wantRoot:     rootFF,
+			conflictRoot: "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(tc.payload))...)
+			writeRawLog(t, dir, raw)
+
+			q := reopen(t, dir)
+			defer q.Close()
+			// The restored root is accepted idempotently at the trusted height,
+			// proving its exact bytes survived.
+			requireHeaderAccepted(t, q, "a", 10, tc.wantRoot)
+			// A different root at the same height still conflicts, proving the
+			// restored value is the real root, not a conflated empty one.
+			requireHeaderConflict(t, q, "a", 10, tc.conflictRoot, tc.wantRoot)
 		})
 	}
 }
