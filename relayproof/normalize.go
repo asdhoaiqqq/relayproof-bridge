@@ -25,16 +25,41 @@ const (
 	FieldAction    = "action"
 )
 
-// fieldAliases maps accepted alternative log keys to canonical field names.
-var fieldAliases = map[string]string{
-	"time":       FieldTimestamp,
-	"src_ip":     FieldSourceIP,
-	"event_type": FieldAction,
+// fieldSpec is the single description of one canonical log field. It bundles
+// every per-field fact the normalization pipeline used to restate separately:
+// the accepted alias key, whether the field must be present, and how a
+// provided JSON value is validated and normalized. Maintaining a field rule
+// means editing this one entry instead of repeating the field name across
+// field identification, alias attribution, check order, and the
+// required-field decision.
+type fieldSpec struct {
+	name      string
+	alias     string
+	required  bool
+	normalize func(canonical string, raw json.RawMessage) (string, error)
 }
 
-// canonicalFieldOrder is the fixed order in which mapped fields are validated,
-// so the first reported error for a malformed line is deterministic.
-var canonicalFieldOrder = []string{FieldTimestamp, FieldSourceIP, FieldAction}
+// fieldSpecs lists the mapped fields. The slice order doubles as the fixed
+// validation and reporting order, so the first error reported for a malformed
+// line is deterministic and does not depend on where members sit in the
+// input object.
+var fieldSpecs = []fieldSpec{
+	{name: FieldTimestamp, alias: "time", required: true, normalize: normalizeTimestampValue},
+	{name: FieldSourceIP, alias: "src_ip", required: false, normalize: normalizeSourceIPValue},
+	{name: FieldAction, alias: "event_type", required: true, normalize: normalizeActionValue},
+}
+
+// fieldByName resolves any mapped top-level key — canonical name or alias —
+// to its spec. A key absent from the map is unknown and goes into extra.
+var fieldByName = func() map[string]*fieldSpec {
+	mapped := make(map[string]*fieldSpec, 2*len(fieldSpecs))
+	for i := range fieldSpecs {
+		spec := &fieldSpecs[i]
+		mapped[spec.name] = spec
+		mapped[spec.alias] = spec
+	}
+	return mapped
+}()
 
 // NormalizedEvent is the canonical representation of one log line.
 type NormalizedEvent struct {
@@ -61,11 +86,6 @@ var (
 	ErrLogRead  = errors.New("log stream read failure")
 	ErrLogWrite = errors.New("log stream write failure")
 )
-
-type fieldCandidate struct {
-	from string
-	raw  json.RawMessage
-}
 
 // NormalizeReader streams newline-delimited JSON logs from r and writes one
 // NormalizeResult JSON object per non-blank physical line to w. Blank lines
@@ -182,58 +202,63 @@ func normalizeEvent(raw []byte) (*NormalizedEvent, error) {
 	}
 	sort.Strings(keys)
 
-	groups := make(map[string][]fieldCandidate)
+	groups := make(map[*fieldSpec][]json.RawMessage)
 	extra := make(map[string]json.RawMessage)
 	for _, key := range keys {
-		switch key {
-		case FieldTimestamp, FieldSourceIP, FieldAction:
-			groups[key] = append(groups[key], fieldCandidate{from: key, raw: object[key]})
-		default:
-			if canonical, ok := fieldAliases[key]; ok {
-				groups[canonical] = append(groups[canonical], fieldCandidate{from: key, raw: object[key]})
-			} else {
-				extra[key] = object[key]
-			}
+		// One lookup handles both canonical names and aliases; anything it
+		// does not resolve is an independent extra member, even when a
+		// standard name or alias appears nested inside that member.
+		if spec, ok := fieldByName[key]; ok {
+			groups[spec] = append(groups[spec], object[key])
+		} else {
+			extra[key] = object[key]
 		}
 	}
 
 	values := make(map[string]string)
-	for _, canonical := range canonicalFieldOrder {
-		candidates := groups[canonical]
+	for i := range fieldSpecs {
+		spec := &fieldSpecs[i]
+		candidates := groups[spec]
 		if len(candidates) == 0 {
 			continue
 		}
+		// Candidates stay in sorted-key order, so the first normalized value
+		// cited in a conflict message is deterministic.
 		var canonicalValue string
-		for i, candidate := range candidates {
-			value, err := normalizeFieldValue(canonical, candidate.raw)
+		for j, raw := range candidates {
+			value, err := spec.normalize(spec.name, raw)
 			if err != nil {
 				return nil, err
 			}
-			if i == 0 {
+			if j == 0 {
 				canonicalValue = value
 				continue
 			}
 			// Every candidate must be valid; consistent values merge and
 			// divergent values fail the whole line.
 			if value != canonicalValue {
-				return nil, fmt.Errorf("field %q has conflicting values: %q and %q", canonical, canonicalValue, value)
+				return nil, fmt.Errorf("field %q has conflicting values: %q and %q", spec.name, canonicalValue, value)
 			}
 		}
-		values[canonical] = canonicalValue
+		values[spec.name] = canonicalValue
 	}
 
-	timestamp, ok := values[FieldTimestamp]
-	if !ok {
-		return nil, fmt.Errorf("missing required field %q", FieldTimestamp)
-	}
-	action, ok := values[FieldAction]
-	if !ok {
-		return nil, fmt.Errorf("missing required field %q", FieldAction)
+	// Required-field checks run only after every provided field is valid and
+	// conflict-free; the slice order makes timestamp precede action when both
+	// are missing.
+	for i := range fieldSpecs {
+		spec := &fieldSpecs[i]
+		if spec.required {
+			if _, ok := values[spec.name]; !ok {
+				return nil, fmt.Errorf("missing required field %q", spec.name)
+			}
+		}
 	}
 
+	// The required-field loop above guarantees timestamp and action are set.
 	event := &NormalizedEvent{
-		Timestamp: timestamp,
-		Action:    action,
+		Timestamp: values[FieldTimestamp],
+		Action:    values[FieldAction],
 	}
 	if sourceIP, present := values[FieldSourceIP]; present {
 		event.SourceIP = sourceIP
@@ -392,34 +417,46 @@ func decodeObject(raw []byte) (map[string]json.RawMessage, error) {
 	return object, nil
 }
 
-func normalizeFieldValue(canonical string, raw json.RawMessage) (string, error) {
+// The three normalize*Value functions are the per-field validation rules
+// referenced from fieldSpecs. Each starts by demanding a JSON string (an
+// explicit null is a provided-but-wrongly-typed field, not an omitted one)
+// and then applies that field's own content rule.
+
+func normalizeTimestampValue(canonical string, raw json.RawMessage) (string, error) {
 	s, err := requireString(canonical, raw)
 	if err != nil {
 		return "", err
 	}
-	switch canonical {
-	case FieldTimestamp:
-		t, err := parseTimestamp(strings.TrimSpace(s))
-		if err != nil {
-			return "", fmt.Errorf("field %q: invalid RFC3339 timestamp: %v", canonical, err)
-		}
-		return t.UTC().Format(time.RFC3339Nano), nil
-	case FieldAction:
-		value := strings.TrimSpace(s)
-		if value == "" {
-			return "", fmt.Errorf("field %q: action must not be empty", canonical)
-		}
-		return value, nil
-	case FieldSourceIP:
-		value := strings.TrimSpace(s)
-		ip := net.ParseIP(value)
-		if ip == nil {
-			return "", fmt.Errorf("field %q: invalid IP address %q (no port allowed)", canonical, value)
-		}
-		return ip.String(), nil
-	default:
-		return "", fmt.Errorf("field %q: unknown canonical field", canonical)
+	t, err := parseTimestamp(strings.TrimSpace(s))
+	if err != nil {
+		return "", fmt.Errorf("field %q: invalid RFC3339 timestamp: %v", canonical, err)
 	}
+	return t.UTC().Format(time.RFC3339Nano), nil
+}
+
+func normalizeActionValue(canonical string, raw json.RawMessage) (string, error) {
+	s, err := requireString(canonical, raw)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(s)
+	if value == "" {
+		return "", fmt.Errorf("field %q: action must not be empty", canonical)
+	}
+	return value, nil
+}
+
+func normalizeSourceIPValue(canonical string, raw json.RawMessage) (string, error) {
+	s, err := requireString(canonical, raw)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(s)
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return "", fmt.Errorf("field %q: invalid IP address %q (no port allowed)", canonical, value)
+	}
+	return ip.String(), nil
 }
 
 // requireString enforces that a mapped value is a JSON string. An explicit
