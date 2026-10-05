@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -269,6 +270,56 @@ func checkMagic(path string) error {
 	return nil
 }
 
+// frame is one located record frame: the on-disk envelope every log record
+// shares — uint32-be payload length, payload, uint32-be CRC32-IEEE of the
+// payload. Locating a frame and verifying its checksum is identical for the
+// leading version record and for every later record, so those rules live here
+// exactly once; what differs is the recovery policy each caller applies to a
+// frame that is torn, zero-length, or checksum-bad, and those decisions stay
+// in the callers.
+type frame struct {
+	pos       int // offset of the length header
+	n         int // declared payload length
+	bodyStart int // offset of the payload; zero while even the header is incomplete
+	end       int // offset just past the frame
+}
+
+// errZeroLengthFrame reports a declared payload length of zero, which is
+// corrupt in every context; each caller wraps it with its own record wording.
+var errZeroLengthFrame = errors.New("zero-length record frame")
+
+// scanFrame locates the record frame starting at raw[pos]. A frame cut short
+// by end of file — an incomplete length header, or a declared body/checksum
+// running past the end — is reported as torn, with the frame fields set as
+// far as they could be determined (bodyStart stays zero when even the length
+// header is incomplete). Whether a torn frame is a truncatable unacknowledged
+// write or a corrupt log is the caller's policy, as is the judgment of a
+// checksum mismatch.
+func scanFrame(raw []byte, pos int) (frame, bool, error) {
+	f := frame{pos: pos}
+	if len(raw)-pos < frameHeaderSize {
+		return f, true, nil
+	}
+	f.n = int(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
+	if f.n == 0 {
+		return f, false, errZeroLengthFrame
+	}
+	f.bodyStart = pos + frameHeaderSize
+	f.end = f.bodyStart + f.n + frameCRCsSize
+	if f.end > len(raw) {
+		return f, true, nil
+	}
+	return f, false, nil
+}
+
+// payload returns the complete frame's payload bytes and reports whether the
+// stored CRC32 matches them.
+func (f frame) payload(raw []byte) ([]byte, bool) {
+	payload := raw[f.bodyStart : f.bodyStart+f.n]
+	wantCRC := binary.BigEndian.Uint32(raw[f.bodyStart+f.n : f.end])
+	return payload, crc32.Checksum(payload, crcTable) == wantCRC
+}
+
 // replayLog parses and validates the log, returning the byte length of the
 // longest intact prefix and the reconstructed state.
 func replayLog(raw []byte) (int64, *loadedState, error) {
@@ -295,23 +346,17 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	pos := verEnd
 
 	for pos < len(raw) {
-		// Need at least the length header.
-		if len(raw)-pos < frameHeaderSize {
-			return int64(pos), state, nil // torn length header of an unacked write
-		}
-		n := int(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
-		if n == 0 {
+		f, torn, err := scanFrame(raw, pos)
+		if errors.Is(err, errZeroLengthFrame) {
 			return 0, nil, fmt.Errorf("%w: zero-length record at offset %d", ErrCorrupt, pos)
 		}
-		bodyStart := pos + frameHeaderSize
-		frameEnd := bodyStart + n + frameCRCsSize
-		if frameEnd > len(raw) {
-			return int64(pos), state, nil // torn body/CRC of an unacked write
+		if torn {
+			// Torn length header or body/CRC of an unacked write.
+			return int64(pos), state, nil
 		}
-		payload := raw[bodyStart : bodyStart+n]
-		wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
-		if crc32.Checksum(payload, crcTable) != wantCRC {
-			if frameEnd == len(raw) {
+		payload, ok := f.payload(raw)
+		if !ok {
+			if f.end == len(raw) {
 				// Torn sectors of the final, unacknowledged frame.
 				return int64(pos), state, nil
 			}
@@ -327,7 +372,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		if err := applyEntry(state, &e); err != nil {
 			return 0, nil, err
 		}
-		pos = frameEnd
+		pos = f.end
 	}
 	return int64(pos), state, nil
 }
@@ -339,25 +384,24 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 // record cut short at end of file (one to three length bytes, or the length
 // without the body and CRC), a complete final record with a bad checksum,
 // invalid JSON, a non-version record, or an unsupported version — is a
-// corrupt log, never a truncatable tail.
+// corrupt log, never a truncatable tail. The framing rules themselves (length
+// header, body range, CRC32) are the shared ones in scanFrame; only the
+// acceptance policy is the version record's own.
 func readVersionRecord(raw []byte, start int) (int, error) {
-	if len(raw)-start < frameHeaderSize {
-		return 0, fmt.Errorf("%w: incomplete version record: only %d of %d length bytes after header",
-			ErrCorrupt, len(raw)-start, frameHeaderSize)
-	}
-	n := int(binary.BigEndian.Uint32(raw[start : start+frameHeaderSize]))
-	if n == 0 {
+	f, torn, err := scanFrame(raw, start)
+	if errors.Is(err, errZeroLengthFrame) {
 		return 0, fmt.Errorf("%w: zero-length version record at offset %d", ErrCorrupt, start)
 	}
-	bodyStart := start + frameHeaderSize
-	frameEnd := bodyStart + n + frameCRCsSize
-	if frameEnd > len(raw) {
+	if torn {
+		if f.bodyStart == 0 {
+			return 0, fmt.Errorf("%w: incomplete version record: only %d of %d length bytes after header",
+				ErrCorrupt, len(raw)-start, frameHeaderSize)
+		}
 		return 0, fmt.Errorf("%w: incomplete version record: length %d but only %d body/checksum bytes present",
-			ErrCorrupt, n, len(raw)-bodyStart)
+			ErrCorrupt, f.n, len(raw)-f.bodyStart)
 	}
-	payload := raw[bodyStart : bodyStart+n]
-	wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
-	if crc32.Checksum(payload, crcTable) != wantCRC {
+	payload, ok := f.payload(raw)
+	if !ok {
 		return 0, fmt.Errorf("%w: checksum mismatch in version record at offset %d", ErrCorrupt, start)
 	}
 	var e logEntry
@@ -370,7 +414,7 @@ func readVersionRecord(raw []byte, start int) (int, error) {
 	if e.V != currentLogV {
 		return 0, fmt.Errorf("%w: unsupported log version %d", ErrCorrupt, e.V)
 	}
-	return frameEnd, nil
+	return f.end, nil
 }
 
 // entryCarriesConsumption reports whether a non-success entry smuggles any
