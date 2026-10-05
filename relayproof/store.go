@@ -84,6 +84,29 @@ import (
 // with ErrCorrupt, leaving the file untouched — it is never read back as an
 // empty or replacement-filled payload.
 //
+// Message ids have the identical contract — the Go submit interface compares
+// ids by their raw bytes, and an id read back after an acknowledged submit
+// must always name the same message, across reopen and compaction. Allowing
+// JSON string encoding to rewrite invalid bytes to U+FFFD would make several
+// originally-distinct ids reopen as one duplicate record (an unopenable
+// directory), make a byte-identical resubmit unfindable, and leave a success
+// record's consumeBy attribution pointing at an id no record carries. A
+// valid-UTF-8 id — ordinary text, whitespace, colons, NUL bytes, U+FFFD
+// itself — keeps the historical plain "id" field in every record kind
+// (submit, result, state) and in "consumeBy"; an invalid-UTF-8 id is stored
+// base64-encoded in "idB64" instead, and a success's attribution uses
+// "consumeByB64". Result and state reasons embed the successful message's id
+// (the replay attribution), so an invalid-UTF-8 id there is likewise stored
+// base64-encoded in "reasonB64", keeping the recorded reason byte-identical;
+// consumeBy is validated against the record's own id fields. The bytes
+// 0xFF, 0xFE and U+FFFD are three different ids and never merge. Ids an
+// older build already rewrote to replacement characters stay those
+// characters on replay — the lost bytes are never guessed. As with root and
+// payload, an undecodable idB64/reasonB64/consumeByB64, or either field set
+// together with its plain counterpart, is an inconsistent record no build
+// writes and rejects the directory with ErrCorrupt, leaving the file
+// untouched.
+//
 // Processing-time validation on replay: a plain result's time must be a
 // non-negative Unix-millisecond instant and no earlier than any queue-wide
 // time the log has already confirmed — an advance checkpoint or any earlier
@@ -141,6 +164,10 @@ type logEntry struct {
 	ProofAt   int64  `json:"proofAt,omitempty"`
 	ExpiresAt int64  `json:"expiresAt,omitempty"`
 
+	// IDB64 carries a message id's raw bytes base64-encoded when the id is not
+	// valid UTF-8; see setID/entryID. Never set together with ID.
+	IDB64 string `json:"idB64,omitempty"`
+
 	// PayloadB64 carries a message payload's raw bytes base64-encoded when the
 	// payload is not valid UTF-8; see setPayload/entryPayload. Never set
 	// together with Payload.
@@ -152,6 +179,11 @@ type logEntry struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	NextRetry int64  `json:"nextRetry,omitempty"`
 
+	// ReasonB64 carries a result/state reason's raw bytes base64-encoded when
+	// the reason embeds an id that is not valid UTF-8; see
+	// setReason/entryReason. Never set together with Reason.
+	ReasonB64 string `json:"reasonB64,omitempty"`
+
 	// Consumed triple of a success entry, stored as three independent values
 	// so routing paths that share a flattened key stay distinct. consumeBy is
 	// the id of the successful message.
@@ -159,6 +191,11 @@ type logEntry struct {
 	ConsumeTo    string `json:"consumeTo,omitempty"`
 	ConsumeNonce uint64 `json:"consumeNonce,omitempty"`
 	ConsumeBy    string `json:"consumeBy,omitempty"`
+
+	// ConsumeByB64 is the base64-encoded raw bytes of a success's consumer id
+	// when that id is not valid UTF-8; see setID. Never set together with
+	// ConsumeBy.
+	ConsumeByB64 string `json:"consumeByB64,omitempty"`
 
 	// ConsumeKey is the legacy (pre-triple) NUL-joined consumption string. It
 	// is accepted only while replaying logs written by older builds and is
@@ -232,6 +269,101 @@ func (e *logEntry) entryPayload() (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
 	if err != nil {
 		return "", fmt.Errorf("submit entry carries undecodable payloadB64: %v", err)
+	}
+	return string(raw), nil
+}
+
+// setID encodes a message id for the log without altering its bytes. An id
+// that is valid UTF-8 — ordinary text, whitespace, colons, NUL bytes and
+// U+FFFD itself — keeps the historical plain "id" field, so existing logs
+// stay byte-compatible with older builds. An id holding invalid UTF-8 bytes
+// would be silently rewritten to U+FFFD by JSON string encoding, merging
+// originally-distinct ids on replay, so it is instead stored base64-encoded
+// in "idB64", preserving the exact byte sequence across save, reopen and
+// compaction.
+func (e *logEntry) setID(id string) {
+	if utf8.ValidString(id) {
+		e.ID = id
+		return
+	}
+	e.IDB64 = base64.StdEncoding.EncodeToString([]byte(id))
+}
+
+// entryID decodes an entry's message id back to its exact submitted bytes.
+// Entries written before idB64 existed carry only "id" and are taken at face
+// value — including ids an old build had already rewritten to replacement
+// characters, which stay those characters; the lost bytes are never guessed.
+// An entry carrying both fields, or an idB64 that does not decode, is an
+// inconsistent record no build writes and is corrupt.
+func (e *logEntry) entryID() (string, error) {
+	if e.IDB64 == "" {
+		return e.ID, nil
+	}
+	if e.ID != "" {
+		return "", fmt.Errorf("entry carries both id and idB64")
+	}
+	raw, err := base64.StdEncoding.DecodeString(e.IDB64)
+	if err != nil {
+		return "", fmt.Errorf("entry carries undecodable idB64: %v", err)
+	}
+	return string(raw), nil
+}
+
+// setReason encodes a result/state reason without altering its bytes. The
+// replay reason embeds the successful message's id verbatim, so when that id
+// is not valid UTF-8 the reason itself is not valid UTF-8 and would be
+// rewritten by JSON string encoding; it is then stored base64-encoded in
+// "reasonB64". All other reasons are plain ASCII and keep the historical
+// "reason" field.
+func (e *logEntry) setReason(reason string) {
+	if utf8.ValidString(reason) {
+		e.Reason = reason
+		return
+	}
+	e.ReasonB64 = base64.StdEncoding.EncodeToString([]byte(reason))
+}
+
+// entryReason decodes a result/state reason back to its exact bytes. Entries
+// written before reasonB64 existed carry only "reason" and are taken at face
+// value; both fields at once or an undecodable reasonB64 is corrupt.
+func (e *logEntry) entryReason() (string, error) {
+	if e.ReasonB64 == "" {
+		return e.Reason, nil
+	}
+	if e.Reason != "" {
+		return "", fmt.Errorf("entry carries both reason and reasonB64")
+	}
+	raw, err := base64.StdEncoding.DecodeString(e.ReasonB64)
+	if err != nil {
+		return "", fmt.Errorf("entry carries undecodable reasonB64: %v", err)
+	}
+	return string(raw), nil
+}
+
+// setConsumeBy records the successful message's own id as the consumer of a
+// success entry's nonce triple, with the same byte-preserving encoding as
+// setID: a valid-UTF-8 id keeps the historical "consumeBy" field; an
+// invalid-UTF-8 id is stored base64-encoded in "consumeByB64".
+func (e *logEntry) setConsumeBy(id string) {
+	if utf8.ValidString(id) {
+		e.ConsumeBy = id
+		return
+	}
+	e.ConsumeByB64 = base64.StdEncoding.EncodeToString([]byte(id))
+}
+
+// consumeByID decodes a success entry's consumer id back to its exact bytes;
+// both fields at once or an undecodable consumeByB64 is corrupt.
+func (e *logEntry) consumeByID() (string, error) {
+	if e.ConsumeByB64 == "" {
+		return e.ConsumeBy, nil
+	}
+	if e.ConsumeBy != "" {
+		return "", fmt.Errorf("success entry carries both consumeBy and consumeByB64")
+	}
+	raw, err := base64.StdEncoding.DecodeString(e.ConsumeByB64)
+	if err != nil {
+		return "", fmt.Errorf("success entry carries undecodable consumeByB64: %v", err)
 	}
 	return string(raw), nil
 }
@@ -532,7 +664,7 @@ func readVersionRecord(raw []byte, start int) (int, error) {
 // consumption field, which is always corrupt.
 func entryCarriesConsumption(e *logEntry) bool {
 	return e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0 ||
-		e.ConsumeKey != "" || e.ConsumeBy != ""
+		e.ConsumeKey != "" || e.ConsumeBy != "" || e.ConsumeByB64 != ""
 }
 
 // acceptConsumption validates the triple consumed by a success result or
@@ -547,8 +679,12 @@ func entryCarriesConsumption(e *logEntry) bool {
 // that does not match its record is an inconsistent record and rejected.
 func acceptConsumption(s *loadedState, rec *Record, e *logEntry, corrupt func(string, ...any) error) (consumeToken, error) {
 	m := rec.Msg.Message
-	if e.ConsumeBy != e.ID {
-		return consumeToken{}, corrupt("success entry for %q is marked consumed by %q", e.ID, e.ConsumeBy)
+	by, err := e.consumeByID()
+	if err != nil {
+		return consumeToken{}, corrupt("%v", err)
+	}
+	if by != m.ID {
+		return consumeToken{}, corrupt("success entry for %q is marked consumed by %q", m.ID, by)
 	}
 	token := newConsumeToken(m.From, m.To, m.Nonce)
 	hasTriple := e.ConsumeFrom != "" || e.ConsumeTo != "" || e.ConsumeNonce != 0
@@ -568,9 +704,9 @@ func acceptConsumption(s *loadedState, rec *Record, e *logEntry, corrupt func(st
 		return consumeToken{}, corrupt("success entry for %q carries no nonce consumption", e.ID)
 	}
 	if winner, taken := s.consumed[token]; taken {
-		return consumeToken{}, corrupt("nonce %s already consumed by %q while accepting %q", token, winner, e.ID)
+		return consumeToken{}, corrupt("nonce %s already consumed by %q while accepting %q", token, winner, m.ID)
 	}
-	s.consumed[token] = e.ID
+	s.consumed[token] = m.ID
 	return token, nil
 }
 
@@ -716,11 +852,15 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			hs.trusted = &t
 		}
 	case kindSubmit:
-		if e.ID == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
+		id, err := e.entryID()
+		if err != nil {
+			return corrupt("bad submit entry: %v", err)
+		}
+		if id == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
 			return corrupt("bad submit entry: %+v", e)
 		}
-		if _, dup := s.records[e.ID]; dup {
-			return corrupt("duplicate submit for id %q", e.ID)
+		if _, dup := s.records[id]; dup {
+			return corrupt("duplicate submit for id %q", id)
 		}
 		if e.Seq != s.nextSeq {
 			return corrupt("submit seq %d out of order, expected %d", e.Seq, s.nextSeq)
@@ -729,10 +869,10 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if err != nil {
 			return corrupt("bad submit entry: %v", err)
 		}
-		s.records[e.ID] = &Record{
+		s.records[id] = &Record{
 			Msg: Envelope{
 				Message: Message{
-					ID:      e.ID,
+					ID:      id,
 					From:    e.From,
 					To:      e.To,
 					Nonce:   e.Nonce,
@@ -758,12 +898,21 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// intact and well-checksummed the record is. The per-status
 		// validation (waiting schedule, success consumption, terminal fields)
 		// is shared with compacted state entries.
-		rec, ok := s.records[e.ID]
+		id, err := e.entryID()
+		if err != nil {
+			return corrupt("bad result entry: %v", err)
+		}
+		reason, err := e.entryReason()
+		if err != nil {
+			return corrupt("bad result entry: %v", err)
+		}
+		e.ID, e.Reason = id, reason
+		rec, ok := s.records[id]
 		if !ok {
-			return corrupt("result for unknown id %q", e.ID)
+			return corrupt("result for unknown id %q", id)
 		}
 		if isTerminal(rec.Status) {
-			return corrupt("result for terminal id %q", e.ID)
+			return corrupt("result for terminal id %q", id)
 		}
 		if err := validateRecoveryTime(e, recoveryResult); err != nil {
 			return err
@@ -772,13 +921,13 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// check is the queue-wide one restricted to this record; it stays
 		// first to keep its historical error wording.
 		if rec.Attempts > 0 && e.Now < rec.LastProcAt {
-			return corrupt("result time %d before prior time %d for %q", e.Now, rec.LastProcAt, e.ID)
+			return corrupt("result time %d before prior time %d for %q", e.Now, rec.LastProcAt, id)
 		}
 		if e.Now < s.now {
-			return corrupt("result time %d before known time %d for %q", e.Now, s.now, e.ID)
+			return corrupt("result time %d before known time %d for %q", e.Now, s.now, id)
 		}
 		if e.Attempts != rec.Attempts+1 {
-			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
+			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, id)
 		}
 		if err := validateRecoveryStatus(e, recoveryResult); err != nil {
 			return err
@@ -798,12 +947,21 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// so their times are not ordered among themselves. The per-status
 		// validation is shared with plain result entries; the two kinds stay
 		// distinct on disk.
-		rec, ok := s.records[e.ID]
+		id, err := e.entryID()
+		if err != nil {
+			return corrupt("bad state entry: %v", err)
+		}
+		reason, err := e.entryReason()
+		if err != nil {
+			return corrupt("bad state entry: %v", err)
+		}
+		e.ID, e.Reason = id, reason
+		rec, ok := s.records[id]
 		if !ok {
-			return corrupt("state for unknown id %q", e.ID)
+			return corrupt("state for unknown id %q", id)
 		}
 		if rec.Attempts != 0 {
-			return corrupt("duplicate state for id %q", e.ID)
+			return corrupt("duplicate state for id %q", id)
 		}
 		if err := validateRecoveryTime(e, recoveryState); err != nil {
 			return err
@@ -812,7 +970,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			return err
 		}
 		if e.Attempts < 1 {
-			return corrupt("state with zero attempts for %q", e.ID)
+			return corrupt("state with zero attempts for %q", id)
 		}
 		if err := acceptRecoveryStatus(s, rec, e, recoveryState); err != nil {
 			return err
@@ -926,9 +1084,10 @@ func (s *store) appendHeader(h Header) error {
 func (s *store) appendSubmit(rec *Record) error {
 	m := rec.Msg.Message
 	e := &logEntry{
-		T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
+		T: kindSubmit, Seq: rec.Seq, From: m.From, To: m.To,
 		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
 	}
+	e.setID(m.ID)
 	e.setPayload(m.Payload)
 	return s.append(e)
 }
@@ -943,9 +1102,11 @@ func (s *store) appendSubmit(rec *Record) error {
 // non-success status.
 func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
 	e := &logEntry{
-		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
-		Status: oc.status, Reason: oc.reason, Attempts: attempts, NextRetry: nextRetry,
+		T: kindResult, Now: now,
+		Status: oc.status, Attempts: attempts, NextRetry: nextRetry,
 	}
+	e.setID(rec.Msg.Message.ID)
+	e.setReason(oc.reason)
 	if oc.status == StatusSuccess {
 		if oc.consume == nil {
 			return fmt.Errorf("internal error: success result for %q missing nonce consumption", rec.Msg.Message.ID)
@@ -953,7 +1114,7 @@ func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry in
 		e.ConsumeFrom = oc.consume.from
 		e.ConsumeTo = oc.consume.to
 		e.ConsumeNonce = oc.consume.nonce
-		e.ConsumeBy = rec.Msg.Message.ID
+		e.setConsumeBy(rec.Msg.Message.ID)
 	}
 	return s.append(e)
 }
@@ -1011,16 +1172,19 @@ func (s *store) compact(state *loadedState) error {
 		rec := bySeq[seq]
 		m := rec.Msg.Message
 		se := &logEntry{
-			T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
+			T: kindSubmit, Seq: rec.Seq, From: m.From, To: m.To,
 			Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
 		}
+		se.setID(m.ID)
 		se.setPayload(m.Payload)
 		entries = append(entries, se)
 		if rec.Attempts > 0 {
 			re := &logEntry{
-				T: kindState, Now: rec.LastProcAt, ID: m.ID,
-				Status: rec.Status, Reason: rec.Reason, Attempts: rec.Attempts,
+				T: kindState, Now: rec.LastProcAt,
+				Status: rec.Status, Attempts: rec.Attempts,
 			}
+			re.setID(m.ID)
+			re.setReason(rec.Reason)
 			if rec.Status == StatusWaiting {
 				re.NextRetry = rec.NextRetry
 			}
@@ -1028,7 +1192,7 @@ func (s *store) compact(state *loadedState) error {
 				re.ConsumeFrom = m.From
 				re.ConsumeTo = m.To
 				re.ConsumeNonce = m.Nonce
-				re.ConsumeBy = m.ID
+				re.setConsumeBy(m.ID)
 			}
 			entries = append(entries, re)
 		}
