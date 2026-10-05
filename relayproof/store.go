@@ -295,30 +295,20 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 	pos := verEnd
 
 	for pos < len(raw) {
-		// Need at least the length header.
-		if len(raw)-pos < frameHeaderSize {
-			return int64(pos), state, nil // torn length header of an unacked write
-		}
-		n := int(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
-		if n == 0 {
+		fr, outcome := readFrame(raw, pos)
+		switch outcome {
+		case frameShortHeader, frameShortBody, frameBadCRCTrailing:
+			// A final record missing length bytes, body/CRC bytes, or a final
+			// complete record with a bad checksum, is the torn tail of an
+			// unacknowledged write.
+			return int64(pos), state, nil
+		case frameZeroLength:
 			return 0, nil, fmt.Errorf("%w: zero-length record at offset %d", ErrCorrupt, pos)
-		}
-		bodyStart := pos + frameHeaderSize
-		frameEnd := bodyStart + n + frameCRCsSize
-		if frameEnd > len(raw) {
-			return int64(pos), state, nil // torn body/CRC of an unacked write
-		}
-		payload := raw[bodyStart : bodyStart+n]
-		wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
-		if crc32.Checksum(payload, crcTable) != wantCRC {
-			if frameEnd == len(raw) {
-				// Torn sectors of the final, unacknowledged frame.
-				return int64(pos), state, nil
-			}
+		case frameBadCRCMid:
 			return 0, nil, fmt.Errorf("%w: checksum mismatch at offset %d", ErrCorrupt, pos)
 		}
 		var e logEntry
-		if err := json.Unmarshal(payload, &e); err != nil {
+		if err := json.Unmarshal(fr.payload, &e); err != nil {
 			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
 		}
 		if e.T == kindVersion {
@@ -327,41 +317,98 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		if err := applyEntry(state, &e); err != nil {
 			return 0, nil, err
 		}
-		pos = frameEnd
+		pos = fr.end
 	}
 	return int64(pos), state, nil
 }
 
-// readVersionRecord reads and validates the log's first record at offset
-// start, returning the offset just past it. A correct magic prefix alone is
-// not a valid log: the version record must be fully present, its checksum
-// must match, and it must name a supported version. Every other shape — a
-// record cut short at end of file (one to three length bytes, or the length
-// without the body and CRC), a complete final record with a bad checksum,
-// invalid JSON, a non-version record, or an unsupported version — is a
-// corrupt log, never a truncatable tail.
-func readVersionRecord(raw []byte, start int) (int, error) {
+// frameOutcome classifies one record against the framing rules shared by the
+// leading version record and every later business record.
+type frameOutcome int
+
+const (
+	frameIntact frameOutcome = iota
+	// frameShortHeader: fewer than frameHeaderSize length bytes remain.
+	frameShortHeader
+	// frameShortBody: the length is whole but body and/or CRC bytes are missing.
+	frameShortBody
+	// frameBadCRCTrailing: a complete frame ending exactly at EOF fails CRC.
+	frameBadCRCTrailing
+	// frameBadCRCMid: a frame fails CRC with more log bytes following it.
+	frameBadCRCMid
+	// frameZeroLength: the declared payload length is zero.
+	frameZeroLength
+)
+
+// parsedFrame locates one record inside the raw log. payload and end are
+// meaningful only for frameIntact; length carries the declared payload length
+// whenever the four-byte header was whole.
+type parsedFrame struct {
+	length  int
+	payload []byte
+	end     int
+}
+
+// readFrame applies the common framing rules to the record starting at
+// raw[start]: read the big-endian length, reject a zero-length record, locate
+// the body range, require every body/CRC byte to be present, and verify the
+// CRC32. It deliberately stops short of interpreting the payload: callers keep
+// their own acceptance conditions. A torn outcome (short header, short
+// body/CRC, or a checksum-bad frame sitting exactly at EOF) is a truncatable
+// unacknowledged tail only for the records after the leading version record;
+// readVersionRecord rejects every non-intact outcome as corrupt. A checksum
+// failure with bytes still following the frame is always corrupt.
+func readFrame(raw []byte, start int) (parsedFrame, frameOutcome) {
 	if len(raw)-start < frameHeaderSize {
-		return 0, fmt.Errorf("%w: incomplete version record: only %d of %d length bytes after header",
-			ErrCorrupt, len(raw)-start, frameHeaderSize)
+		return parsedFrame{}, frameShortHeader
 	}
 	n := int(binary.BigEndian.Uint32(raw[start : start+frameHeaderSize]))
 	if n == 0 {
-		return 0, fmt.Errorf("%w: zero-length version record at offset %d", ErrCorrupt, start)
+		return parsedFrame{}, frameZeroLength
 	}
 	bodyStart := start + frameHeaderSize
 	frameEnd := bodyStart + n + frameCRCsSize
 	if frameEnd > len(raw) {
-		return 0, fmt.Errorf("%w: incomplete version record: length %d but only %d body/checksum bytes present",
-			ErrCorrupt, n, len(raw)-bodyStart)
+		return parsedFrame{length: n}, frameShortBody
 	}
 	payload := raw[bodyStart : bodyStart+n]
 	wantCRC := binary.BigEndian.Uint32(raw[bodyStart+n : frameEnd])
 	if crc32.Checksum(payload, crcTable) != wantCRC {
+		if frameEnd == len(raw) {
+			return parsedFrame{length: n}, frameBadCRCTrailing
+		}
+		return parsedFrame{length: n, end: frameEnd}, frameBadCRCMid
+	}
+	return parsedFrame{length: n, payload: payload, end: frameEnd}, frameIntact
+}
+
+// readVersionRecord reads and validates the log's first record at offset
+// start, returning the offset just past it. It runs the same framing rules as
+// every later record through readFrame but keeps the version record's own
+// acceptance: a correct magic prefix alone is not a valid log, the version
+// record must be fully present, its checksum must match (a checksum-bad first
+// record is corrupt even when it ends exactly at EOF — torn-tail recovery
+// exists only after the head has been validated), and it must name a
+// supported version. Every other shape — a record cut short at end of file
+// (one to three length bytes, or the length without the body and CRC), a
+// zero-length record, invalid JSON, a non-version record, or an unsupported
+// version — is a corrupt log, never a truncatable tail.
+func readVersionRecord(raw []byte, start int) (int, error) {
+	fr, outcome := readFrame(raw, start)
+	switch outcome {
+	case frameShortHeader:
+		return 0, fmt.Errorf("%w: incomplete version record: only %d of %d length bytes after header",
+			ErrCorrupt, len(raw)-start, frameHeaderSize)
+	case frameZeroLength:
+		return 0, fmt.Errorf("%w: zero-length version record at offset %d", ErrCorrupt, start)
+	case frameShortBody:
+		return 0, fmt.Errorf("%w: incomplete version record: length %d but only %d body/checksum bytes present",
+			ErrCorrupt, fr.length, len(raw)-(start+frameHeaderSize))
+	case frameBadCRCTrailing, frameBadCRCMid:
 		return 0, fmt.Errorf("%w: checksum mismatch in version record at offset %d", ErrCorrupt, start)
 	}
 	var e logEntry
-	if err := json.Unmarshal(payload, &e); err != nil {
+	if err := json.Unmarshal(fr.payload, &e); err != nil {
 		return 0, fmt.Errorf("%w: invalid version record at offset %d: %v", ErrCorrupt, start, err)
 	}
 	if e.T != kindVersion {
@@ -370,7 +417,7 @@ func readVersionRecord(raw []byte, start int) (int, error) {
 	if e.V != currentLogV {
 		return 0, fmt.Errorf("%w: unsupported log version %d", ErrCorrupt, e.V)
 	}
-	return frameEnd, nil
+	return fr.end, nil
 }
 
 // entryCarriesConsumption reports whether a non-success entry smuggles any
