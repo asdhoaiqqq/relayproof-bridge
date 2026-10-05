@@ -204,9 +204,17 @@ func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 // delivered together with the read error is part of the failed read rather
 // than a complete log line, so it is neither normalized nor counted and gets
 // no result of its own. A write error is returned wrapped with ErrLogWrite
-// and leaves the failure count unchanged. When both sides fail, the earlier
-// read error is reported. A clean EOF is not an error, including when the
-// final complete line has no trailing newline.
+// and leaves the failure count unchanged. An output end that acknowledges
+// fewer bytes than offered while returning a nil error — whether zero bytes
+// or a non-empty prefix, on the shutdown flush or on a single result larger
+// than the internal write buffer — is an io.Writer contract violation too:
+// processing ends at that write with io.ErrShortWrite wrapped alongside
+// ErrLogWrite, without retrying and without completing the delivery, and the
+// bytes already acknowledged remain as the prefix of the normal output. When
+// the output returns its own concrete error, that error stays the write
+// failure's cause instead of being replaced by io.ErrShortWrite. When both
+// sides fail, the earlier read error is reported. A clean EOF is not an
+// error, including when the final complete line has no trailing newline.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	return NormalizeReaderFiltered(r, w, nil)
 }
@@ -220,9 +228,35 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 // original error reason and carries no event, whether or not its raw address
 // was inside, outside, or absent from the network, and later lines keep
 // processing. A nil filter reproduces NormalizeReader exactly.
+// shortWriteGuardingWriter normalizes an output end that violates the
+// io.Writer contract by acknowledging fewer bytes than it was offered while
+// returning a nil error. bufio.Writer turns that shape into
+// io.ErrShortWrite only on its buffered Flush path: when a single write is
+// larger than the buffer and the buffer is empty, it is handed straight to
+// the underlying writer, whose (n, nil) acknowledgement is trusted as-is —
+// a (0, nil) acknowledgement would be retried forever, and a non-empty
+// prefix acknowledgement would be treated as a complete delivery. Checking
+// the acknowledgement here makes both the buffered and the direct paths end
+// deterministically. A concrete error is passed through untouched, even when
+// it accompanies a short acknowledgement, so the output's own cause stays
+// the reason instead of being replaced by io.ErrShortWrite.
+type shortWriteGuardingWriter struct {
+	w io.Writer
+}
+
+func (g shortWriteGuardingWriter) Write(p []byte) (int, error) {
+	n, err := g.w.Write(p)
+	if err == nil && n < len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, err
+}
+
 func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter) (failures int, err error) {
 	reader := bufio.NewReader(r)
-	bw := bufio.NewWriter(w)
+	// Guard before buffering: the guard also covers the direct large-write
+	// path bufio takes for a result bigger than its 4096-byte buffer.
+	bw := bufio.NewWriter(shortWriteGuardingWriter{w: w})
 	var readErr error // first stream read error, reported even if flushing fails
 	defer func() {
 		flushErr := bw.Flush()
