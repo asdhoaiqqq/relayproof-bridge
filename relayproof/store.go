@@ -84,6 +84,26 @@ import (
 // with ErrCorrupt, leaving the file untouched — it is never read back as an
 // empty or replacement-filled payload.
 //
+// Message ids have the same contract and use the same encoding: identity is
+// judged by the id's exact bytes, never by its display form. The Go submit
+// interface accepts any non-empty id without requiring valid UTF-8 — plain
+// text, Chinese text, whitespace, colons, NUL bytes, stray 0xFF/0xFE bytes,
+// or text mixed with them — and the bytes 0xFF, 0xFE and the legal character
+// U+FFFD are three different ids that must never merge into one record. JSON
+// string encoding would silently rewrite invalid id bytes to U+FFFD, so after
+// a reopen the original id would no longer find its message and two distinct
+// ids could replay as duplicate submits, making the directory unopenable. A
+// valid-UTF-8 id keeps the historical plain "id" field (and a success entry's
+// "consumeBy"), so existing logs and the CLI stay byte-compatible; an
+// invalid-UTF-8 id is stored base64-encoded in "idB64" (and "consumeByB64").
+// Result and snapshot reasons embed such raw bytes too — a replay reason
+// names the winning message id and an unknown-source reason names the chain —
+// so an invalid-UTF-8 reason is likewise stored in "reasonB64". Ids an older
+// build already rewrote to replacement characters stay those characters on
+// replay; the lost bytes are never guessed. A record carrying both a plain
+// field and its base64 form, or an undecodable base64 field, is corrupt and
+// rejects the directory with ErrCorrupt.
+//
 // Processing-time validation on replay: a plain result's time must be a
 // non-negative Unix-millisecond instant and no earlier than any queue-wide
 // time the log has already confirmed — an advance checkpoint or any earlier
@@ -141,6 +161,10 @@ type logEntry struct {
 	ProofAt   int64  `json:"proofAt,omitempty"`
 	ExpiresAt int64  `json:"expiresAt,omitempty"`
 
+	// IDB64 carries a message id's raw bytes base64-encoded when the id is
+	// not valid UTF-8; see setID/entryID. Never set together with ID.
+	IDB64 string `json:"idB64,omitempty"`
+
 	// PayloadB64 carries a message payload's raw bytes base64-encoded when the
 	// payload is not valid UTF-8; see setPayload/entryPayload. Never set
 	// together with Payload.
@@ -152,6 +176,12 @@ type logEntry struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	NextRetry int64  `json:"nextRetry,omitempty"`
 
+	// ReasonB64 carries a result/snapshot reason's raw bytes base64-encoded
+	// when the reason is not valid UTF-8 (it may embed a raw-bytes message id
+	// or chain name); see setReason/entryReason. Never set together with
+	// Reason.
+	ReasonB64 string `json:"reasonB64,omitempty"`
+
 	// Consumed triple of a success entry, stored as three independent values
 	// so routing paths that share a flattened key stay distinct. consumeBy is
 	// the id of the successful message.
@@ -160,10 +190,91 @@ type logEntry struct {
 	ConsumeNonce uint64 `json:"consumeNonce,omitempty"`
 	ConsumeBy    string `json:"consumeBy,omitempty"`
 
+	// ConsumeByB64 is the base64 form of ConsumeBy for an invalid-UTF-8
+	// message id; see setConsumeBy/entryConsumeBy. Never set together with
+	// ConsumeBy.
+	ConsumeByB64 string `json:"consumeByB64,omitempty"`
+
 	// ConsumeKey is the legacy (pre-triple) NUL-joined consumption string. It
 	// is accepted only while replaying logs written by older builds and is
 	// never written anymore.
 	ConsumeKey string `json:"consumeKey,omitempty"`
+}
+
+// bytesField is the shared inverse of the plain/base64 field split: with no
+// base64 value the plain field is taken at face value (historical records,
+// including bytes an old build rewrote to U+FFFD, keep their meaning and are
+// never guessed back); both fields set, or an undecodable base64 value, is an
+// inconsistent record no build writes.
+func bytesField(plain, b64Value, bothMsg, undecodableMsg string) (string, error) {
+	if b64Value == "" {
+		return plain, nil
+	}
+	if plain != "" {
+		return "", fmt.Errorf("%s", bothMsg)
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64Value)
+	if err != nil {
+		return "", fmt.Errorf("%s: %v", undecodableMsg, err)
+	}
+	return string(raw), nil
+}
+
+// setID encodes a message id for the log without altering its bytes.
+func (e *logEntry) setID(id string) {
+	if utf8.ValidString(id) {
+		e.ID = id
+		e.IDB64 = ""
+		return
+	}
+	e.ID = ""
+	e.IDB64 = base64.StdEncoding.EncodeToString([]byte(id))
+}
+
+// entryID decodes an entry's id back to its exact submitted bytes.
+func (e *logEntry) entryID() (string, error) {
+	return bytesField(e.ID, e.IDB64,
+		"entry carries both id and idB64",
+		"entry carries undecodable idB64")
+}
+
+// setReason encodes a processing result reason for the log without altering
+// its bytes. Reasons may quote a raw-bytes message id (replay) or chain name
+// (unknown source).
+func (e *logEntry) setReason(reason string) {
+	if utf8.ValidString(reason) {
+		e.Reason = reason
+		e.ReasonB64 = ""
+		return
+	}
+	e.Reason = ""
+	e.ReasonB64 = base64.StdEncoding.EncodeToString([]byte(reason))
+}
+
+// entryReason decodes a result/snapshot entry's reason back to its exact bytes.
+func (e *logEntry) entryReason() (string, error) {
+	return bytesField(e.Reason, e.ReasonB64,
+		"entry carries both reason and reasonB64",
+		"entry carries undecodable reasonB64")
+}
+
+// setConsumeBy records the successful message's raw id alongside the consumed
+// triple, using the same plain/base64 split as the id field.
+func (e *logEntry) setConsumeBy(id string) {
+	if utf8.ValidString(id) {
+		e.ConsumeBy = id
+		e.ConsumeByB64 = ""
+		return
+	}
+	e.ConsumeBy = ""
+	e.ConsumeByB64 = base64.StdEncoding.EncodeToString([]byte(id))
+}
+
+// entryConsumeBy decodes the consuming message id back to its exact bytes.
+func (e *logEntry) entryConsumeBy() (string, error) {
+	return bytesField(e.ConsumeBy, e.ConsumeByB64,
+		"success entry carries both consumeBy and consumeByB64",
+		"success entry carries undecodable consumeByB64")
 }
 
 // setRoot encodes a header root for the log without altering its bytes. A
@@ -477,6 +588,9 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		if err := json.Unmarshal(payload, &e); err != nil {
 			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
 		}
+		if err := normalizeEntryRaw(&e); err != nil {
+			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
+		}
 		if e.T == kindVersion {
 			return 0, nil, fmt.Errorf("%w: unexpected version record at offset %d", ErrCorrupt, pos)
 		}
@@ -526,6 +640,32 @@ func readVersionRecord(raw []byte, start int) (int, error) {
 		return 0, fmt.Errorf("%w: unsupported log version %d", ErrCorrupt, e.V)
 	}
 	return f.end, nil
+}
+
+// normalizeEntryRaw decodes every raw-bytes field of a replayed entry back to
+// its exact submitted bytes in place, so the rest of replay compares ids,
+// reasons and consumer attributions as raw strings just like the live queue.
+// A plain/base64 clash or an undecodable base64 value is corruption.
+func normalizeEntryRaw(e *logEntry) error {
+	id, err := e.entryID()
+	if err != nil {
+		return err
+	}
+	e.ID = id
+	e.IDB64 = ""
+	reason, err := e.entryReason()
+	if err != nil {
+		return err
+	}
+	e.Reason = reason
+	e.ReasonB64 = ""
+	by, err := e.entryConsumeBy()
+	if err != nil {
+		return err
+	}
+	e.ConsumeBy = by
+	e.ConsumeByB64 = ""
+	return nil
 }
 
 // entryCarriesConsumption reports whether a non-success entry smuggles any
@@ -926,9 +1066,10 @@ func (s *store) appendHeader(h Header) error {
 func (s *store) appendSubmit(rec *Record) error {
 	m := rec.Msg.Message
 	e := &logEntry{
-		T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
+		T: kindSubmit, Seq: rec.Seq, From: m.From, To: m.To,
 		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
 	}
+	e.setID(m.ID)
 	e.setPayload(m.Payload)
 	return s.append(e)
 }
@@ -942,18 +1083,21 @@ func (s *store) appendSubmit(rec *Record) error {
 // durable record, committing together atomically; oc.consume is nil for every
 // non-success status.
 func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
+	id := rec.Msg.Message.ID
 	e := &logEntry{
-		T: kindResult, Now: now, ID: rec.Msg.Message.ID,
-		Status: oc.status, Reason: oc.reason, Attempts: attempts, NextRetry: nextRetry,
+		T: kindResult, Now: now,
+		Status: oc.status, Attempts: attempts, NextRetry: nextRetry,
 	}
+	e.setID(id)
+	e.setReason(oc.reason)
 	if oc.status == StatusSuccess {
 		if oc.consume == nil {
-			return fmt.Errorf("internal error: success result for %q missing nonce consumption", rec.Msg.Message.ID)
+			return fmt.Errorf("internal error: success result for %q missing nonce consumption", id)
 		}
 		e.ConsumeFrom = oc.consume.from
 		e.ConsumeTo = oc.consume.to
 		e.ConsumeNonce = oc.consume.nonce
-		e.ConsumeBy = rec.Msg.Message.ID
+		e.setConsumeBy(id)
 	}
 	return s.append(e)
 }
@@ -1011,16 +1155,19 @@ func (s *store) compact(state *loadedState) error {
 		rec := bySeq[seq]
 		m := rec.Msg.Message
 		se := &logEntry{
-			T: kindSubmit, Seq: rec.Seq, ID: m.ID, From: m.From, To: m.To,
+			T: kindSubmit, Seq: rec.Seq, From: m.From, To: m.To,
 			Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
 		}
+		se.setID(m.ID)
 		se.setPayload(m.Payload)
 		entries = append(entries, se)
 		if rec.Attempts > 0 {
 			re := &logEntry{
-				T: kindState, Now: rec.LastProcAt, ID: m.ID,
-				Status: rec.Status, Reason: rec.Reason, Attempts: rec.Attempts,
+				T: kindState, Now: rec.LastProcAt,
+				Status: rec.Status, Attempts: rec.Attempts,
 			}
+			re.setID(m.ID)
+			re.setReason(rec.Reason)
 			if rec.Status == StatusWaiting {
 				re.NextRetry = rec.NextRetry
 			}
@@ -1028,7 +1175,7 @@ func (s *store) compact(state *loadedState) error {
 				re.ConsumeFrom = m.From
 				re.ConsumeTo = m.To
 				re.ConsumeNonce = m.Nonce
-				re.ConsumeBy = m.ID
+				re.setConsumeBy(m.ID)
 			}
 			entries = append(entries, re)
 		}
