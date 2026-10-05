@@ -144,6 +144,11 @@ type store struct {
 	// zero means injectErr fails every append.
 	injectErrOnCall int
 	appendCalls     int
+	// compactions counts committed snapshot rewrites (a successful rename over
+	// the active log). It is a test-observable hook, in the same spirit as
+	// injectErr, letting regression tests assert that a given user operation
+	// crossed the threshold and actually compacted.
+	compactions int
 }
 
 // loadedState is the fully replayed (or live) queue state.
@@ -913,6 +918,7 @@ func (s *store) compact(state *loadedState) error {
 	if info, err := nf.Stat(); err == nil {
 		s.size = info.Size()
 	}
+	s.compactions++
 	return nil
 }
 
