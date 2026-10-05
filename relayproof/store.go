@@ -31,6 +31,13 @@ import (
 // U+0000 — so the triple is never flattened into one delimiter-joined string,
 // which would let distinct routing paths share one consumption identity.
 //
+// Header roots likewise compare and persist byte for byte. A JSON string field
+// cannot hold bytes that are not valid UTF-8 (json.Marshal rewrites them to
+// U+FFFD), so a non-empty root is additionally carried in rootBytes as a
+// base64-encoded []byte, which round-trips every byte sequence. rootBytes is
+// authoritative when present; the plain root string is the fallback for older
+// records and remains written alongside for readability.
+//
 // Crash recovery: a frame missing bytes at end of file, or a final frame with
 // a bad checksum, is the torn tail of a write that was never acknowledged and
 // is truncated. That recovery is only available once the log's leading
@@ -91,10 +98,22 @@ type logEntry struct {
 	T string `json:"t"`
 	V int    `json:"v,omitempty"`
 
-	Chain   string `json:"chain,omitempty"`
-	Height  int64  `json:"height,omitempty"`
-	Root    string `json:"root,omitempty"`
-	Trusted bool   `json:"trusted,omitempty"`
+	Chain  string `json:"chain,omitempty"`
+	Height int64  `json:"height,omitempty"`
+	Root   string `json:"root,omitempty"`
+	// RootBytes carries the header root as its exact submitted byte sequence,
+	// base64-encoded by encoding/json. Roots stay Go strings at the API and
+	// compare byte for byte, but a JSON string cannot carry bytes that are not
+	// valid UTF-8: json.Marshal replaces every invalid byte with U+FFFD, which
+	// used to silently rewrite a saved root once it passed through the log (a
+	// reopen, or a compaction snapshot). Every non-empty root is written here
+	// and is the root's source of truth on replay; an empty root is omitted
+	// (it encodes to zero bytes) and falls back to Root, which is the same
+	// empty string. Records written by older builds have no rootBytes and fall
+	// back to their Root verbatim — including a U+FFFD an old build actually
+	// stored, never guessed back into the bytes it replaced.
+	RootBytes []byte `json:"rootBytes,omitempty"`
+	Trusted   bool   `json:"trusted,omitempty"`
 
 	Seq       int64  `json:"seq,omitempty"`
 	ID        string `json:"id,omitempty"`
@@ -595,7 +614,7 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			hs = &headerState{}
 			s.headers[e.Chain] = hs
 		}
-		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: e.Root, Trusted: e.Trusted}
+		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: headerRoot(e), Trusted: e.Trusted}
 		if e.Trusted && (hs.trusted == nil || e.Height >= hs.trusted.Height) {
 			t := hs.latest
 			hs.trusted = &t
@@ -798,8 +817,36 @@ func (s *store) appendRegisterSource(chain string) error {
 	return s.append(&logEntry{T: kindSource, Chain: chain})
 }
 
+// headerLogEntry builds the on-disk header record. The root is written twice:
+// as the JSON root string (kept for readability and by older builds) and as
+// rootBytes, its exact submitted byte sequence base64-encoded by encoding/json.
+// The two can legitimately differ for an invalid-UTF-8 root because
+// json.Marshal rewrites the string copy's invalid bytes to U+FFFD; rootBytes
+// is what survives verbatim.
+func headerLogEntry(h Header) *logEntry {
+	return &logEntry{
+		T:         kindHeader,
+		Chain:     h.Chain,
+		Height:    h.Height,
+		Root:      h.Root,
+		RootBytes: []byte(h.Root),
+		Trusted:   h.Trusted,
+	}
+}
+
+// headerRoot returns the exact root recorded on a header entry. New records
+// carry it verbatim in rootBytes; records from older builds only have the JSON
+// root string, which is used exactly as recorded — a stored U+FFFD included —
+// because the invalid bytes an old build replaced with it cannot be recovered.
+func headerRoot(e *logEntry) string {
+	if e.RootBytes != nil {
+		return string(e.RootBytes)
+	}
+	return e.Root
+}
+
 func (s *store) appendHeader(h Header) error {
-	return s.append(&logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Root: h.Root, Trusted: h.Trusted})
+	return s.append(headerLogEntry(h))
 }
 
 func (s *store) appendSubmit(rec *Record) error {
@@ -866,10 +913,10 @@ func (s *store) compact(state *loadedState) error {
 		// highest trusted as the max-height trusted entry, so this order
 		// restores both exactly.
 		if hs.trusted != nil {
-			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.trusted.Chain, Height: hs.trusted.Height, Root: hs.trusted.Root, Trusted: hs.trusted.Trusted})
+			entries = append(entries, headerLogEntry(*hs.trusted))
 		}
 		if hs.trusted == nil || hs.latest != *hs.trusted {
-			entries = append(entries, &logEntry{T: kindHeader, Chain: hs.latest.Chain, Height: hs.latest.Height, Root: hs.latest.Root, Trusted: hs.latest.Trusted})
+			entries = append(entries, headerLogEntry(hs.latest))
 		}
 	}
 
