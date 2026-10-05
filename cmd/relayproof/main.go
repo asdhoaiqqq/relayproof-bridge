@@ -4,9 +4,14 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asdhoaiqqq/relayproof-bridge/relayproof"
 )
+
+// sourceCIDRFlag is the sole normalize option: an IPv4 network that restricts
+// which successful events are emitted.
+const sourceCIDRFlag = "--source-cidr"
 
 func main() {
 	command := "demo"
@@ -36,12 +41,27 @@ func usage() {
 	fmt.Println("  normalize   read newline-delimited JSON logs from stdin and write")
 	fmt.Println("              normalized event results to stdout, one JSON object per line;")
 	fmt.Println("              exits non-zero when one or more input lines fail")
+	fmt.Println()
+	fmt.Println("              options:")
+	fmt.Println("                --source-cidr <IPv4>/<prefix>")
+	fmt.Println("                    emit a successful event only when its normalized")
+	fmt.Println("                    source_ip lies in this single IPv4 network (prefix")
+	fmt.Println(`                    length 0-32, e.g. "192.0.2.0/24" or "192.0.2.123/24";`)
+	fmt.Println("                    failed lines are still reported. May be given once.")
 	fmt.Println("  version     print the relayproof version")
 	fmt.Println("  help        show this help")
 }
 
 func runNormalize() {
-	failures, err := relayproof.NormalizeReader(os.Stdin, os.Stdout)
+	// Options are parsed before stdin is read: a malformed option exits 2
+	// with empty stdout, exactly like a stream-level failure, and no log
+	// content is consumed or produced for it.
+	filter, err := parseNormalizeOptions(os.Args[2:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "normalize: %v\n", err)
+		os.Exit(2)
+	}
+	failures, err := relayproof.NormalizeReaderFiltered(os.Stdin, os.Stdout, filter)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "normalize: %v\n", err)
 		os.Exit(2)
@@ -49,6 +69,49 @@ func runNormalize() {
 	if failures > 0 {
 		os.Exit(1)
 	}
+}
+
+// parseNormalizeOptions accepts at most one --source-cidr option, in either
+// "--source-cidr value" or "--source-cidr=value" form. A missing or empty
+// value, a value outside the IPv4/prefix grammar, a repeated option, or any
+// other argument is a parameter error: the caller reports it on stderr and
+// exits 2 before opening the log stream.
+func parseNormalizeOptions(args []string) (*relayproof.SourceCIDRFilter, error) {
+	var filter *relayproof.SourceCIDRFilter
+	specified := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == sourceCIDRFlag:
+			if specified {
+				return nil, fmt.Errorf("%s may be specified at most once", sourceCIDRFlag)
+			}
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("%s requires a value: an IPv4 network in dotted decimal with a \"/0\" to \"/32\" prefix length, e.g. %q",
+					sourceCIDRFlag, "192.0.2.0/24")
+			}
+			i++
+			value := args[i]
+			parsed, err := relayproof.ParseSourceCIDRFilter(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s value: %w", sourceCIDRFlag, err)
+			}
+			filter, specified = &parsed, true
+		case strings.HasPrefix(arg, sourceCIDRFlag+"="):
+			if specified {
+				return nil, fmt.Errorf("%s may be specified at most once", sourceCIDRFlag)
+			}
+			value := strings.TrimPrefix(arg, sourceCIDRFlag+"=")
+			parsed, err := relayproof.ParseSourceCIDRFilter(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s value: %w", sourceCIDRFlag, err)
+			}
+			filter, specified = &parsed, true
+		default:
+			return nil, fmt.Errorf("unknown argument %q; normalize accepts only %s <IPv4>/<prefix>", arg, sourceCIDRFlag)
+		}
+	}
+	return filter, nil
 }
 
 func runDemo() {

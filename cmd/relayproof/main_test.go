@@ -69,7 +69,15 @@ type cliResult struct {
 // started at all fails the test rather than masquerading as an exit status.
 func runNormalizeCLI(t *testing.T, stdin io.Reader) cliResult {
 	t.Helper()
-	cmd := exec.Command(normalizeBin, "normalize")
+	return runNormalizeCLIArgs(t, stdin)
+}
+
+// runNormalizeCLIArgs is runNormalizeCLI with explicit extra arguments after
+// the normalize subcommand, e.g. runNormalizeCLIArgs(t, r, "--source-cidr",
+// "192.0.2.0/24").
+func runNormalizeCLIArgs(t *testing.T, stdin io.Reader, args ...string) cliResult {
+	t.Helper()
+	cmd := exec.Command(normalizeBin, append([]string{"normalize"}, args...)...)
 	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

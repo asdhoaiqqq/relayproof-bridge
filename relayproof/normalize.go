@@ -104,6 +104,94 @@ var (
 	ErrLogWrite = errors.New("log stream write failure")
 )
 
+// SourceCIDRFilter restricts emitted successful events to one IPv4 source
+// network. It is the parsed, validated form of an argument like
+// "192.0.2.123/24": host bits in the spelled address do not narrow the range,
+// so "192.0.2.123/24" and "192.0.2.0/24" admit the same sources, "/32" admits
+// only the one address, and "/0" admits every normalized IPv4 source.
+//
+// Matching uses the fully normalized source_ip. A plain IPv4 address and its
+// IPv4-mapped IPv6 spellings (e.g. 192.0.2.1 and ::ffff:192.0.2.1) normalize
+// to the same address and therefore admit identically; a genuine IPv6 source
+// whose tail happens to embed the same 32 bits (e.g. ::192.0.2.1) is not an
+// IPv4-mapped address and never admits. A valid event without a source
+// address, or whose normalized source stays IPv6, is simply not emitted by a
+// filtered run; that is neither a success result nor a failure.
+type SourceCIDRFilter struct {
+	network *net.IPNet
+}
+
+// sourceCIDRPattern pins the argument grammar before any range checking:
+// exactly four 1-3 digit octets, a single "/", and a 1-3 digit prefix
+// length. net.ParseCIDR is deliberately not used: it accepts IPv6 networks
+// (the option is IPv4-only) and its error text does not distinguish the
+// rejected shapes, while strict parsing here lets each failure name the
+// exact octet or prefix that was wrong.
+var sourceCIDRPattern = regexp.MustCompile(`^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,3})$`)
+
+// ParseSourceCIDRFilter validates one IPv4 network argument: a dotted decimal
+// IPv4 address, a slash, and a prefix length of 0-32. Each octet must be a
+// plain 0-255 decimal number, with no leading-zero padding, sign, or other
+// notation. Host bits are interpreted as part of the network — they are masked
+// away rather than rejected — so "192.0.2.123/24" is the same filter as
+// "192.0.2.0/24".
+func ParseSourceCIDRFilter(s string) (SourceCIDRFilter, error) {
+	m := sourceCIDRPattern.FindStringSubmatch(s)
+	if m == nil {
+		return SourceCIDRFilter{}, errors.New(`must be an IPv4 network in dotted decimal with a "/0" to "/32" prefix length, e.g. "192.0.2.0/24"`)
+	}
+	var octets [4]byte
+	for i := 0; i < 4; i++ {
+		part := m[i+1]
+		// The pattern caps each octet at three digits; reject leading-zero
+		// padding such as "192.168.001.001", which is not the promised dotted
+		// decimal spelling (and ambiguous with historic octal parsing).
+		if len(part) > 1 && part[0] == '0' {
+			return SourceCIDRFilter{}, fmt.Errorf("invalid IPv4 network %q: octet %q must not have leading zeroes", s, part)
+		}
+		v, _ := strconv.Atoi(part)
+		if v > 255 {
+			return SourceCIDRFilter{}, fmt.Errorf("invalid IPv4 network %q: octet %d out of range (0-255)", s, v)
+		}
+		octets[i] = byte(v)
+	}
+	prefixPart := m[5]
+	if len(prefixPart) > 1 && prefixPart[0] == '0' {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv4 network %q: prefix length %q must not have leading zeroes", s, prefixPart)
+	}
+	prefix, _ := strconv.Atoi(prefixPart)
+	if prefix > 32 {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv4 network %q: prefix length %d out of range (0-32)", s, prefix)
+	}
+	// Mask host bits away so the written host address cannot narrow the
+	// range: network.IP already carries the masked address.
+	mask := net.CIDRMask(prefix, 32)
+	ip := net.IPv4(octets[0], octets[1], octets[2], octets[3]).To4()
+	return SourceCIDRFilter{network: &net.IPNet{IP: ip.Mask(mask), Mask: mask}}, nil
+}
+
+// String renders the canonical network the filter admits, e.g.
+// ParseSourceCIDRFilter("192.0.2.123/24").String() == "192.0.2.0/24".
+func (f SourceCIDRFilter) String() string {
+	return f.network.String()
+}
+
+// admits reports whether a normalized source_ip string falls in the IPv4
+// network. Text that is not a single IPv4 address is never admitted: a
+// normalized IPv6 spelling (including ::192.0.2.1) stays IPv6 and is rejected
+// even when its final 32 bits match. Normalized mapped spellings have already
+// been printed in dotted form by net.IP.String, so they take the IPv4 path.
+func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
+	ip := net.ParseIP(normalizedSourceIP)
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return f.network.Contains(v4)
+	}
+	return false
+}
+
 // NormalizeReader streams newline-delimited JSON logs from r and writes one
 // NormalizeResult JSON object per non-blank physical line to w. Blank lines
 // produce no output but still advance the physical line counter. It returns
@@ -120,6 +208,19 @@ var (
 // read error is reported. A clean EOF is not an error, including when the
 // final complete line has no trailing newline.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
+	return NormalizeReaderFiltered(r, w, nil)
+}
+
+// NormalizeReaderFiltered behaves like NormalizeReader, except that when
+// filter is non-nil a successfully normalized event is written only when its
+// normalized source_ip is admitted by the filter. Filtered-out successes are
+// not written and are not failures: they leave both the failure count and
+// the exit status unchanged. The filter never hides bad logs: a line that
+// fails normalization is still emitted with its physical line number and
+// original error reason and carries no event, whether or not its raw address
+// was inside, outside, or absent from the network, and later lines keep
+// processing. A nil filter reproduces NormalizeReader exactly.
+func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter) (failures int, err error) {
 	reader := bufio.NewReader(r)
 	bw := bufio.NewWriter(w)
 	var readErr error // first stream read error, reported even if flushing fails
@@ -163,11 +264,21 @@ func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 			lineNo++
 			if strings.TrimSpace(string(line)) != "" {
 				result := NormalizeLine(lineNo, line)
+				emit := true
 				if !result.OK {
 					failures++
+				} else if filter != nil && !filter.admits(result.Event.SourceIP) {
+					// A valid event whose normalized source is outside the
+					// selected network (or absent, or still IPv6) is
+					// filtered out: no result and no failure. The filter
+					// never runs on failed lines, so a bad address outside
+					// the network is still reported as a failure.
+					emit = false
 				}
-				if encErr := encoder.Encode(result); encErr != nil {
-					return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
+				if emit {
+					if encErr := encoder.Encode(result); encErr != nil {
+						return failures, fmt.Errorf("%w: %w", ErrLogWrite, encErr)
+					}
 				}
 			}
 		}
