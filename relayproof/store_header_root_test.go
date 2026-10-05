@@ -214,6 +214,79 @@ func TestHeaderRootB64InconsistentRecordsRejected(t *testing.T) {
 	}
 }
 
+// The two root forms must never co-occur, and an empty string still counts as
+// the field appearing: a complete, checksum-valid header record carrying both
+// "root" and "rootB64" — even with one side empty, or with both sides
+// decoding to the same bytes — is corrupt, trusted or not, whether it sits in
+// a plainly appended log or in a compacted-looking one, and even as the final
+// record of the log (it is judged, never truncated as a torn tail). These
+// payloads are hand-crafted because the marshaler's omitempty never emits an
+// empty "root":"" — no build writes these records.
+func TestHeaderRootBothFormsPresentRejected(t *testing.T) {
+	version := encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))
+	source := encodeFrame(mustMarshal(&logEntry{T: kindSource, Chain: "a"}))
+	cases := map[string]string{
+		"empty root beside rootB64":   `{"t":"header","chain":"a","height":1,"root":"","rootB64":"/w==","trusted":true}`,
+		"empty rootB64 beside root":   `{"t":"header","chain":"a","height":1,"root":"x","rootB64":"","trusted":true}`,
+		"both forms decoding equally": `{"t":"header","chain":"a","height":1,"root":"x","rootB64":"eA==","trusted":true}`,
+		"untrusted header":            `{"t":"header","chain":"a","height":1,"root":"","rootB64":"/w=="}`,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, version...)
+			raw = append(raw, encodeFrame([]byte(payload))...)
+			writeRawLog(t, dir, raw)
+			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+
+	// The same clash inside a compacted-shaped log (records preceding the
+	// header, as compaction writes them) is rejected the same way.
+	t.Run("compacted log shape", func(t *testing.T) {
+		dir := t.TempDir()
+		var raw []byte
+		raw = append(raw, logMagic...)
+		raw = append(raw, version...)
+		raw = append(raw, source...)
+		raw = append(raw, encodeFrame([]byte(
+			`{"t":"header","chain":"a","height":1,"root":"","rootB64":"/w==","trusted":true}`))...)
+		writeRawLog(t, dir, raw)
+		assertCorruptAndUntouched(t, dir, raw)
+	})
+}
+
+// Legal single-form roots are unaffected by the clash check: an explicit
+// empty "root":"", a historical record omitting both root fields, and a
+// decodable rootB64 on its own all keep their existing meanings — the empty
+// root and the exact rootB64 bytes — and drive same-height conflict judgment
+// as before.
+func TestHeaderRootSingleFormStillAccepted(t *testing.T) {
+	dir := t.TempDir()
+	var raw []byte
+	raw = append(raw, logMagic...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+	raw = append(raw, encodeFrame([]byte(`{"t":"header","chain":"a","height":1,"root":"","trusted":true}`))...)
+	raw = append(raw, encodeFrame([]byte(`{"t":"header","chain":"b","height":2,"trusted":true}`))...)
+	raw = append(raw, encodeFrame([]byte(`{"t":"header","chain":"c","height":3,"rootB64":"/w==","trusted":true}`))...)
+	writeRawLog(t, dir, raw)
+
+	q := reopen(t, dir)
+	defer q.Close()
+	rootFF := string([]byte{0xFF})
+	// Explicit empty root and omitted root fields both mean the empty root.
+	requireHeaderAccepted(t, q, "a", 1, "")
+	requireHeaderAccepted(t, q, "b", 2, "")
+	requireHeaderConflict(t, q, "a", 1, "other", "")
+	requireHeaderConflict(t, q, "b", 2, "other", "")
+	// A lone rootB64 restores its exact bytes.
+	requireHeaderAccepted(t, q, "c", 3, rootFF)
+	requireHeaderConflict(t, q, "c", 3, string([]byte{0xFE}), rootFF)
+	requireHeaderConflict(t, q, "c", 3, replacementCharRoot, rootFF)
+}
+
 // A conflict error still names the submitted and accepted roots distinctly
 // when invalid bytes are involved, so the two sides of the conflict stay
 // distinguishable in diagnostics.

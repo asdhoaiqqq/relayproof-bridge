@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -355,6 +357,60 @@ func TestCLIHeaderConflictEmptyRoots(t *testing.T) {
 	}
 	assertHeaderConflict(t, storeHeader(t, state2, "y", 2, "", true),
 		"y", 2, "", "r0")
+}
+
+// A stored header record that carries both root forms at once is corrupt
+// on-disk state, not a header conflict: opening the directory through
+// `queue query` fails with the corruption exit code 12 (distinct from the
+// same-height-different-root conflict's 16), stderr names the two root
+// representations, no query result is printed, and queue.log keeps every
+// byte. The frame bytes are hand-built because no build writes such a record.
+func TestCLIQueryCorruptHeaderRootBothFormsExitCode12(t *testing.T) {
+	state := t.TempDir()
+	var raw []byte
+	raw = append(raw, "RELAYPROOF-QUEUE-V1\n"...)
+	raw = append(raw, cliLogFrame(`{"t":"version","v":1}`)...)
+	raw = append(raw, cliLogFrame(`{"t":"header","chain":"a","height":1,"root":"","rootB64":"/w==","trusted":true}`)...)
+	logPath := filepath.Join(state, "queue.log")
+	if err := os.WriteFile(logPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := queueCLI(t, state, "query")
+	if r.code != 12 {
+		t.Fatalf("want corruption exit code 12, got %d (stdout=%q stderr=%q)", r.code, r.stdout, r.stderr)
+	}
+	if r.stdout != "" {
+		t.Fatalf("a corrupt directory must not print query results: %q", r.stdout)
+	}
+	for _, want := range []string{"corrupt", "both root and rootB64"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, r.stderr)
+		}
+	}
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("rejected open modified queue.log: want %d bytes, got %d", len(raw), len(got))
+	}
+}
+
+// cliLogFrame wraps a JSON payload in the queue.log frame envelope:
+// uint32-be length, payload, uint32-be CRC32-IEEE of the payload.
+func cliLogFrame(payload string) []byte {
+	body := []byte(payload)
+	frame := make([]byte, 0, 4+len(body)+4)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
+	frame = append(frame, hdr[:]...)
+	frame = append(frame, body...)
+	var crc [4]byte
+	binary.BigEndian.PutUint32(crc[:], crc32.ChecksumIEEE(body))
+	frame = append(frame, crc[:]...)
+	return frame
 }
 
 // An untrusted header at the trusted height with a different root saves

@@ -66,7 +66,14 @@ import (
 // in "rootB64" instead, preserving the exact byte sequence across save,
 // reopen and compaction. Roots an older build already rewrote to replacement
 // characters stay those characters on replay — the lost bytes are never
-// guessed.
+// guessed. A checksum-valid header record carrying both root fields at once
+// is no record any build writes — the two forms must never co-occur, and an
+// explicit empty "root":"" still counts as the field appearing, even when one
+// side is empty or both decode to the same bytes. Such a record rejects the
+// directory with ErrCorrupt, leaving the file untouched, whether it was
+// appended directly or written by compaction, whatever its trust flag, and
+// even when it is the final record of the log — a complete, checksum-valid
+// record is judged, never truncated away as a torn tail.
 //
 // Message payloads have the same contract and use the same encoding: the Go
 // submit interface accepts any string without requiring valid UTF-8 (empty
@@ -296,7 +303,11 @@ func (e *logEntry) setRoot(root string) {
 // taken at face value — including roots an old build had already rewritten to
 // replacement characters, which stay those characters; the lost bytes are
 // never guessed. An entry carrying both fields, or a rootB64 that does not
-// decode, is an inconsistent record no build writes and is corrupt.
+// decode, is an inconsistent record no build writes and is corrupt. The
+// both-fields judgment is made on the raw record payload by
+// headerRootFormsClash before this decode, because the decoded struct cannot
+// distinguish an absent "root" from an explicit empty one; the check here is
+// the decoded-value backstop.
 func (e *logEntry) headerRoot() (string, error) {
 	if e.RootB64 == "" {
 		return e.Root, nil
@@ -309,6 +320,24 @@ func (e *logEntry) headerRoot() (string, error) {
 		return "", fmt.Errorf("header entry carries undecodable rootB64: %v", err)
 	}
 	return string(raw), nil
+}
+
+// headerRootFormsClash reports whether a raw header record payload carries
+// both root forms at once. Presence is judged on the raw JSON object rather
+// than on the decoded logEntry, whose zero value cannot tell an absent field
+// from an explicit empty string: "root":"" is still the field appearing, and
+// the two forms must never co-occur — even when one side is empty or both
+// decode to the same bytes, no build writes such a record. payload is known
+// to unmarshal cleanly into logEntry, so the probe cannot fail.
+func headerRootFormsClash(payload []byte) bool {
+	var probe struct {
+		Root    *string `json:"root"`
+		RootB64 *string `json:"rootB64"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return false
+	}
+	return probe.Root != nil && probe.RootB64 != nil
 }
 
 // setPayload encodes a message payload for the log without altering its
@@ -590,6 +619,9 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		}
 		if err := normalizeEntryRaw(&e); err != nil {
 			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: %v", ErrCorrupt, pos, err)
+		}
+		if e.T == kindHeader && headerRootFormsClash(payload) {
+			return 0, nil, fmt.Errorf("%w: invalid record at offset %d: header entry carries both root and rootB64", ErrCorrupt, pos)
 		}
 		if e.T == kindVersion {
 			return 0, nil, fmt.Errorf("%w: unexpected version record at offset %d", ErrCorrupt, pos)
