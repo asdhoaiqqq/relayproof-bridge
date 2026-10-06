@@ -106,3 +106,67 @@ func TestCLIQueryDualPayloadSubmitHidesNormalResults(t *testing.T) {
 		t.Fatalf("normal message must not be served from a corrupt directory: %q", r.stdout)
 	}
 }
+
+// Field-name casing cannot smuggle a second payload representation past the
+// recovery check: a complete final record mixing cased spellings — here an
+// uppercase plain key together with an uppercase base64 key — still opens with
+// exit 12, prints nothing, names both representations and leaves every byte in
+// place, for both the listing and a single-id lookup. An all-caps base64
+// spelling whose value does not decode is the same refusal but with the
+// undecodable wording rather than the both-representations wording.
+func TestCLIQueryCasedPayloadKeysCorruptExit12(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"cased both representations",
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOAD":"","PAYLOADB64":"/w=="}`,
+			"both payload and payloadB64",
+		},
+		{
+			"cased undecodable base64",
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOADB64":"!!!not-base64!!!"}`,
+			"undecodable payloadB64",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			var raw []byte
+			raw = append(raw, cliLogMagic...)
+			raw = append(raw, cliFrame([]byte(`{"t":"version","v":1}`))...)
+			raw = append(raw, cliFrame([]byte(tc.body))...)
+			writeCLIStateLog(t, state, raw)
+
+			for _, r := range []cliResult{
+				queueCLI(t, state, "query"),
+				queueCLI(t, state, "query", "--id", "m"),
+			} {
+				if r.code != 12 {
+					t.Fatalf("want corrupt exit code 12, got %d (stdout=%q stderr=%q)",
+						r.code, r.stdout, r.stderr)
+				}
+				if r.stdout != "" {
+					t.Fatalf("a corrupt directory must print no query results: %q", r.stdout)
+				}
+				if !strings.Contains(r.stderr, "corrupt") || !strings.Contains(r.stderr, tc.want) {
+					t.Fatalf("stderr must name the verdict %q:\n%s", tc.want, r.stderr)
+				}
+				if strings.Contains(r.stderr, "message id conflict") {
+					t.Fatalf("on-disk corruption must not read as a live content conflict:\n%s", r.stderr)
+				}
+			}
+
+			got, err := os.ReadFile(filepath.Join(state, "queue.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(raw) {
+				t.Fatalf("queue.log changed on rejected open: want %d bytes, got %d bytes",
+					len(raw), len(got))
+			}
+		})
+	}
+}

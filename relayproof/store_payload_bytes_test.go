@@ -673,7 +673,230 @@ func TestPayloadEmptyOmittedAndSoleB64StillAccepted(t *testing.T) {
 	}
 }
 
-// A complete dual-payload submit record is corruption even when perfectly
+// A record that names a single payload representation with a differently
+// cased field name — "PAYLOAD"/"Payload" for plain text, "PAYLOADB64"/
+// "PayloadB64" for the base64 form — restores exactly the content the
+// conventional spelling would. encoding/json fills the struct field under
+// folded keys, so recovery must read presence the same way: plain text comes
+// back as the saved text, a sole base64 form decodes back to the original
+// bytes (byte 0xFF here, never a replacement character), and a sole empty
+// base64 spelling is still the empty payload. The restored bytes are then
+// real message content: an identical resubmit of the unterminated record
+// returns the existing record, while changing one payload byte conflicts and
+// leaves the original in place.
+func TestPayloadFieldNameCasingRestoresSameContent(t *testing.T) {
+	payFF := string([]byte{0xFF})
+	cases := map[string]struct {
+		body        string
+		wantPayload string
+	}{
+		"uppercase plain key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOAD":"hello"}`,
+			"hello",
+		},
+		"mixed-case plain key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"Payload":"hello"}`,
+			"hello",
+		},
+		"uppercase base64 key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOADB64":"/w=="}`,
+			payFF,
+		},
+		"mixed-case base64 key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PayloadB64":"/w=="}`,
+			payFF,
+		},
+		"uppercase sole empty base64 key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOADB64":""}`,
+			"",
+		},
+		"uppercase sole empty plain key": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOAD":""}`,
+			"",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(tc.body))...)
+			writeRawLog(t, dir, raw)
+
+			q := reopen(t, dir)
+			defer q.Close()
+			got, ok := q.Query("m")
+			if !ok {
+				t.Fatal("restored message missing")
+			}
+			if !bytes.Equal([]byte(got.Payload), []byte(tc.wantPayload)) {
+				t.Fatalf("restored payload = % x, want % x", got.Payload, tc.wantPayload)
+			}
+
+			same := Envelope{Message: Message{
+				ID: "m", From: "a", To: "b", Nonce: 1,
+				Payload: tc.wantPayload, ProofAt: 10,
+			}}
+			echo, err := q.Submit(same)
+			if err != nil || echo.Msg.Message.Payload != tc.wantPayload {
+				t.Fatalf("identical resubmit of cased-key record: echo=% x err=%v",
+					echo.Msg.Message.Payload, err)
+			}
+			if len(q.Queries()) != 1 {
+				t.Fatal("identical resubmit must not add a record")
+			}
+			diff := same
+			diff.Message.Payload = tc.wantPayload + "z"
+			if _, err := q.Submit(diff); !errors.Is(err, ErrConflict) {
+				t.Fatalf("a one-byte payload change must conflict: %v", err)
+			}
+			if after, ok := q.Query("m"); !ok || after.Payload != tc.wantPayload {
+				t.Fatalf("original payload changed after conflict: ok=%v % x", ok, after.Payload)
+			}
+		})
+	}
+}
+
+// A cased-key base64 payload must restore byte-for-byte for an unterminated
+// waiting message too: after a reopen the identical resubmit returns the
+// existing waiting record with its schedule intact, and a one-byte change
+// conflicts without disturbing it. This is the persistence boundary where an
+// all-caps "PAYLOADB64" used to come back as the empty payload.
+func TestPayloadUppercaseB64WaitingResubmitAfterReopen(t *testing.T) {
+	pay := "w" + string([]byte{0x00, 0xFF, 0xFE})
+	payB64 := base64.StdEncoding.EncodeToString([]byte(pay))
+	body := `{"t":"submit","seq":0,"id":"w","from":"a","to":"b","nonce":7,"proofAt":100,"PAYLOADB64":"` + payB64 + `"}`
+
+	dir := t.TempDir()
+	var raw []byte
+	raw = append(raw, logMagic...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindSource, Chain: "a"}))...)
+	raw = append(raw, encodeFrame([]byte(body))...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{
+		T: kindResult, ID: "w", Now: 1000, Status: StatusWaiting,
+		Reason: "waiting", Attempts: 1, NextRetry: 2000,
+	}))...)
+	writeRawLog(t, dir, raw)
+
+	q := reopen(t, dir)
+	defer q.Close()
+	st, _ := q.Query("w")
+	if st.Status != StatusWaiting || !bytes.Equal([]byte(st.Payload), []byte(pay)) {
+		t.Fatalf("waiting record not restored with exact payload: %+v payload=% x", st, st.Payload)
+	}
+	env := Envelope{Message: Message{
+		ID: "w", From: "a", To: "b", Nonce: 7, Payload: pay, ProofAt: 100,
+	}}
+	echo, err := q.Submit(env)
+	if err != nil {
+		t.Fatalf("byte-identical resubmit must return the waiting record: %v", err)
+	}
+	if echo.Status != StatusWaiting || echo.Attempts != 1 || echo.NextRetry != 2000 ||
+		echo.Msg.Message.Payload != pay {
+		t.Fatalf("resubmit must return the waiting record unchanged: %+v", echo)
+	}
+	bad := env
+	bad.Message.Payload = "w" + string([]byte{0x00, 0xFF, 0x00})
+	if _, err := q.Submit(bad); !errors.Is(err, ErrConflict) {
+		t.Fatalf("one-byte payload change must conflict: %v", err)
+	}
+	st2, _ := q.Query("w")
+	if st2.Attempts != 1 || st2.NextRetry != 2000 || st2.Payload != pay {
+		t.Fatalf("waiting record changed after conflict: %+v payload=% x", st2, st2.Payload)
+	}
+}
+
+// Field-name casing must never dodge the two payload representations'
+// mutual-exclusion rule: any case combination of the plain and base64 keys
+// together — one empty, both empty, or the two decoding to the same bytes — is
+// corruption no build writes, regardless of key order. A base64 spelling that
+// does not decode likewise rejects the directory, under any case. The two
+// verdicts stay distinguishable by their wording, every frame (complete and
+// checksum-valid, here at end of log) is left byte-for-byte in place, and open
+// returns no usable queue.
+func TestPayloadB64CasedInconsistentRecordsRejected(t *testing.T) {
+	both := "submit entry carries both payload and payloadB64"
+	undec := "submit entry carries undecodable payloadB64"
+	cases := map[string]struct {
+		body string
+		want string
+	}{
+		"uppercase plain key plus lowercase base64, plain empty": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOAD":"","payloadB64":"/w=="}`,
+			both,
+		},
+		"lowercase plain plus uppercase base64, base64 empty": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payload":"x","PAYLOADB64":""}`,
+			both,
+		},
+		"both uppercase, non-empty, decoding to the same bytes": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOAD":"x","PAYLOADB64":"eA=="}`,
+			both,
+		},
+		"both mixed case, both empty": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"Payload":"","PayloadB64":""}`,
+			both,
+		},
+		"uppercase base64 key first, plain after": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOADB64":"/w==","PAYLOAD":""}`,
+			both,
+		},
+		"uppercase undecodable base64": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PAYLOADB64":"!!!not-base64!!!"}`,
+			undec,
+		},
+		"mixed-case undecodable base64": {
+			`{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"PayloadB64":"!!!not-base64!!!"}`,
+			undec,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(tc.body))...)
+			writeRawLog(t, dir, raw)
+
+			q, err := Open(dir)
+			if !errors.Is(err, ErrCorrupt) {
+				if q != nil {
+					q.Close()
+				}
+				t.Fatalf("want ErrCorrupt, got %v (queue=%v)", err, q != nil)
+			}
+			if q != nil {
+				q.Close()
+				t.Fatal("corrupt open must not return a usable queue")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q must distinguish the verdict %q", err.Error(), tc.want)
+			}
+			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+}
+
+// A cased dual-payload record is still corruption after normal records, so
+// none of the earlier messages are served and every byte is preserved.
+func TestPayloadCasedDualRepresentationRejectedAfterNormalRecord(t *testing.T) {
+	dir := t.TempDir()
+	var raw []byte
+	raw = append(raw, logMagic...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+	raw = append(raw, encodeFrame(mustMarshal(&logEntry{
+		T: kindSubmit, Seq: 0, ID: "ok", From: "a", To: "b", Nonce: 1,
+		Payload: "normal", ProofAt: 10,
+	}))...)
+	raw = append(raw, encodeFrame([]byte(
+		`{"t":"submit","seq":1,"id":"bad","from":"a","to":"b","nonce":2,"proofAt":10,"PAYLOAD":"","PAYLOADB64":"/w=="}`))...)
+	writeRawLog(t, dir, raw)
+	assertCorruptAndUntouched(t, dir, raw)
+}
+
 // good records precede it — including the submit entry a compaction writes to
 // restore an already processed message, followed by its state entry. Open
 // refuses the whole directory with ErrCorrupt, returns no usable queue and

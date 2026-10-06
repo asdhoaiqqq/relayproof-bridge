@@ -95,7 +95,12 @@ import (
 // dual-payload record. A checksum-valid record carrying an undecodable
 // payloadB64 likewise rejects the directory with ErrCorrupt, leaving the file
 // untouched — it is never read back as an empty or replacement-filled
-// payload.
+// payload. Key names are matched case-insensitively, exactly as encoding/json
+// itself matches them to the struct tag: a single representation written as
+// "PAYLOAD"/"Payload"/"payloadB64"/… restores the same content as the
+// conventional spelling (plain text as the saved text, base64 as its decoded
+// bytes), and varying the field-name case cannot turn one representation into
+// the empty value or smuggle both forms past the clash check.
 //
 // Destination chain names have the same contract and use the same encoding:
 // replay identity is the exact (source chain, destination chain, nonce)
@@ -253,7 +258,11 @@ type logEntry struct {
 	// empty-value rules are keyed on presence, not the decoded value: the
 	// empty string is a legal value and is written as an explicitly present
 	// "…":"", so it must never double as the signal that the key was omitted.
-	// Set only by UnmarshalJSON and never marshalled.
+	// Presence is matched case-insensitively, exactly as encoding/json matches a
+	// record's key to the struct tag when unmarshalling: a record that writes
+	// "PAYLOADB64" or "PayloadB64" still fills the PayloadB64 field, so the
+	// presence seen here must agree or the mutual-exclusion rule could be bypassed
+	// by varying case. Set only by UnmarshalJSON and never marshalled.
 	present map[string]bool
 }
 
@@ -265,6 +274,23 @@ var splitJSONKeys = []string{
 	"payload", "payloadB64",
 	"to", "toB64",
 	"consumeTo", "consumeToB64",
+}
+
+// foldKey reproduces the case folding encoding/json applies when matching an
+// incoming JSON key to a struct tag: ASCII A-Z fold to a-z and every other
+// byte is taken literally. Presence detection must use the same fold so a
+// record written as "PAYLOADB64" or "PayloadB64" — which encoding/json still
+// loads into the PayloadB64 field — is seen as the same key the decoder's
+// mutual-exclusion rule checks. Unicode case mapping is deliberately not
+// applied: encoding/json folds ASCII only, and the tracked tags are ASCII.
+func foldKey(k string) string {
+	b := []byte(k)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // UnmarshalJSON decodes a log record while recording which plain/base64 keys
@@ -285,9 +311,21 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return err
 	}
+	// Index the record's literal keys under their folded form so presence is
+	// judged the same way encoding/json fills the struct fields: a record
+	// writing "PAYLOADB64"/"PayloadB64" populates PayloadB64, and the
+	// plain/base64 mutual-exclusion rule must see that key as present too.
+	// Without the fold, an all-caps base64 key would decode as the empty
+	// payload and a mixed-case plain key could smuggle a second
+	// representation past the clash check. Duplicate spellings of one role
+	// collapse to a single present key, matching last-wins unmarshalling.
+	folded := make(map[string]bool, len(keys))
+	for k := range keys {
+		folded[foldKey(k)] = true
+	}
 	e.present = make(map[string]bool, len(splitJSONKeys))
 	for _, k := range splitJSONKeys {
-		_, e.present[k] = keys[k]
+		e.present[k] = folded[foldKey(k)]
 	}
 	return nil
 }
@@ -325,6 +363,10 @@ type splitFieldSpec struct {
 //   - Both representations present is an inconsistent record no build writes —
 //     judged by key presence where tracked, so even "":"" or two forms that
 //     decode to the identical bytes clash — regardless of field order.
+//   - Key presence folds ASCII case the way encoding/json does, so "PAYLOADB64"
+//     and "payloadB64" are the same key: a differently cased sole key still
+//     selects its representation, and a differently cased second key still
+//     clashes.
 //   - A present base64 value that does not decode is corruption, never an empty
 //     or replacement-filled value.
 func (s splitFieldSpec) decode(e *logEntry) (string, error) {
@@ -532,7 +574,10 @@ func (e *logEntry) setPayload(payload string) {
 // explicitly empty "payload":"" is a legal plain payload, but "payload":""
 // together with any payloadB64 — even an empty one, even one that decodes to
 // the same bytes — still carries two representations of the message content
-// and is rejected. Field order does not change the verdict. The
+// and is rejected. Field order does not change the verdict, and neither does
+// field-name case: key presence folds ASCII case like encoding/json, so a
+// "PAYLOAD"/"PAYLOADB64" (or other mixed-case) pair clashes just the same,
+// while a single cased spelling restores its representation normally. The
 // presence/empty/decode-error rules themselves are the shared ones in
 // splitFieldSpec.decode; only the wording is payload specific.
 func (e *logEntry) entryPayload() (string, error) {
