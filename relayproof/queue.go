@@ -100,9 +100,70 @@ type Result struct {
 // coverage is determined solely by the highest trusted header — a later
 // untrusted header, even at a greater height, can never lower or invalidate
 // it. The zero value is a chain with no recorded headers.
+//
+// The two recorded pieces are updated from one place here, so the common
+// rules live exactly once while the two writers keep their own acceptance
+// conditions:
+//
+//   - A new submission (recordSaved) additionally runs
+//     checkSubmissionConflict first: a trusted header at the current highest
+//     trusted height with a different root is rejected outright, so neither
+//     piece changes.
+//   - Historical replay (recordRecovered) is permissive: same-height trusted
+//     headers with different roots are never a conflict; the later record
+//     wins the trusted slot.
+//
+// Everything else is shared: the latest header is always the last header
+// saved, and untrusted headers (any height) and trusted headers below the
+// accepted height update latest but never lower the trusted height.
 type headerState struct {
 	latest  Header
 	trusted *Header
+}
+
+// checkSubmissionConflict is the acceptance condition that belongs only to a
+// newly submitted header: a trusted header at the current highest trusted
+// height with a different root conflicts with the accepted header. Roots
+// compare as their exact bytes — the empty root is a legal root and invalid
+// UTF-8 bytes never collapse to the replacement character. It returns nil
+// when the submission may be recorded: no trusted header is accepted yet, the
+// header is untrusted, its height differs from the accepted height, or it
+// repeats the accepted root.
+func (hs *headerState) checkSubmissionConflict(h Header) error {
+	if h.Trusted && hs.trusted != nil &&
+		h.Height == hs.trusted.Height && h.Root != hs.trusted.Root {
+		return fmt.Errorf("%w: chain %q height %d: submitted root %q conflicts with accepted root %q",
+			ErrHeaderConflict, h.Chain, h.Height, h.Root, hs.trusted.Root)
+	}
+	return nil
+}
+
+// recordSaved applies a newly submitted, already accepted header. Same shared
+// state rule as recordRecovered: latest always follows the last save; the
+// trusted slot moves only to a strictly higher trusted header. A same-height
+// trusted resubmission with the same root is an idempotent no-op there; a
+// different root must already have been refused by checkSubmissionConflict.
+func (hs *headerState) recordSaved(h Header) {
+	hs.latest = h
+	if h.Trusted && (hs.trusted == nil || h.Height > hs.trusted.Height) {
+		t := h
+		hs.trusted = &t
+	}
+}
+
+// recordRecovered applies one header record read while replaying a state
+// directory. Replay is permissive: historical same-height trusted headers
+// with different roots are never rejected as conflicts, and a tie at the
+// highest trusted height goes to the later record (the log order in which
+// records are replayed, and the order compaction writes them). Everything
+// else matches recordSaved: latest is the last record and a trusted header
+// below the accepted height never lowers coverage.
+func (hs *headerState) recordRecovered(h Header) {
+	hs.latest = h
+	if h.Trusted && (hs.trusted == nil || h.Height >= hs.trusted.Height) {
+		t := h
+		hs.trusted = &t
+	}
 }
 
 // Queue is a durable local outbox backed by a state directory. A single
@@ -348,6 +409,10 @@ func (q *Queue) RegisterSource(chain string) error {
 //     ErrHeaderConflict: the accepted trusted header is kept and the queue
 //     remains usable.
 //
+// The conflict check is the submission-specific acceptance condition; the
+// resulting state update itself is the shared headerState rule that history
+// replay also uses.
+//
 // Header updates never bypass retry scheduling, never process messages, and
 // never reactivate terminal messages.
 func (q *Queue) UpsertHeader(h Header) error {
@@ -367,19 +432,13 @@ func (q *Queue) UpsertHeader(h Header) error {
 		hs = &headerState{}
 		q.headers[h.Chain] = hs
 	}
-	if h.Trusted && hs.trusted != nil &&
-		h.Height == hs.trusted.Height && h.Root != hs.trusted.Root {
-		return fmt.Errorf("%w: chain %q height %d: submitted root %q conflicts with accepted root %q",
-			ErrHeaderConflict, h.Chain, h.Height, h.Root, hs.trusted.Root)
+	if err := hs.checkSubmissionConflict(h); err != nil {
+		return err
 	}
 	if err := q.store.appendHeader(h); err != nil {
 		return q.fail("upsert header", err)
 	}
-	hs.latest = h
-	if h.Trusted && (hs.trusted == nil || h.Height > hs.trusted.Height) {
-		t := h
-		hs.trusted = &t
-	}
+	hs.recordSaved(h)
 	return q.maybeCompact()
 }
 

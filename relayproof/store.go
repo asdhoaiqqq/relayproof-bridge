@@ -1093,22 +1093,19 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if err != nil {
 			return corrupt("bad header entry: %v", err)
 		}
-		// Replay is permissive: historical same-height coverage is never
-		// rejected as a conflict, and recovery relies only on the header
-		// records actually kept in the log. The latest header is the last one
-		// written; the highest trusted header is the max-height trusted one,
-		// with ties going to the later write (matching old overwrite
-		// semantics). Neither is fabricated from lost history.
+		// Replay keeps its own acceptance condition, distinct from a live
+		// submission (see headerState): historical same-height trusted headers
+		// with different roots are never rejected as a conflict. The state
+		// update itself is the shared headerState rule: the latest header is
+		// the last record replayed, the highest trusted header advances with
+		// ties going to the later record, and neither is fabricated from lost
+		// history.
 		hs := s.headers[e.Chain]
 		if hs == nil {
 			hs = &headerState{}
 			s.headers[e.Chain] = hs
 		}
-		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: root, Trusted: e.Trusted}
-		if e.Trusted && (hs.trusted == nil || e.Height >= hs.trusted.Height) {
-			t := hs.latest
-			hs.trusted = &t
-		}
+		hs.recordRecovered(Header{Chain: e.Chain, Height: e.Height, Root: root, Trusted: e.Trusted})
 	case kindSubmit:
 		if e.ID == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
 			return corrupt("bad submit entry: %+v", e)

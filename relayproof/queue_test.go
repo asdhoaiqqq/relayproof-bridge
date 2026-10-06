@@ -1197,3 +1197,64 @@ func TestHistoricalSameHeightCoverageNotRejected(t *testing.T) {
 		t.Fatalf("historical coverage should deliver, got %s (%s)", r.Status, r.Reason)
 	}
 }
+
+// After a historical same-height different-root log is recovered, both header
+// meanings must survive log compaction and a reopen: the later root stays the
+// accepted trusted root (recovery permissiveness, not the submission conflict
+// rule), and the latest header stays the last record — including the case
+// where the latest record is itself a lower or untrusted header.
+func TestHistoricalSameHeightCoverageSurvivesCompactionAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	// Trusted 100/0xaaa then trusted 100/0xbbb (later root wins), then an
+	// untrusted 120 (latest, but no coverage).
+	entries := []*logEntry{
+		{T: kindSource, Chain: "a"},
+		{T: kindHeader, Chain: "a", Height: 100, Root: "0xaaa", Trusted: true},
+		{T: kindHeader, Chain: "a", Height: 100, Root: "0xbbb", Trusted: true},
+		{T: kindHeader, Chain: "a", Height: 120, Root: "0x120", Trusted: false},
+		{T: kindSubmit, Seq: 0, ID: "m", From: "a", To: "b", Nonce: 1, ProofAt: 100},
+	}
+	writeLegacyLog(t, dir, entries...)
+
+	q, err := Open(dir)
+	if err != nil {
+		t.Fatalf("old same-height coverage must open directly: %v", err)
+	}
+	if hs := q.headers["a"]; hs.trusted == nil || hs.trusted.Height != 100 || hs.trusted.Root != "0xbbb" {
+		t.Fatalf("later same-height root must be accepted: %+v", hs.trusted)
+	} else if hs.latest.Height != 120 || hs.latest.Root != "0x120" {
+		t.Fatalf("latest must be the untrusted 120 header: %+v", hs.latest)
+	}
+
+	// Compact and reopen; the snapshot must preserve both meanings.
+	if err := q.store.compact(q.snapshot()); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q = reopen(t, dir)
+	defer q.Close()
+	hs := q.headers["a"]
+	if hs.trusted == nil || hs.trusted.Height != 100 || hs.trusted.Root != "0xbbb" {
+		t.Fatalf("accepted trusted root lost across compaction/reopen: %+v", hs.trusted)
+	}
+	if hs.latest.Height != 120 || hs.latest.Root != "0x120" || hs.latest.Trusted {
+		t.Fatalf("latest header lost across compaction/reopen: %+v", hs.latest)
+	}
+	// Historical recovery never upgrades into the submission rule: resaving
+	// the recovered later root stays accepted, and coverage still cites 100.
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0xbbb", Trusted: true}); err != nil {
+		t.Fatalf("recovered later root must resave without conflict: %v", err)
+	}
+	if err := q.UpsertHeader(Header{Chain: "a", Height: 100, Root: "0xaaa", Trusted: true}); !errors.Is(err, ErrHeaderConflict) {
+		t.Fatalf("after recovery, a different root at the accepted height is a new conflict: got %v", err)
+	}
+	if _, err := q.Advance(1000); err != nil {
+		t.Fatal(err)
+	}
+	if r := statusOf(t, q, "m"); r.Status != StatusSuccess ||
+		r.Reason != "delivered; proof verified by trusted header at height 100" {
+		t.Fatalf("coverage reason must cite trusted height 100: %+v", r)
+	}
+}
