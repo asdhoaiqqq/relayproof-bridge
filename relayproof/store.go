@@ -1093,7 +1093,8 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		if err != nil {
 			return corrupt("bad header entry: %v", err)
 		}
-		// Replay is permissive: historical same-height coverage is never
+		// Replay applies the shared header-state update rules with the
+		// recovery acceptance policy: historical same-height coverage is never
 		// rejected as a conflict, and recovery relies only on the header
 		// records actually kept in the log. The latest header is the last one
 		// written; the highest trusted header is the max-height trusted one,
@@ -1104,11 +1105,12 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			hs = &headerState{}
 			s.headers[e.Chain] = hs
 		}
-		hs.latest = Header{Chain: e.Chain, Height: e.Height, Root: root, Trusted: e.Trusted}
-		if e.Trusted && (hs.trusted == nil || e.Height >= hs.trusted.Height) {
-			t := hs.latest
-			hs.trusted = &t
+		h := Header{Chain: e.Chain, Height: e.Height, Root: root, Trusted: e.Trusted}
+		update, err := hs.planUpdate(h, replaySameHeight)
+		if err != nil {
+			return corrupt("bad header entry: %v", err)
 		}
+		hs.applyUpdate(h, update)
 	case kindSubmit:
 		if e.ID == "" || e.From == "" || e.To == "" || e.ProofAt < 0 || e.ExpiresAt < 0 {
 			return corrupt("bad submit entry: %+v", e)

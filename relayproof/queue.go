@@ -95,16 +95,6 @@ type Result struct {
 	Reason string `json:"reason"`
 }
 
-// headerState records the headers seen for one chain: the latest header
-// written (any trust level) and the highest trusted header accepted. Proof
-// coverage is determined solely by the highest trusted header — a later
-// untrusted header, even at a greater height, can never lower or invalidate
-// it. The zero value is a chain with no recorded headers.
-type headerState struct {
-	latest  Header
-	trusted *Header
-}
-
 // Queue is a durable local outbox backed by a state directory. A single
 // Queue owns the directory for writes; other processes attempting to Open the
 // same directory fail with ErrLocked. It is safe for concurrent use by
@@ -348,6 +338,10 @@ func (q *Queue) RegisterSource(chain string) error {
 //     ErrHeaderConflict: the accepted trusted header is kept and the queue
 //     remains usable.
 //
+// These update rules are the shared ones in headerState.planUpdate, with
+// submitSameHeight as the same-height acceptance rule; log replay of the
+// saved header applies the same rules with the recovery policy instead.
+//
 // Header updates never bypass retry scheduling, never process messages, and
 // never reactivate terminal messages.
 func (q *Queue) UpsertHeader(h Header) error {
@@ -367,19 +361,16 @@ func (q *Queue) UpsertHeader(h Header) error {
 		hs = &headerState{}
 		q.headers[h.Chain] = hs
 	}
-	if h.Trusted && hs.trusted != nil &&
-		h.Height == hs.trusted.Height && h.Root != hs.trusted.Root {
-		return fmt.Errorf("%w: chain %q height %d: submitted root %q conflicts with accepted root %q",
-			ErrHeaderConflict, h.Chain, h.Height, h.Root, hs.trusted.Root)
+	// Judge before persisting: a rejected header (a same-height conflict)
+	// touches neither the log nor the recorded state.
+	update, err := hs.planUpdate(h, submitSameHeight)
+	if err != nil {
+		return err
 	}
 	if err := q.store.appendHeader(h); err != nil {
 		return q.fail("upsert header", err)
 	}
-	hs.latest = h
-	if h.Trusted && (hs.trusted == nil || h.Height > hs.trusted.Height) {
-		t := h
-		hs.trusted = &t
-	}
+	hs.applyUpdate(h, update)
 	return q.maybeCompact()
 }
 
