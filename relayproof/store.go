@@ -189,16 +189,6 @@ type logEntry struct {
 	// Root.
 	RootB64 string `json:"rootB64,omitempty"`
 
-	// rootPresent and rootB64Present report whether the replayed JSON record
-	// literally carried the "root"/"rootB64" keys, distinct from the decoded
-	// value (which may be the empty string). They are set only by
-	// UnmarshalJSON and never marshalled: the empty root is written as
-	// "root":"" (rootPresent alone on replay), while a record that names both
-	// representations — even when one of them is the empty string — is
-	// corrupt no matter what the two decode to.
-	rootPresent    bool
-	rootB64Present bool
-
 	Seq       int64  `json:"seq,omitempty"`
 	ID        string `json:"id,omitempty"`
 	From      string `json:"from,omitempty"`
@@ -213,15 +203,6 @@ type logEntry struct {
 	// together with To.
 	ToB64 string `json:"toB64,omitempty"`
 
-	// toPresent/toB64Present report whether the replayed JSON submit record
-	// literally carried the "to"/"toB64" keys, distinct from the decoded value
-	// (which may be the empty string). They are set only by UnmarshalJSON and
-	// never marshalled: a record naming both representations — even when one of
-	// them is the empty string, and even when the two decode to the same bytes
-	// — is corrupt no matter what the two decode to.
-	toPresent    bool
-	toB64Present bool
-
 	// IDB64 carries a message id's raw bytes base64-encoded when the id is
 	// not valid UTF-8; see setID/entryID. Never set together with ID.
 	IDB64 string `json:"idB64,omitempty"`
@@ -230,17 +211,6 @@ type logEntry struct {
 	// payload is not valid UTF-8; see setPayload/entryPayload. Never set
 	// together with Payload.
 	PayloadB64 string `json:"payloadB64,omitempty"`
-
-	// payloadPresent and payloadB64Present report whether the replayed JSON
-	// record literally carried the "payload"/"payloadB64" keys, distinct from
-	// the decoded value (which may be the empty string). They are set only by
-	// UnmarshalJSON and never marshalled: the empty payload is written as
-	// "payload":"" (payloadPresent alone on replay), while a record that names
-	// both representations — even when one of them is the empty string, and
-	// even when the two happen to decode to the same bytes — is corrupt no
-	// matter what the two decode to.
-	payloadPresent    bool
-	payloadB64Present bool
 
 	Now       int64  `json:"now,omitempty"`
 	Status    string `json:"status,omitempty"`
@@ -267,14 +237,6 @@ type logEntry struct {
 	// with ConsumeTo.
 	ConsumeToB64 string `json:"consumeToB64,omitempty"`
 
-	// consumeToPresent/consumeToB64Present report whether the replayed JSON
-	// success record literally carried the "consumeTo"/"consumeToB64" keys,
-	// distinct from the decoded value (which may be the empty string). They are
-	// set only by UnmarshalJSON and never marshalled; a record naming both
-	// representations at once is corrupt regardless of what the two decode to.
-	consumeToPresent    bool
-	consumeToB64Present bool
-
 	// ConsumeByB64 is the base64 form of ConsumeBy for an invalid-UTF-8
 	// message id; see setConsumeBy/entryConsumeBy. Never set together with
 	// ConsumeBy.
@@ -284,14 +246,34 @@ type logEntry struct {
 	// is accepted only while replaying logs written by older builds and is
 	// never written anymore.
 	ConsumeKey string `json:"consumeKey,omitempty"`
+
+	// present records which JSON keys the replayed record literally carried,
+	// for the plain/base64-split fields — root/rootB64, payload/payloadB64,
+	// to/toB64 and consumeTo/consumeToB64. The split's mutual-exclusion and
+	// empty-value rules are keyed on presence, not the decoded value: the
+	// empty string is a legal value and is written as an explicitly present
+	// "…":"", so it must never double as the signal that the key was omitted.
+	// Set only by UnmarshalJSON and never marshalled.
+	present map[string]bool
 }
 
-// UnmarshalJSON decodes a log record while recording which root keys the
-// record literally carried. The plain/base64 split needs presence, not just
-// the decoded value: the empty root is a legal value written as "root":"", so
-// the empty string cannot double as the signal that the key was omitted. The
-// exported fields decode exactly as with the default unmarshalling (the alias
-// avoids listing them by hand); only the two presence flags are extra.
+// splitJSONKeys are the plain/base64 field pairs whose mutual-exclusion rule
+// is keyed on literal JSON key presence (see logEntry.present and
+// splitFieldSpec). Field order in the record is irrelevant.
+var splitJSONKeys = []string{
+	"root", "rootB64",
+	"payload", "payloadB64",
+	"to", "toB64",
+	"consumeTo", "consumeToB64",
+}
+
+// UnmarshalJSON decodes a log record while recording which plain/base64 keys
+// the record literally carried. The plain/base64 split needs presence, not
+// just the decoded value: the empty root/payload is a legal value written as
+// "root":""/"payload":"", so the empty string cannot double as the signal
+// that the key was omitted. The exported fields decode exactly as with the
+// default unmarshalling (the alias avoids listing them by hand); only the
+// presence map is extra.
 func (e *logEntry) UnmarshalJSON(data []byte) error {
 	type plain logEntry
 	var p plain
@@ -303,34 +285,144 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return err
 	}
-	_, e.rootPresent = keys["root"]
-	_, e.rootB64Present = keys["rootB64"]
-	_, e.payloadPresent = keys["payload"]
-	_, e.payloadB64Present = keys["payloadB64"]
-	_, e.toPresent = keys["to"]
-	_, e.toB64Present = keys["toB64"]
-	_, e.consumeToPresent = keys["consumeTo"]
-	_, e.consumeToB64Present = keys["consumeToB64"]
+	e.present = make(map[string]bool, len(splitJSONKeys))
+	for _, k := range splitJSONKeys {
+		_, e.present[k] = keys[k]
+	}
 	return nil
 }
 
-// bytesField is the shared inverse of the plain/base64 field split: with no
-// base64 value the plain field is taken at face value (historical records,
-// including bytes an old build rewrote to U+FFFD, keep their meaning and are
-// never guessed back); both fields set, or an undecodable base64 value, is an
-// inconsistent record no build writes.
-func bytesField(plain, b64Value, bothMsg, undecodableMsg string) (string, error) {
-	if b64Value == "" {
-		return plain, nil
+// splitFieldSpec is one plain/base64 field pair's recovery policy: the JSON
+// key names, a way to read the two decoded values off a replayed entry, and
+// the field's own wording for the two corruption verdicts. Every pair shares
+// exactly one byte-preservation rule set — implemented once in decode — and
+// differs only in this descriptor, so each value keeps its business meaning
+// (header root, message payload, destination chain, consumed destination) and
+// its existing, field-specific error text.
+//
+// plainKey is empty for fields that predate presence tracking (id/idB64,
+// reason/reasonB64, consumeBy/consumeByB64): those pairs keep their historical
+// value-based mutual exclusion (they are never written with an empty plain
+// value), which decode applies when plainKey is empty.
+type splitFieldSpec struct {
+	plainKey       string
+	b64Key         string
+	plain          func(e *logEntry) string
+	b64            func(e *logEntry) string
+	bothErr        string
+	undecodableErr string
+}
+
+// decode is the single inverse of the plain/base64 field split every raw-bytes
+// log value uses. The rules are:
+//
+//   - With the base64 key absent, the plain value is taken at face value. That
+//     covers historical records that predate the split, including bytes an old
+//     build rewrote to U+FFFD: the saved characters stay literal and are never
+//     guessed back.
+//   - With the base64 key present (alone, including an empty base64 string),
+//     the base64 value is decoded to the original byte sequence.
+//   - Both representations present is an inconsistent record no build writes —
+//     judged by key presence where tracked, so even "":"" or two forms that
+//     decode to the identical bytes clash — regardless of field order.
+//   - A present base64 value that does not decode is corruption, never an empty
+//     or replacement-filled value.
+func (s splitFieldSpec) decode(e *logEntry) (string, error) {
+	b64Value := s.b64(e)
+	var b64Present bool
+	if s.plainKey != "" {
+		// Presence-based mutual exclusion: the empty string counts as present.
+		if e.present[s.plainKey] && e.present[s.b64Key] {
+			return "", errors.New(s.bothErr)
+		}
+		b64Present = e.present[s.b64Key]
+	} else {
+		// Historical value-based mutual exclusion for fields whose plain value
+		// is never written empty alongside a base64 form: a set plain value
+		// with a set base64 value clashes; an empty base64 is simply absent.
+		if s.plain(e) != "" && b64Value != "" {
+			return "", errors.New(s.bothErr)
+		}
+		b64Present = b64Value != ""
 	}
-	if plain != "" {
-		return "", fmt.Errorf("%s", bothMsg)
+	if !b64Present {
+		return s.plain(e), nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(b64Value)
 	if err != nil {
-		return "", fmt.Errorf("%s: %v", undecodableMsg, err)
+		return "", fmt.Errorf("%s: %v", s.undecodableErr, err)
 	}
 	return string(raw), nil
+}
+
+// splitFields is the one place each plain/base64 log pair is declared: the
+// JSON key names, accessors and field-specific corruption wording. Adding a
+// raw-bytes field means adding one descriptor, not another copy of the
+// presence/empty/decode-error handling. Message id, result reason and the
+// success entry's consuming id share the same decoder through these
+// descriptors too; their pairs keep value-based exclusion (empty plainKey).
+var splitFields = struct {
+	id        splitFieldSpec
+	reason    splitFieldSpec
+	consumeBy splitFieldSpec
+	root      splitFieldSpec
+	payload   splitFieldSpec
+	to        splitFieldSpec
+	consumeTo splitFieldSpec
+}{
+	id: splitFieldSpec{
+		b64Key:         "idB64",
+		plain:          func(e *logEntry) string { return e.ID },
+		b64:            func(e *logEntry) string { return e.IDB64 },
+		bothErr:        "entry carries both id and idB64",
+		undecodableErr: "entry carries undecodable idB64",
+	},
+	reason: splitFieldSpec{
+		b64Key:         "reasonB64",
+		plain:          func(e *logEntry) string { return e.Reason },
+		b64:            func(e *logEntry) string { return e.ReasonB64 },
+		bothErr:        "entry carries both reason and reasonB64",
+		undecodableErr: "entry carries undecodable reasonB64",
+	},
+	consumeBy: splitFieldSpec{
+		b64Key:         "consumeByB64",
+		plain:          func(e *logEntry) string { return e.ConsumeBy },
+		b64:            func(e *logEntry) string { return e.ConsumeByB64 },
+		bothErr:        "success entry carries both consumeBy and consumeByB64",
+		undecodableErr: "success entry carries undecodable consumeByB64",
+	},
+	root: splitFieldSpec{
+		plainKey:       "root",
+		b64Key:         "rootB64",
+		plain:          func(e *logEntry) string { return e.Root },
+		b64:            func(e *logEntry) string { return e.RootB64 },
+		bothErr:        "header entry carries both root and rootB64",
+		undecodableErr: "header entry carries undecodable rootB64",
+	},
+	payload: splitFieldSpec{
+		plainKey:       "payload",
+		b64Key:         "payloadB64",
+		plain:          func(e *logEntry) string { return e.Payload },
+		b64:            func(e *logEntry) string { return e.PayloadB64 },
+		bothErr:        "submit entry carries both payload and payloadB64",
+		undecodableErr: "submit entry carries undecodable payloadB64",
+	},
+	to: splitFieldSpec{
+		plainKey:       "to",
+		b64Key:         "toB64",
+		plain:          func(e *logEntry) string { return e.To },
+		b64:            func(e *logEntry) string { return e.ToB64 },
+		bothErr:        "submit entry carries both to and toB64",
+		undecodableErr: "submit entry carries undecodable toB64",
+	},
+	consumeTo: splitFieldSpec{
+		plainKey:       "consumeTo",
+		b64Key:         "consumeToB64",
+		plain:          func(e *logEntry) string { return e.ConsumeTo },
+		b64:            func(e *logEntry) string { return e.ConsumeToB64 },
+		bothErr:        "success entry carries both consumeTo and consumeToB64",
+		undecodableErr: "success entry carries undecodable consumeToB64",
+	},
 }
 
 // setID encodes a message id for the log without altering its bytes.
@@ -346,9 +438,7 @@ func (e *logEntry) setID(id string) {
 
 // entryID decodes an entry's id back to its exact submitted bytes.
 func (e *logEntry) entryID() (string, error) {
-	return bytesField(e.ID, e.IDB64,
-		"entry carries both id and idB64",
-		"entry carries undecodable idB64")
+	return splitFields.id.decode(e)
 }
 
 // setReason encodes a processing result reason for the log without altering
@@ -366,9 +456,7 @@ func (e *logEntry) setReason(reason string) {
 
 // entryReason decodes a result/snapshot entry's reason back to its exact bytes.
 func (e *logEntry) entryReason() (string, error) {
-	return bytesField(e.Reason, e.ReasonB64,
-		"entry carries both reason and reasonB64",
-		"entry carries undecodable reasonB64")
+	return splitFields.reason.decode(e)
 }
 
 // setConsumeBy records the successful message's raw id alongside the consumed
@@ -385,9 +473,7 @@ func (e *logEntry) setConsumeBy(id string) {
 
 // entryConsumeBy decodes the consuming message id back to its exact bytes.
 func (e *logEntry) entryConsumeBy() (string, error) {
-	return bytesField(e.ConsumeBy, e.ConsumeByB64,
-		"success entry carries both consumeBy and consumeByB64",
-		"success entry carries undecodable consumeByB64")
+	return splitFields.consumeBy.decode(e)
 }
 
 // setRoot encodes a header root for the log without altering its bytes. A
@@ -413,19 +499,11 @@ func (e *logEntry) setRoot(root string) {
 // two representations are mutually exclusive by key presence: an explicitly
 // empty "root":"" is a legal plain root, but "root":"" together with any
 // rootB64 — even one that decodes to the same bytes, or to the empty root —
-// still carries two representations and is rejected.
+// still carries two representations and is rejected. The presence/empty/
+// decode-error rules themselves are the shared ones in splitFieldSpec.decode;
+// only the wording is header-root specific.
 func (e *logEntry) headerRoot() (string, error) {
-	if e.rootPresent && e.rootB64Present {
-		return "", fmt.Errorf("header entry carries both root and rootB64")
-	}
-	if !e.rootB64Present {
-		return e.Root, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.RootB64)
-	if err != nil {
-		return "", fmt.Errorf("header entry carries undecodable rootB64: %v", err)
-	}
-	return string(raw), nil
+	return splitFields.root.decode(e)
 }
 
 // setPayload encodes a message payload for the log without altering its
@@ -454,19 +532,11 @@ func (e *logEntry) setPayload(payload string) {
 // explicitly empty "payload":"" is a legal plain payload, but "payload":""
 // together with any payloadB64 — even an empty one, even one that decodes to
 // the same bytes — still carries two representations of the message content
-// and is rejected. Field order does not change the verdict.
+// and is rejected. Field order does not change the verdict. The
+// presence/empty/decode-error rules themselves are the shared ones in
+// splitFieldSpec.decode; only the wording is payload specific.
 func (e *logEntry) entryPayload() (string, error) {
-	if e.payloadPresent && e.payloadB64Present {
-		return "", fmt.Errorf("submit entry carries both payload and payloadB64")
-	}
-	if !e.payloadB64Present {
-		return e.Payload, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
-	if err != nil {
-		return "", fmt.Errorf("submit entry carries undecodable payloadB64: %v", err)
-	}
-	return string(raw), nil
+	return splitFields.payload.decode(e)
 }
 
 // setTo encodes a submit entry's destination chain for the log without
@@ -491,19 +561,11 @@ func (e *logEntry) setTo(to string) {
 // rewritten to a replacement character, which stays that character; the lost
 // bytes are never guessed. An entry carrying both fields at once (judged by
 // key presence, the empty string included), or a toB64 that does not decode,
-// is an inconsistent record no build writes and is corrupt.
+// is an inconsistent record no build writes and is corrupt. Those rules are
+// the shared ones in splitFieldSpec.decode; only the wording is destination
+// specific.
 func (e *logEntry) entryTo() (string, error) {
-	if e.toPresent && e.toB64Present {
-		return "", fmt.Errorf("submit entry carries both to and toB64")
-	}
-	if !e.toB64Present {
-		return e.To, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.ToB64)
-	if err != nil {
-		return "", fmt.Errorf("submit entry carries undecodable toB64: %v", err)
-	}
-	return string(raw), nil
+	return splitFields.to.decode(e)
 }
 
 // setConsumeTo records the successful message's destination chain alongside
@@ -519,20 +581,12 @@ func (e *logEntry) setConsumeTo(to string) {
 }
 
 // entryConsumeTo decodes a success entry's consumed destination back to its
-// exact bytes. A record with both consumeTo and consumeToB64 set, or an
-// undecodable consumeToB64, is corrupt.
+// exact bytes. A record with both consumeTo and consumeToB64 set (by key
+// presence, the empty string included), or an undecodable consumeToB64, is
+// corrupt. Those rules are the shared ones in splitFieldSpec.decode; only the
+// wording is success-entry specific.
 func (e *logEntry) entryConsumeTo() (string, error) {
-	if e.consumeToPresent && e.consumeToB64Present {
-		return "", fmt.Errorf("success entry carries both consumeTo and consumeToB64")
-	}
-	if !e.consumeToB64Present {
-		return e.ConsumeTo, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.ConsumeToB64)
-	if err != nil {
-		return "", fmt.Errorf("success entry carries undecodable consumeToB64: %v", err)
-	}
-	return string(raw), nil
+	return splitFields.consumeTo.decode(e)
 }
 
 // legacyNonceKey reproduces the consumption string used by older builds:
