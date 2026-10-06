@@ -62,9 +62,9 @@ func TestSubmitConflictForEverySingleContentField(t *testing.T) {
 				t.Fatalf("want ErrConflict, got %v", err)
 			}
 
-			if len(q.records) != 1 || len(q.order) != 1 || q.order[0] != "m" || q.nextSeq != 1 {
+			if len(q.records) != 1 || q.order.len() != 1 || q.order.ids()[0] != "m" || q.nextSeq != 1 {
 				t.Fatalf("rejected submit must persist nothing: records=%d order=%v nextSeq=%d",
-					len(q.records), q.order, q.nextSeq)
+					len(q.records), q.order.ids(), q.nextSeq)
 			}
 			got := statusOf(t, q, "m")
 			if got.Msg != base {
@@ -212,8 +212,8 @@ func TestSubmitIdenticalWaitingReturnsCurrentRecord(t *testing.T) {
 	if wantReason := "waiting for trusted header covering height 110 (current 100)"; qy.Reason != wantReason {
 		t.Fatalf("waiting reason wrong: %q", qy.Reason)
 	}
-	if len(q.order) != 1 || len(q.records) != 1 {
-		t.Fatalf("waiting duplicate must not add a queue entry: order=%v records=%d", q.order, len(q.records))
+	if q.order.len() != 1 || len(q.records) != 1 {
+		t.Fatalf("waiting duplicate must not add a queue entry: order=%v records=%d", q.order.ids(), len(q.records))
 	}
 
 	// Early advance (before retry) processes nothing and keeps the schedule.
@@ -282,8 +282,8 @@ func TestSubmitConflictWhileWaitingKeepsRecordAndSchedule(t *testing.T) {
 	if got, _ := q.Query("w"); got != beforeQ {
 		t.Fatalf("query view changed: %+v", got)
 	}
-	if len(q.order) != 1 {
-		t.Fatalf("conflict added a queue entry: %v", q.order)
+	if q.order.len() != 1 {
+		t.Fatalf("conflict added a queue entry: %v", q.order.ids())
 	}
 }
 

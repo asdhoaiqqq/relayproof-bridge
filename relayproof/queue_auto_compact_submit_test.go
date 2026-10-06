@@ -305,9 +305,9 @@ func TestAutoCompactOnSubmitPersistsTriggerAndAllPrior(t *testing.T) {
 	if echo.Seq != 1 || echo.Status != StatusPending || echo.Attempts != 0 || echo.NextRetry != 0 {
 		t.Fatalf("identical resubmit must echo the existing pending record: %+v", echo)
 	}
-	if len(q.records) != 5 || len(q.order) != 5 || q.nextSeq != 5 {
+	if len(q.records) != 5 || q.order.len() != 5 || q.nextSeq != 5 {
 		t.Fatalf("identical resubmit added an entry: records=%d order=%v nextSeq=%d",
-			len(q.records), q.order, q.nextSeq)
+			len(q.records), q.order.ids(), q.nextSeq)
 	}
 	bad := keep1
 	bad.Message.Payload = "body-keep1-CHANGED"
@@ -320,8 +320,8 @@ func TestAutoCompactOnSubmitPersistsTriggerAndAllPrior(t *testing.T) {
 			len(q.records), q.nextSeq)
 	}
 	for i, want := range wantIDs {
-		if q.order[i] != want {
-			t.Fatalf("processing order changed after the rejected submit: want %v got %v", wantIDs, q.order)
+		if q.order.ids()[i] != want {
+			t.Fatalf("processing order changed after the rejected submit: want %v got %v", wantIDs, q.order.ids())
 		}
 	}
 

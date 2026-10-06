@@ -2,6 +2,7 @@
 package relayproof
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"math"
@@ -120,9 +121,60 @@ type Queue struct {
 	sources  map[string]bool         // registered source chains
 	headers  map[string]*headerState // per-chain recorded headers (latest + highest trusted)
 	records  map[string]*Record      // by message id
-	order    []string                // non-terminal messages, submission order
+	order    *pendingOrder           // non-terminal messages, first-submission order
 	consumed map[consumeToken]string // (source, destination, nonce) -> successful message id
 	nextSeq  int64
+}
+
+// pendingOrder is the set of non-terminal (live) messages kept in strict
+// first-submission order. It is an intrusive doubly-linked list indexed by
+// message id: a message leaving the order when it terminalizes unlinks itself
+// in constant time, instead of a linear slice scan followed by shifting every
+// later entry. The total order-maintenance work of one advance therefore grows
+// only with the number of non-terminal messages present when the advance
+// began — traversed a constant number of times — never with the number of
+// terminal results already accumulated in history. Traversal is stable under
+// unlinking the current node, so terminalizing during a sweep neither visits a
+// dead node nor reorders the survivors.
+type pendingOrder struct {
+	l     *list.List               // each element's Value is the live message id
+	index map[string]*list.Element // live id -> its node
+}
+
+func newPendingOrder(hint int) *pendingOrder {
+	return &pendingOrder{
+		l:     list.New(),
+		index: make(map[string]*list.Element, hint),
+	}
+}
+
+// pushBack appends a newly submitted live message after every earlier one.
+func (p *pendingOrder) pushBack(id string) {
+	if _, ok := p.index[id]; ok {
+		return
+	}
+	p.index[id] = p.l.PushBack(id)
+}
+
+// remove unlinks a terminalized message in constant time. Removing an id that
+// is no longer live is a no-op.
+func (p *pendingOrder) remove(id string) {
+	if el, ok := p.index[id]; ok {
+		p.l.Remove(el)
+		delete(p.index, id)
+	}
+}
+
+func (p *pendingOrder) len() int { return p.l.Len() }
+
+// ids returns the live ids in first-submission order. It is used by the
+// in-package tests; hot paths traverse the nodes directly instead.
+func (p *pendingOrder) ids() []string {
+	out := make([]string, 0, p.l.Len())
+	for el := p.l.Front(); el != nil; el = el.Next() {
+		out = append(out, el.Value.(string))
+	}
+	return out
 }
 
 // Open opens (creating if needed) a persistent queue backed by stateDir. It
@@ -166,14 +218,18 @@ func Open(stateDir string) (*Queue, error) {
 		consumed: state.consumed,
 		now:      state.now,
 		nextSeq:  state.nextSeq,
+		order:    newPendingOrder(len(state.records)),
 	}
-	q.order = q.reconstructOrder()
+	q.reconstructOrder()
 	st.snap = q.snapshot
 	return q, nil
 }
 
-// reconstructOrder returns non-terminal record ids in submission (seq) order.
-func (q *Queue) reconstructOrder() []string {
+// reconstructOrder fills the empty live order with the non-terminal records in
+// submission (seq) order. It runs once, when opening a state directory: the
+// per-advance cost of maintaining the order never depends on how many terminal
+// records history has accumulated.
+func (q *Queue) reconstructOrder() {
 	seqs := make([]int64, 0, len(q.records))
 	live := map[int64]string{}
 	for id, rec := range q.records {
@@ -184,11 +240,9 @@ func (q *Queue) reconstructOrder() []string {
 		live[rec.Seq] = id
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-	order := make([]string, 0, len(seqs))
 	for _, seq := range seqs {
-		order = append(order, live[seq])
+		q.order.pushBack(live[seq])
 	}
-	return order
 }
 
 // snapshot returns a detached copy of live state for log compaction. Callers
@@ -377,7 +431,7 @@ func (q *Queue) Submit(env Envelope) (*Record, error) {
 		return nil, q.fail("submit", err)
 	}
 	q.records[m.ID] = rec
-	q.order = append(q.order, m.ID)
+	q.order.pushBack(m.ID)
 	q.nextSeq++
 	if err := q.maybeCompact(); err != nil {
 		return nil, err
@@ -428,8 +482,17 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 
 	report := &AdvanceReport{Now: nowMs}
 
-	// Phase 1: due messages, first-submission order.
-	for _, id := range append([]string(nil), q.order...) {
+	// Phase 1: due messages, first-submission order. Traversal walks the live
+	// list directly and captures the successor before processing, because a
+	// result that terminalizes — and therefore unlinks — the current node
+	// leaves that node without a successor afterwards. Doing so neither
+	// corrupts the walk nor changes any survivor's position. Each unlink is
+	// constant-time, so maintaining the order across the whole phase costs
+	// only one pass over the live messages.
+	el := q.order.l.Front()
+	for el != nil {
+		id := el.Value.(string)
+		el = el.Next()
 		rec := q.records[id]
 		if rec == nil || isTerminal(rec.Status) {
 			continue
@@ -452,8 +515,16 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 	}
 
 	// Phase 2: replay/expiry hold for every non-terminal message at the new
-	// time, even while its retry backoff is still running.
-	for _, id := range append([]string(nil), q.order...) {
+	// time, even while its retry backoff is still running. Messages that
+	// terminalized in phase 1 are already gone from the list, so this sweep
+	// (plus every constant-time unlink it triggers) again costs one linear
+	// pass over the remaining live messages only — never over history.
+	el = q.order.l.Front()
+	for el != nil {
+		id := el.Value.(string)
+		// Capture the successor before processing: checkReplayExpiry may
+		// terminalize — and unlink — this very node.
+		el = el.Next()
 		rec := q.records[id]
 		if rec == nil || isTerminal(rec.Status) {
 			continue
@@ -609,7 +680,7 @@ func (q *Queue) applyOutcome(rec *Record, now int64, oc outcome) (Result, error)
 		q.consumed[*oc.consume] = id
 	}
 	if isTerminal(oc.status) {
-		q.removeFromOrder(id)
+		q.order.remove(id)
 	}
 	return Result{ID: id, Status: oc.status, Reason: oc.reason}, nil
 }
@@ -628,15 +699,6 @@ func retryDue(rec *Record, now int64) bool {
 		return false
 	}
 	return now != rec.LastProcAt
-}
-
-func (q *Queue) removeFromOrder(id string) {
-	for i, cand := range q.order {
-		if cand == id {
-			q.order = append(q.order[:i], q.order[i+1:]...)
-			return
-		}
-	}
 }
 
 // nextRetryAt returns the retry instant after the attempt-th processing at

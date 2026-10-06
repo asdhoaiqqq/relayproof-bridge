@@ -163,11 +163,11 @@ func TestSubmitDedupConflictTerminal(t *testing.T) {
 	if _, err := q.Submit(e); err != nil {
 		t.Fatal(err)
 	}
-	before := len(q.order)
+	before := q.order.len()
 	if _, err := q.Submit(e); err != nil {
 		t.Fatalf("identical resubmit must be idempotent: %v", err)
 	}
-	if len(q.order) != before || len(q.records) != 1 {
+	if q.order.len() != before || len(q.records) != 1 {
 		t.Fatalf("identical resubmit added a queue entry")
 	}
 
@@ -498,8 +498,8 @@ func TestOrderingAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer q3.Close()
-	if len(q3.order) != 2 || q3.order[0] != "w2" || q3.order[1] != "w1" {
-		t.Fatalf("waiting order not restored: %v", q3.order)
+	if live := q3.order.ids(); len(live) != 2 || live[0] != "w2" || live[1] != "w1" {
+		t.Fatalf("waiting order not restored: %v", live)
 	}
 	r := statusOf(t, q3, "w1")
 	if r.Status != StatusWaiting || r.NextRetry != 3000 {
@@ -787,8 +787,8 @@ func TestIdempotentResubmitWhileWaiting(t *testing.T) {
 	if rec.Attempts != 1 || rec.NextRetry != 2000 || rec.Status != StatusWaiting {
 		t.Fatalf("resubmit must return the existing live record: %+v", rec)
 	}
-	if len(q.order) != 1 {
-		t.Fatalf("resubmit added queue entry: %v", q.order)
+	if q.order.len() != 1 {
+		t.Fatalf("resubmit added queue entry: %v", q.order.ids())
 	}
 }
 

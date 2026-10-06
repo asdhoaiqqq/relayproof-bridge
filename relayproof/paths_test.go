@@ -265,8 +265,8 @@ func TestLegacyRawLogOpensDirectly(t *testing.T) {
 	if r := statusOf(t, q, "w"); r.Status != StatusWaiting || r.Attempts != 1 || r.NextRetry != 2000 {
 		t.Fatalf("waiting schedule lost: %+v", r)
 	}
-	if len(q.order) != 1 || q.order[0] != "w" {
-		t.Fatalf("live order not reconstructed: %v", q.order)
+	if live := q.order.ids(); len(live) != 1 || live[0] != "w" {
+		t.Fatalf("live order not reconstructed: %v", live)
 	}
 
 	// Register the other path's source/header, then submit it with new ids:

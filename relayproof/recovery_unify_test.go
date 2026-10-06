@@ -360,8 +360,8 @@ func TestStateRestoresMultiAttemptStatus(t *testing.T) {
 		if r.Status != StatusWaiting || r.Attempts != 3 || r.NextRetry != 6000 {
 			t.Fatalf("snapshot not restored: %+v", r)
 		}
-		if q.Now() != 2000 || len(q.order) != 1 || q.order[0] != "w" {
-			t.Fatalf("time/order not restored: now=%d order=%v", q.Now(), q.order)
+		if q.Now() != 2000 || q.order.len() != 1 || q.order.ids()[0] != "w" {
+			t.Fatalf("time/order not restored: now=%d order=%v", q.Now(), q.order.ids())
 		}
 		// At the scheduled retry the message takes exactly one more attempt;
 		// the fourth backoff interval is 8s, so the next retry is 14000.
@@ -452,8 +452,8 @@ func TestStateRestoresMultiAttemptStatus(t *testing.T) {
 		if r := statusOf(t, q, "r"); r.Attempts != 2 || !strings.Contains(r.Reason, "message z") {
 			t.Fatalf("replay attempts/reason not restored: %+v", r)
 		}
-		if len(q.order) != 0 {
-			t.Fatalf("all snapshot records are terminal, order must be empty: %v", q.order)
+		if q.order.len() != 0 {
+			t.Fatalf("all snapshot records are terminal, order must be empty: %v", q.order.ids())
 		}
 		all := q.Queries()
 		if len(all) != 3 || all[0].ID != "r" || all[1].ID != "x" || all[2].ID != "u" {
