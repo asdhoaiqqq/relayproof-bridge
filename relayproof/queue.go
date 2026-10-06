@@ -120,7 +120,7 @@ type Queue struct {
 	sources  map[string]bool         // registered source chains
 	headers  map[string]*headerState // per-chain recorded headers (latest + highest trusted)
 	records  map[string]*Record      // by message id
-	order    []string                // non-terminal messages, submission order
+	order    []string                // non-terminal messages, submission order; ids terminalized during an advance are dropped in one pass when that advance completes
 	consumed map[consumeToken]string // (source, destination, nonce) -> successful message id
 	nextSeq  int64
 }
@@ -428,8 +428,14 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 
 	report := &AdvanceReport{Now: nowMs}
 
+	// The order slice is not mutated while an advance runs: outcomes only
+	// change record fields, and the ids terminalized here are dropped from
+	// the order in a single pass once processing is over. Both phases can
+	// therefore iterate the live order directly, skipping records that are
+	// already terminal.
+	//
 	// Phase 1: due messages, first-submission order.
-	for _, id := range append([]string(nil), q.order...) {
+	for _, id := range q.order {
 		rec := q.records[id]
 		if rec == nil || isTerminal(rec.Status) {
 			continue
@@ -453,7 +459,7 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 
 	// Phase 2: replay/expiry hold for every non-terminal message at the new
 	// time, even while its retry backoff is still running.
-	for _, id := range append([]string(nil), q.order...) {
+	for _, id := range q.order {
 		rec := q.records[id]
 		if rec == nil || isTerminal(rec.Status) {
 			continue
@@ -464,6 +470,18 @@ func (q *Queue) Advance(nowMs int64) (*AdvanceReport, error) {
 			report.Results = append(report.Results, r)
 		}
 	}
+
+	// Order maintenance: drop the messages this advance terminalized in one
+	// pass, preserving the survivors' relative submission order. Removing
+	// each terminalized id on the spot would make a burst of terminal
+	// outcomes cost quadratic in the number of live messages.
+	live := q.order[:0]
+	for _, id := range q.order {
+		if rec := q.records[id]; rec != nil && !isTerminal(rec.Status) {
+			live = append(live, id)
+		}
+	}
+	q.order = live
 
 	if err := q.store.appendAdvance(nowMs); err != nil {
 		return nil, q.fail("advance", err)
@@ -588,8 +606,10 @@ func successOutcome(reason string, token consumeToken) outcome {
 // acknowledged in the same advance stay in force. On success every result
 // counts exactly one more attempt and stamps LastProcAt with the processing
 // time; a waiting result additionally keeps its saturated backoff schedule,
-// while success and terminal results clear the retry time and leave the
-// processing order; success also records the nonce consumption.
+// while success and terminal results clear the retry time; success also
+// records the nonce consumption. Terminal records stop being processed
+// immediately via their status and are dropped from the live processing
+// order by the enclosing advance's single closing pass.
 func (q *Queue) applyOutcome(rec *Record, now int64, oc outcome) (Result, error) {
 	id := rec.Msg.Message.ID
 	attempt := rec.Attempts + 1
@@ -608,9 +628,6 @@ func (q *Queue) applyOutcome(rec *Record, now int64, oc outcome) (Result, error)
 	if oc.consume != nil {
 		q.consumed[*oc.consume] = id
 	}
-	if isTerminal(oc.status) {
-		q.removeFromOrder(id)
-	}
 	return Result{ID: id, Status: oc.status, Reason: oc.reason}, nil
 }
 
@@ -628,15 +645,6 @@ func retryDue(rec *Record, now int64) bool {
 		return false
 	}
 	return now != rec.LastProcAt
-}
-
-func (q *Queue) removeFromOrder(id string) {
-	for i, cand := range q.order {
-		if cand == id {
-			q.order = append(q.order[:i], q.order[i+1:]...)
-			return
-		}
-	}
 }
 
 // nextRetryAt returns the retry instant after the attempt-th processing at
