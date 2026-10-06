@@ -216,6 +216,77 @@ func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 	return false
 }
 
+// isCleanEOF reports whether err marks ordinary end-of-input carrying no
+// independent failure reason. A bare io.EOF is clean, and so is any error
+// that only wraps that one marker through ordinary single-cause wrapping:
+// every leaf reachable through Unwrap is the EOF marker, and at least one
+// leaf exists. A combined error that joins io.EOF WITH another reason —
+// errors.Join(io.EOF, cause), a custom error exposing several Unwrap
+// targets, or either shape behind further wrapping — is NOT clean even
+// though errors.Is(err, io.EOF) matches, because that second leaf is a
+// genuine read fault. An unwrapper that exposes no leaf at all (an empty
+// Unwrap() []error or a nil-cause wrapper) is likewise not clean: it is not
+// the EOF marker, so treating it as normal completion could swallow a real
+// fault. Only leaf errors are inspected: intermediate wrapping nodes are
+// structure, not causes. The seen set keeps a self-referential Unwrap graph
+// from looping; non-comparable error values are descended without recording
+// (such a value cannot recur by identity anyway).
+func isCleanEOF(err error) bool {
+	if err == nil {
+		return false
+	}
+	clean := true    // no non-EOF leaf has been seen yet
+	eofLeaf := false // at least one EOF leaf has been seen
+	seen := make(map[any]bool)
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil || !clean {
+			return
+		}
+		if mark(seen, e) {
+			return // already visited: a cyclic error graph
+		}
+		switch u := e.(type) {
+		case interface{ Unwrap() error }:
+			walk(u.Unwrap())
+		case interface{ Unwrap() []error }:
+			for _, child := range u.Unwrap() {
+				walk(child)
+				if !clean {
+					return
+				}
+			}
+		default:
+			// A leaf has nothing more to unwrap, so errors.Is here is plain
+			// identity: it is either the EOF marker itself or a real cause.
+			if errors.Is(e, io.EOF) {
+				eofLeaf = true
+			} else {
+				clean = false
+			}
+		}
+	}
+	walk(err)
+	return clean && eofLeaf
+}
+
+// mark records e in seen for cycle detection, reporting whether it was
+// already present. A non-comparable dynamic error type (one holding a slice
+// or map) cannot be a map key and cannot recur by identity, so it is treated
+// as not-yet-seen and the caller descends normally.
+func mark(seen map[any]bool, e error) (already bool) {
+	defer func() {
+		if recover() != nil {
+			already = false
+		}
+	}()
+	if seen[e] {
+		return true
+	}
+	seen[e] = true
+	return false
+}
+
 // NormalizeReader streams newline-delimited JSON logs from r and writes one
 // NormalizeResult JSON object per non-blank physical line to w. Blank lines
 // produce no output but still advance the physical line counter. It returns
@@ -241,7 +312,14 @@ func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 // in the error chain instead of retried until it recovers; bytes already
 // accepted remain as the prefix of the would-be output, including an
 // incomplete final JSON record. A clean EOF is not an error, including when
-// the final complete line has no trailing newline.
+// the final complete line has no trailing newline. "Clean" means the end
+// marker carries no other cause: a bare io.EOF and an error that only wraps
+// that marker are normal completion, but a combined error delivering
+// io.EOF together with an independent read reason in the same call
+// (errors.Join(io.EOF, cause), a multi-Unwrap error, or either behind
+// further wrapping) is a read fault: errors.Is matches ErrLogRead and the
+// reader's actual cause, and the newline-less remainder is treated as part
+// of the failed read rather than a final complete log.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	return NormalizeReaderFiltered(r, w, nil)
 }
@@ -362,8 +440,15 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 			}
 			continue
 		}
-		eof := errors.Is(rerr, io.EOF)
-		fault := rerr != nil && !eof
+		// Classify how this delivery ended by the error tree, not by a simple
+		// errors.Is match: a combined error can carry io.EOF together with a
+		// genuine cause in one delivery (errors.Join(io.EOF, cause), a
+		// multi-Unwrap error, or either behind further wrapping), and matching
+		// the EOF branch alone would silently drop the cause. Only an error
+		// whose whole tree is the EOF marker is ordinary completion; any other
+		// leaf makes the delivery a fault.
+		cleanEOF := isCleanEOF(rerr)
+		fault := rerr != nil && !cleanEOF
 		if fault {
 			// The fault is recorded before the bytes delivered with it are
 			// touched, so it survives even if pushing their results out fails.
@@ -405,9 +490,12 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 			// neither normalized nor counted and gets no result of its own.
 			// Stop immediately; no further input is read to set precedence.
 			return failures, nil
-		case eof:
+		case cleanEOF:
 			// A clean EOF is normal completion: any remaining bytes are the
-			// final complete line without a trailing newline.
+			// final complete line without a trailing newline. This covers only
+			// an error whose whole tree is the EOF marker; an EOF joined with
+			// an actual read cause took the fault branch above and its tail is
+			// discarded.
 			if len(pending) > 0 {
 				if werr := processLine(pending); werr != nil {
 					return failures, writeFailure(werr)
