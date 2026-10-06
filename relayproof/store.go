@@ -1317,42 +1317,94 @@ func (s *store) appendHeader(h Header) error {
 	return s.append(e)
 }
 
-func (s *store) appendSubmit(rec *Record) error {
-	m := rec.Msg.Message
+// newSubmitEntry encodes one message's original submission — its id, source
+// and destination chains, nonce, payload and proof height together with the
+// absolute expiry and first-submission sequence — as a log entry. It is the
+// single construction site for a submit record shared by the plain append
+// path (kindSubmit appended on Submit) and log compaction (the same record
+// rewritten into the snapshot), so the id/destination/payload byte
+// preservation rules can never drift between the two save paths: valid
+// UTF-8 keeps the historical plain fields and invalid bytes go through the
+// plain/base64 split exactly once here.
+func newSubmitEntry(seq int64, env Envelope) *logEntry {
+	m := env.Message
 	e := &logEntry{
-		T: kindSubmit, Seq: rec.Seq, From: m.From,
-		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
+		T: kindSubmit, Seq: seq, From: m.From,
+		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: env.ExpiresAt,
 	}
 	e.setID(m.ID)
 	e.setTo(m.To)
 	e.setPayload(m.Payload)
-	return s.append(e)
+	return e
 }
 
-// appendOutcome records one processing result. Every result carries the
-// processing time, the post-attempt attempt count and the resulting status and
-// reason; a waiting result additionally carries the retry instant the queue
-// layer already computed and saturated, so the log never carries an overflowed
-// negative schedule. On success the consumed triple
-// (consumeFrom/consumeTo/consumeNonce) and its consumer are part of the same
-// durable record, committing together atomically; oc.consume is nil for every
-// non-success status.
-func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
-	id := rec.Msg.Message.ID
+func (s *store) appendSubmit(rec *Record) error {
+	return s.append(newSubmitEntry(rec.Seq, rec.Msg))
+}
+
+// processedFields is the post-processing state both message save paths
+// record: the on-disk kind selects one incremental result (kindResult,
+// written by every Advance) or the message's full current status
+// (kindState, written by compaction) — every other field rule is shared and
+// lives solely in newProcessedEntry. nextRetry is non-zero only for a
+// waiting record and consume is set only for success.
+type processedFields struct {
+	kind      string
+	now       int64
+	attempts  int
+	status    string
+	reason    string
+	nextRetry int64
+	consume   *consumeToken
+}
+
+// newProcessedEntry encodes a message's processed state for the log: every
+// entry carries the processing time, the attempt count after processing and
+// the resulting status and reason; a waiting entry additionally carries the
+// retry instant the queue layer already computed and saturated, so the log
+// never carries an overflowed negative schedule; on success the consumed
+// triple (consumeFrom/consumeTo/consumeNonce) and its consumer are part of
+// the same record, committing together atomically. Both save paths go
+// through this one constructor, so the id/reason byte preservation, the
+// waiting-only retry instant and the success-only consumption attribution
+// stay identical for a plain result and a compacted state entry. A success
+// state without its consumed triple is an internal error, worded exactly as
+// the plain-result path has always reported it.
+func newProcessedEntry(id string, f processedFields) (*logEntry, error) {
 	e := &logEntry{
-		T: kindResult, Now: now,
-		Status: oc.status, Attempts: attempts, NextRetry: nextRetry,
+		T: f.kind, Now: f.now,
+		Status: f.status, Attempts: f.attempts, NextRetry: f.nextRetry,
 	}
 	e.setID(id)
-	e.setReason(oc.reason)
-	if oc.status == StatusSuccess {
-		if oc.consume == nil {
-			return fmt.Errorf("internal error: success result for %q missing nonce consumption", id)
+	e.setReason(f.reason)
+	if f.status == StatusSuccess {
+		if f.consume == nil {
+			return nil, fmt.Errorf("internal error: success result for %q missing nonce consumption", id)
 		}
-		e.ConsumeFrom = oc.consume.from
-		e.setConsumeTo(oc.consume.to)
-		e.ConsumeNonce = oc.consume.nonce
+		e.ConsumeFrom = f.consume.from
+		e.setConsumeTo(f.consume.to)
+		e.ConsumeNonce = f.consume.nonce
 		e.setConsumeBy(id)
+	}
+	return e, nil
+}
+
+// appendOutcome records one processing result. The field rules themselves
+// (attempt count, saturated waiting schedule, success triple committed in
+// the same record) are the shared ones in newProcessedEntry; this only
+// stamps the incremental result kind and the current processing time.
+func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
+	e, err := newProcessedEntry(rec.Msg.Message.ID, processedFields{
+		kind:      kindResult,
+		now:       now,
+		attempts:  attempts,
+		status:    oc.status,
+		reason:    oc.reason,
+		nextRetry: nextRetry,
+		consume:   oc.consume,
+	})
+	if err != nil {
+		return err
 	}
 	return s.append(e)
 }
@@ -1409,29 +1461,27 @@ func (s *store) compact(state *loadedState) error {
 	for _, seq := range seqs {
 		rec := bySeq[seq]
 		m := rec.Msg.Message
-		se := &logEntry{
-			T: kindSubmit, Seq: rec.Seq, From: m.From,
-			Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
-		}
-		se.setID(m.ID)
-		se.setTo(m.To)
-		se.setPayload(m.Payload)
-		entries = append(entries, se)
+		// The submit record and a processed record use the exact same
+		// construction as the plain append path, so the snapshot cannot save
+		// id/destination/payload bytes or a success triple under rules
+		// different from the ones the live log used.
+		entries = append(entries, newSubmitEntry(rec.Seq, rec.Msg))
 		if rec.Attempts > 0 {
-			re := &logEntry{
-				T: kindState, Now: rec.LastProcAt,
-				Status: rec.Status, Attempts: rec.Attempts,
+			f := processedFields{
+				kind: kindState, now: rec.LastProcAt,
+				status: rec.Status, attempts: rec.Attempts,
+				reason: rec.Reason,
 			}
-			re.setID(m.ID)
-			re.setReason(rec.Reason)
 			if rec.Status == StatusWaiting {
-				re.NextRetry = rec.NextRetry
+				f.nextRetry = rec.NextRetry
 			}
 			if rec.Status == StatusSuccess {
-				re.ConsumeFrom = m.From
-				re.setConsumeTo(m.To)
-				re.ConsumeNonce = m.Nonce
-				re.setConsumeBy(m.ID)
+				token := newConsumeToken(m.From, m.To, m.Nonce)
+				f.consume = &token
+			}
+			re, err := newProcessedEntry(m.ID, f)
+			if err != nil {
+				return err
 			}
 			entries = append(entries, re)
 		}
