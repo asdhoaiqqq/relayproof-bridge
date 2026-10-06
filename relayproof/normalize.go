@@ -104,6 +104,39 @@ var (
 	ErrLogWrite = errors.New("log stream write failure")
 )
 
+// isCleanEndOfInput reports whether err denotes nothing but the end of the
+// input: io.EOF itself, or wrappers — a single %w chain or an errors.Join
+// combination — whose every underlying cause is io.EOF. A combined error
+// that carries io.EOF together with any other independent cause is NOT a
+// clean end: errors.Is(err, io.EOF) matches it, but the accompanying cause
+// is a genuine read fault. Treating such a combination as normal completion
+// would silently drop the real cause and mistake the newline-less fragment
+// delivered with it for a complete final line.
+func isCleanEndOfInput(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF {
+		return true
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := multi.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !isCleanEndOfInput(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return isCleanEndOfInput(single.Unwrap())
+	}
+	return false
+}
+
 // shortWriteDetectingWriter enforces the io.Writer contract at the output
 // boundary: a Write that acknowledges fewer bytes than it was offered while
 // reporting a nil error becomes io.ErrShortWrite. The guard matters for
@@ -241,7 +274,10 @@ func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 // in the error chain instead of retried until it recovers; bytes already
 // accepted remain as the prefix of the would-be output, including an
 // incomplete final JSON record. A clean EOF is not an error, including when
-// the final complete line has no trailing newline.
+// the final complete line has no trailing newline. Clean means the error is
+// io.EOF and nothing else: a combined error that carries io.EOF together
+// with another independent cause — even behind ordinary error wrapping — is
+// a read failure, handled exactly like any other non-EOF read fault.
 func NormalizeReader(r io.Reader, w io.Writer) (failures int, err error) {
 	return NormalizeReaderFiltered(r, w, nil)
 }
@@ -301,8 +337,10 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 	// already-delivered read cause. Owning the loop makes every (bytes, err)
 	// pair observable at the exact call it arrives, so a non-EOF fault is
 	// recorded before the bytes that came with it are processed and can never
-	// be reclassified by a write fault that follows in processing order. A
-	// clean EOF is recorded as ordinary end-of-input and is never a fault.
+	// be reclassified by a write fault that follows in processing order. Only
+	// an error that is io.EOF and nothing else is recorded as ordinary
+	// end-of-input; a combined error that joins io.EOF with another
+	// independent cause is a fault like any other.
 	var pending []byte
 	// scanned counts the leading bytes of pending already known to contain no
 	// newline. Only bytes appended since the last scan are searched, so a long
@@ -362,7 +400,12 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 			}
 			continue
 		}
-		eof := errors.Is(rerr, io.EOF)
+		// Only an error that is io.EOF and nothing else is a clean end of
+		// input. A combined error that joins io.EOF with another independent
+		// cause (even behind ordinary %w wrapping) still matches
+		// errors.Is(err, io.EOF), but the other cause is a real read fault:
+		// it must be recorded as such, not vanish into normal completion.
+		eof := isCleanEndOfInput(rerr)
 		fault := rerr != nil && !eof
 		if fault {
 			// The fault is recorded before the bytes delivered with it are
