@@ -94,42 +94,84 @@ type NormalizeResult struct {
 	Error string           `json:"error,omitempty"`
 }
 
-// SourceCIDRFilter restricts emitted successful events to one IPv4 source
-// network. It is the parsed, validated form of an argument like
-// "192.0.2.123/24": host bits in the spelled address do not narrow the range,
-// so "192.0.2.123/24" and "192.0.2.0/24" admit the same sources, "/32" admits
-// only the one address, and "/0" admits every normalized IPv4 source.
+// SourceCIDRFilter restricts emitted successful events to one source
+// network, IPv4 or IPv6. It is the parsed, validated form of an argument
+// like "192.0.2.123/24" or "2001:db8::1234/64": host bits in the spelled
+// address do not narrow the range, so "192.0.2.123/24" and "192.0.2.0/24"
+// admit the same sources and likewise "2001:db8::1234/64" and
+// "2001:db8::/64". A "/32" (or "/128") filter admits only the one address,
+// and a "/0" filter admits every normalized source of the filter's own
+// address family.
 //
-// Matching uses the fully normalized source_ip. A plain IPv4 address and its
-// IPv4-mapped IPv6 spellings (e.g. 192.0.2.1 and ::ffff:192.0.2.1) normalize
-// to the same address and therefore admit identically; a genuine IPv6 source
-// whose tail happens to embed the same 32 bits (e.g. ::192.0.2.1) is not an
-// IPv4-mapped address and never admits. A valid event without a source
-// address, or whose normalized source stays IPv6, is simply not emitted by a
-// filtered run; that is neither a success result nor a failure.
+// A filter matches exactly one address family: matching always uses the
+// fully normalized source_ip, and a plain IPv4 address and its IPv4-mapped
+// IPv6 spellings (e.g. 192.0.2.1 and ::ffff:192.0.2.1) normalize to the
+// same dotted IPv4 address, so both only ever match an IPv4 network. A
+// genuine IPv6 source whose tail happens to embed the same 32 bits (e.g.
+// ::192.0.2.1, normalized to ::c000:201) is not IPv4-mapped and only
+// matches an IPv6 network that contains it. An IPv4-mapped IPv6 address
+// supplied as the *filter argument* is rejected: callers must spell that
+// network as IPv4. A valid event without a source address is never admitted
+// by either family; that is neither a success result nor a failure.
 type SourceCIDRFilter struct {
 	network *net.IPNet
+	// v6 selects the family the filter admits. The network itself carries
+	// 4-byte (IPv4) or 16-byte (IPv6) addressing; this flag makes the
+	// family boundary explicit so an IPv4-mapped source can never slip
+	// through an IPv6 filter (or vice versa).
+	v6 bool
 }
 
-// sourceCIDRPattern pins the argument grammar before any range checking:
-// exactly four 1-3 digit octets, a single "/", and a 1-3 digit prefix
-// length. net.ParseCIDR is deliberately not used: it accepts IPv6 networks
-// (the option is IPv4-only) and its error text does not distinguish the
-// rejected shapes, while strict parsing here lets each failure name the
-// exact octet or prefix that was wrong.
+// sourceCIDRPattern pins the IPv4 argument grammar before any range
+// checking: exactly four 1-3 digit octets, a single "/", and a 1-3 digit
+// prefix length. A strict pattern here lets each failure name the exact
+// octet or prefix that was wrong instead of net.ParseCIDR's generic text.
 var sourceCIDRPattern = regexp.MustCompile(`^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,3})$`)
 
-// ParseSourceCIDRFilter validates one IPv4 network argument: a dotted decimal
-// IPv4 address, a slash, and a prefix length of 0-32. Each octet must be a
-// plain 0-255 decimal number, with no leading-zero padding, sign, or other
-// notation. Host bits are interpreted as part of the network — they are masked
-// away rather than rejected — so "192.0.2.123/24" is the same filter as
-// "192.0.2.0/24".
+// sourceCIDRv6Pattern is the coarse IPv6 candidate grammar: an address
+// portion containing a colon and using hex letters/digits, colons, dots,
+// and the bracket/percent characters a port or zone identifier arrives
+// with, followed by a single "/" and a 1-3 digit decimal prefix length.
+// Actual IPv6 legality — zero compression, group count, non-hex letters,
+// embedded-tail placement, ports and zones — is delegated to net.ParseIP,
+// which accepts only bare valid spellings; every other colon-bearing
+// shape fails there with an error naming the rejected address. Requiring
+// a colon guarantees every IPv6-shaped value reaches this path and every
+// dotted-only value reaches the IPv4 grammar; a value with other
+// characters (spaces, hyphens) matches neither and gets the grammar error.
+var sourceCIDRv6Pattern = regexp.MustCompile(`^([0-9A-Za-z:.[\]%]+:[0-9A-Za-z:.[\]%]*)/([0-9]{1,3})$`)
+
+// sourceCIDRGrammarError names the accepted grammar when a value matches
+// neither the IPv4 nor the IPv6 shape.
+const sourceCIDRGrammarError = `must be an IP network: an IPv4 network in dotted decimal with a "/0" to "/32" prefix length (e.g. "192.0.2.0/24") or an IPv6 network with a "/0" to "/128" prefix length (e.g. "2001:db8::/64")`
+
+// ParseSourceCIDRFilter validates one source network argument: either a
+// dotted decimal IPv4 address with a 0-32 prefix length or an IPv6 address
+// with a 0-128 prefix length. Each IPv4 octet must be a plain 0-255 decimal
+// number with no leading-zero padding, sign, or other notation; the IPv6
+// address accepts both compressed ("2001:db8::1") and full
+// ("2001:db8:0:0:0:0:0:1") spellings and no port or zone identifier, and
+// the decimal prefix length never accepts leading-zero padding in either
+// family. Host bits are interpreted as part of the network — they are
+// masked away rather than rejected — so "192.0.2.123/24" is the same
+// filter as "192.0.2.0/24" and "2001:db8::1234/64" the same as
+// "2001:db8::/64". An IPv4-mapped IPv6 address (e.g. ::ffff:192.0.2.0) is
+// rejected rather than converted: such a network must be written as IPv4.
 func ParseSourceCIDRFilter(s string) (SourceCIDRFilter, error) {
-	m := sourceCIDRPattern.FindStringSubmatch(s)
-	if m == nil {
-		return SourceCIDRFilter{}, errors.New(`must be an IPv4 network in dotted decimal with a "/0" to "/32" prefix length, e.g. "192.0.2.0/24"`)
+	switch {
+	case sourceCIDRPattern.MatchString(s):
+		return parseIPv4SourceCIDRFilter(s)
+	case sourceCIDRv6Pattern.MatchString(s):
+		return parseIPv6SourceCIDRFilter(s)
+	default:
+		return SourceCIDRFilter{}, errors.New(sourceCIDRGrammarError)
 	}
+}
+
+// parseIPv4SourceCIDRFilter handles a value sourceCIDRPattern already
+// matched; it range-checks octets and prefix length and masks host bits.
+func parseIPv4SourceCIDRFilter(s string) (SourceCIDRFilter, error) {
+	m := sourceCIDRPattern.FindStringSubmatch(s)
 	var octets [4]byte
 	for i := 0; i < 4; i++ {
 		part := m[i+1]
@@ -160,21 +202,60 @@ func ParseSourceCIDRFilter(s string) (SourceCIDRFilter, error) {
 	return SourceCIDRFilter{network: &net.IPNet{IP: ip.Mask(mask), Mask: mask}}, nil
 }
 
+// parseIPv6SourceCIDRFilter handles a value sourceCIDRv6Pattern already
+// matched: net.ParseIP validates the address spelling, the prefix length is
+// range-checked without padding, and host bits are masked. An IPv4-mapped
+// IPv6 address is refused with an instruction to use the IPv4 network
+// instead — its prefix is never converted automatically.
+func parseIPv6SourceCIDRFilter(s string) (SourceCIDRFilter, error) {
+	m := sourceCIDRv6Pattern.FindStringSubmatch(s)
+	addrPart, prefixPart := m[1], m[2]
+	ip := net.ParseIP(addrPart)
+	if ip == nil {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: not a valid IPv6 address without a port or zone identifier", s)
+	}
+	// A mapped address denotes an IPv4 source after normalization; letting
+	// it define an IPv6 network would silently match a different family.
+	if v4 := ip.To4(); v4 != nil {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: %s is an IPv4-mapped IPv6 address; specify the IPv4 network instead", s, ip)
+	}
+	if len(prefixPart) > 1 && prefixPart[0] == '0' {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %q must not have leading zeroes", s, prefixPart)
+	}
+	prefix, _ := strconv.Atoi(prefixPart)
+	if prefix > 128 {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %d out of range (0-128)", s, prefix)
+	}
+	// Mask host bits away with a 16-byte mask, so "2001:db8::1234/64" and
+	// "2001:db8::/64" describe and render as one and the same network.
+	mask := net.CIDRMask(prefix, 128)
+	return SourceCIDRFilter{network: &net.IPNet{IP: ip.Mask(mask), Mask: mask}, v6: true}, nil
+}
+
 // String renders the canonical network the filter admits, e.g.
-// ParseSourceCIDRFilter("192.0.2.123/24").String() == "192.0.2.0/24".
+// ParseSourceCIDRFilter("192.0.2.123/24").String() == "192.0.2.0/24" and
+// ParseSourceCIDRFilter("2001:db8::1234/64").String() == "2001:db8::/64".
 func (f SourceCIDRFilter) String() string {
 	return f.network.String()
 }
 
-// admits reports whether a normalized source_ip string falls in the IPv4
-// network. Text that is not a single IPv4 address is never admitted: a
-// normalized IPv6 spelling (including ::192.0.2.1) stays IPv6 and is rejected
-// even when its final 32 bits match. Normalized mapped spellings have already
-// been printed in dotted form by net.IP.String, so they take the IPv4 path.
+// admits reports whether a normalized source_ip string falls in the
+// selected network, within the network's own address family only. Text
+// that is not a single address of that family is never admitted: an IPv6
+// network does not match a normalized dotted IPv4 source (including one
+// that arrived as an ::ffff: mapping), and an IPv4 network does not match
+// a normalized IPv6 spelling such as ::c000:201 even when its final 32
+// bits coincide.
 func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 	ip := net.ParseIP(normalizedSourceIP)
 	if ip == nil {
 		return false
+	}
+	if f.v6 {
+		if ip.To4() != nil {
+			return false // normalized IPv4 sources, mapped spellings included
+		}
+		return f.network.Contains(ip)
 	}
 	if v4 := ip.To4(); v4 != nil {
 		return f.network.Contains(v4)

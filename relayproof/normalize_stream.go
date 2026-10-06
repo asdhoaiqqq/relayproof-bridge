@@ -251,9 +251,10 @@ func (s *normalizeSink) emitLine(raw []byte) error {
 		s.failures++
 	} else if s.filter != nil && !s.filter.admits(result.Event.SourceIP) {
 		// A valid event whose normalized source is outside the selected
-		// network (or absent, or still IPv6) is filtered out: no result and
-		// no failure. The filter never runs on failed lines, so a bad
-		// address outside the network is still reported as a failure.
+		// network (or absent, or of the filter's other address family) is
+		// filtered out: no result and no failure. The filter never runs on
+		// failed lines, so a bad address outside the network is still
+		// reported as a failure.
 		emit = false
 	}
 	if !emit {

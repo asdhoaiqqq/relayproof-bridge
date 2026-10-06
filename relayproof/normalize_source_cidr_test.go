@@ -91,8 +91,10 @@ func TestParseSourceCIDRFilterRejects(t *testing.T) {
 		"192.168.001.1/24", // leading-zero padding
 		"01.2.3.4/8",
 		"192.0.2.1/024", // padded length
-		"::1/128",       // IPv6 form
+		// IPv6-shaped values that must still be refused: an IPv4-mapped
+		// network must be written as IPv4, never auto-converted.
 		"::ffff:192.0.2.0/120",
+		"::ffff:0:0/96",
 		"192.0.2.0/0x8", // non-decimal length
 		"abc",
 		"192.0.2.0/24 ", // trailing space
