@@ -303,7 +303,15 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 	// recorded before the bytes that came with it are processed and can never
 	// be reclassified by a write fault that follows in processing order. A
 	// clean EOF is recorded as ordinary end-of-input and is never a fault.
+	// pending holds bytes of the current physical line (plus any complete
+	// lines delivered in the same read) not yet processed. scanned is the
+	// number of leading pending bytes already searched for '\n' on a previous
+	// delivery: the next search starts there, so a long line arriving in many
+	// short pieces scans each delivered byte exactly once instead of
+	// re-examining every earlier byte on every read. Both indices are
+	// positions in the current pending slice; any discard below resets them.
 	var pending []byte
+	scanned := 0
 	chunk := make([]byte, 64*1024)
 	lineNo := 0
 	emptyReads := 0
@@ -366,14 +374,20 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 		}
 
 		// Process every newline-ended line the delivered bytes complete.
+		// Only the unsearched suffix is examined: every byte before scanned
+		// arrived in an earlier delivery and is already known to carry no
+		// '\n', so a long line fed to the reader in short pieces has its
+		// accumulated prefix scanned once rather than once per delivery.
 		for {
-			i := bytes.IndexByte(pending, '\n')
+			i := bytes.IndexByte(pending[scanned:], '\n')
 			if i < 0 {
+				scanned = len(pending)
 				break
 			}
-			raw := pending[:i+1]
-			werr := processLine(raw)
+			i += scanned
+			werr := processLine(pending[:i+1])
 			pending = pending[i+1:]
+			scanned = 0 // the remaining slice is the unsearched tail of this delivery
 			if werr != nil {
 				return failures, writeFailure(werr)
 			}
@@ -383,6 +397,7 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 			// processed complete line, so retention tracks the longest line
 			// rather than the whole stream.
 			pending = nil
+			scanned = 0
 		}
 
 		switch {
