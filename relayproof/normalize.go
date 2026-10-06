@@ -94,42 +94,67 @@ type NormalizeResult struct {
 	Error string           `json:"error,omitempty"`
 }
 
-// SourceCIDRFilter restricts emitted successful events to one IPv4 source
-// network. It is the parsed, validated form of an argument like
-// "192.0.2.123/24": host bits in the spelled address do not narrow the range,
-// so "192.0.2.123/24" and "192.0.2.0/24" admit the same sources, "/32" admits
-// only the one address, and "/0" admits every normalized IPv4 source.
+// SourceCIDRFilter restricts emitted successful events to one IPv4 or IPv6
+// source network. It is the parsed, validated form of an argument like
+// "192.0.2.123/24" or "2001:db8::1234/64": host bits in the spelled address
+// do not narrow the range, so "192.0.2.123/24" and "192.0.2.0/24" admit the
+// same sources (and "2001:db8::1234/64" and "2001:db8::/64" likewise), a
+// "/32" ("/128") admits only the one address, and a "/0" admits every
+// normalized source of its own address family.
 //
-// Matching uses the fully normalized source_ip. A plain IPv4 address and its
+// Matching uses the fully normalized source_ip, and each network family
+// admits only its own: an IPv4 network never admits an IPv6 source and an
+// IPv6 network never admits an IPv4 source. A plain IPv4 address and its
 // IPv4-mapped IPv6 spellings (e.g. 192.0.2.1 and ::ffff:192.0.2.1) normalize
-// to the same address and therefore admit identically; a genuine IPv6 source
-// whose tail happens to embed the same 32 bits (e.g. ::192.0.2.1) is not an
-// IPv4-mapped address and never admits. A valid event without a source
-// address, or whose normalized source stays IPv6, is simply not emitted by a
+// to the same IPv4 address and therefore admit identically against IPv4
+// networks only; a genuine IPv6 source whose tail happens to embed the same
+// 32 bits (e.g. ::192.0.2.1) is not an IPv4-mapped address, never admits
+// against an IPv4 network, and admits against any IPv6 network that contains
+// it. A valid event without a source address is simply not emitted by a
 // filtered run; that is neither a success result nor a failure.
 type SourceCIDRFilter struct {
 	network *net.IPNet
+	v6      bool
 }
 
-// sourceCIDRPattern pins the argument grammar before any range checking:
+// sourceCIDRPattern pins the IPv4 argument grammar before any range checking:
 // exactly four 1-3 digit octets, a single "/", and a 1-3 digit prefix
-// length. net.ParseCIDR is deliberately not used: it accepts IPv6 networks
-// (the option is IPv4-only) and its error text does not distinguish the
-// rejected shapes, while strict parsing here lets each failure name the
-// exact octet or prefix that was wrong.
+// length. net.ParseCIDR is deliberately not used: its error text does not
+// distinguish the rejected shapes, while strict parsing here lets each
+// failure name the exact octet or prefix that was wrong. Anything carrying a
+// ":" takes the IPv6 path in ParseSourceCIDRFilter instead.
 var sourceCIDRPattern = regexp.MustCompile(`^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,3})$`)
 
-// ParseSourceCIDRFilter validates one IPv4 network argument: a dotted decimal
-// IPv4 address, a slash, and a prefix length of 0-32. Each octet must be a
-// plain 0-255 decimal number, with no leading-zero padding, sign, or other
-// notation. Host bits are interpreted as part of the network — they are masked
-// away rather than rejected — so "192.0.2.123/24" is the same filter as
-// "192.0.2.0/24".
+// sourceCIDRGrammar is the rejection text for an argument that matches
+// neither the IPv4 nor the IPv6 grammar; both promised shapes are named so
+// the message stays accurate whichever family was intended.
+const sourceCIDRGrammar = `must be an IPv4 network in dotted decimal with a "/0" to "/32" prefix length (e.g. "192.0.2.0/24") or an IPv6 network with a "/0" to "/128" prefix length (e.g. "2001:db8::/64")`
+
+// ParseSourceCIDRFilter validates one IPv4 or IPv6 network argument: either a
+// dotted decimal IPv4 address, a slash, and a prefix length of 0-32, or an
+// IPv6 address (compressed or full spelling, without port or zone
+// identifier), a slash, and a decimal prefix length of 0-128. Each IPv4
+// octet must be a plain 0-255 decimal number, and neither family allows
+// leading-zero padding, a sign, or other notation in its numbers. Host bits
+// are interpreted as part of the network — they are masked away rather than
+// rejected — so "192.0.2.123/24" is the same filter as "192.0.2.0/24" and
+// "2001:db8::1234/64" the same filter as "2001:db8::/64". An IPv4-mapped IPv6
+// address (e.g. "::ffff:192.0.2.0/120") is rejected rather than converted:
+// the filter for that range is the IPv4 network, and the prefix length is
+// never translated between families.
 func ParseSourceCIDRFilter(s string) (SourceCIDRFilter, error) {
-	m := sourceCIDRPattern.FindStringSubmatch(s)
-	if m == nil {
-		return SourceCIDRFilter{}, errors.New(`must be an IPv4 network in dotted decimal with a "/0" to "/32" prefix length, e.g. "192.0.2.0/24"`)
+	if m := sourceCIDRPattern.FindStringSubmatch(s); m != nil {
+		return parseIPv4SourceCIDRFilter(s, m)
 	}
+	if strings.Contains(s, ":") {
+		return parseIPv6SourceCIDRFilter(s)
+	}
+	return SourceCIDRFilter{}, errors.New(sourceCIDRGrammar)
+}
+
+// parseIPv4SourceCIDRFilter validates the IPv4 form; m holds the capture
+// groups of sourceCIDRPattern for s.
+func parseIPv4SourceCIDRFilter(s string, m []string) (SourceCIDRFilter, error) {
 	var octets [4]byte
 	for i := 0; i < 4; i++ {
 		part := m[i+1]
@@ -160,21 +185,70 @@ func ParseSourceCIDRFilter(s string) (SourceCIDRFilter, error) {
 	return SourceCIDRFilter{network: &net.IPNet{IP: ip.Mask(mask), Mask: mask}}, nil
 }
 
+// parseIPv6SourceCIDRFilter validates the IPv6 form: a legal IPv6 address in
+// any spelling net.ParseIP accepts (compressed or full, but with no port and
+// no zone identifier), a single "/", and a decimal prefix length of 0-128
+// with no leading-zero padding. An IPv4-mapped address is rejected with a
+// pointer to the IPv4 network form; the prefix length is deliberately not
+// converted between the 32-bit and 128-bit families.
+func parseIPv6SourceCIDRFilter(s string) (SourceCIDRFilter, error) {
+	addr, prefixPart, found := strings.Cut(s, "/")
+	if !found || addr == "" || prefixPart == "" || strings.Contains(prefixPart, "/") {
+		return SourceCIDRFilter{}, errors.New(sourceCIDRGrammar)
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: %q is not a valid IPv6 address (no port or zone identifier allowed)", s, addr)
+	}
+	if ip.To4() != nil {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: %q is an IPv4-mapped IPv6 address; select that range with the IPv4 network form instead (e.g. %q)", s, addr, "192.0.2.0/24")
+	}
+	for i := 0; i < len(prefixPart); i++ {
+		if prefixPart[i] < '0' || prefixPart[i] > '9' {
+			return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %q must be a decimal number", s, prefixPart)
+		}
+	}
+	if len(prefixPart) > 1 && prefixPart[0] == '0' {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %q must not have leading zeroes", s, prefixPart)
+	}
+	if len(prefixPart) > 3 {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %s out of range (0-128)", s, prefixPart)
+	}
+	prefix, _ := strconv.Atoi(prefixPart)
+	if prefix > 128 {
+		return SourceCIDRFilter{}, fmt.Errorf("invalid IPv6 network %q: prefix length %d out of range (0-128)", s, prefix)
+	}
+	// Mask host bits away so the written host address cannot narrow the
+	// range, exactly like the IPv4 path.
+	mask := net.CIDRMask(prefix, 128)
+	return SourceCIDRFilter{network: &net.IPNet{IP: ip.To16().Mask(mask), Mask: mask}, v6: true}, nil
+}
+
 // String renders the canonical network the filter admits, e.g.
-// ParseSourceCIDRFilter("192.0.2.123/24").String() == "192.0.2.0/24".
+// ParseSourceCIDRFilter("192.0.2.123/24").String() == "192.0.2.0/24" and
+// ParseSourceCIDRFilter("2001:db8::1234/64").String() == "2001:db8::/64".
 func (f SourceCIDRFilter) String() string {
 	return f.network.String()
 }
 
-// admits reports whether a normalized source_ip string falls in the IPv4
-// network. Text that is not a single IPv4 address is never admitted: a
-// normalized IPv6 spelling (including ::192.0.2.1) stays IPv6 and is rejected
-// even when its final 32 bits match. Normalized mapped spellings have already
-// been printed in dotted form by net.IP.String, so they take the IPv4 path.
+// admits reports whether a normalized source_ip string falls in the network.
+// Each family admits only its own addresses. Against an IPv4 network, text
+// that is not a single IPv4 address is never admitted: a normalized IPv6
+// spelling (including ::192.0.2.1) stays IPv6 and is rejected even when its
+// final 32 bits match. Against an IPv6 network the mirror rule holds: a
+// normalized IPv4 source is rejected even when its bits would fall inside
+// the v6 range. Normalized mapped spellings have already been printed in
+// dotted form by net.IP.String, so they take the IPv4 path.
 func (f SourceCIDRFilter) admits(normalizedSourceIP string) bool {
 	ip := net.ParseIP(normalizedSourceIP)
 	if ip == nil {
 		return false
+	}
+	if f.v6 {
+		if ip.To4() != nil {
+			return false
+		}
+		return f.network.Contains(ip)
 	}
 	if v4 := ip.To4(); v4 != nil {
 		return f.network.Contains(v4)

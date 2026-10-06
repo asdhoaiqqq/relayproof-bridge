@@ -9,8 +9,8 @@ import (
 	"github.com/asdhoaiqqq/relayproof-bridge/relayproof"
 )
 
-// sourceCIDRFlag is the sole normalize option: an IPv4 network that restricts
-// which successful events are emitted.
+// sourceCIDRFlag is the sole normalize option: an IPv4 or IPv6 network that
+// restricts which successful events are emitted.
 const sourceCIDRFlag = "--source-cidr"
 
 func main() {
@@ -43,11 +43,14 @@ func usage() {
 	fmt.Println("              exits non-zero when one or more input lines fail")
 	fmt.Println()
 	fmt.Println("              options:")
-	fmt.Println("                --source-cidr <IPv4>/<prefix>")
+	fmt.Println("                --source-cidr <address>/<prefix>")
 	fmt.Println("                    emit a successful event only when its normalized")
-	fmt.Println("                    source_ip lies in this single IPv4 network (prefix")
-	fmt.Println(`                    length 0-32, e.g. "192.0.2.0/24" or "192.0.2.123/24";`)
-	fmt.Println("                    failed lines are still reported. May be given once.")
+	fmt.Println("                    source_ip lies in this single IPv4 or IPv6 network")
+	fmt.Println(`                    (IPv4 prefix 0-32, e.g. "192.0.2.0/24" or`)
+	fmt.Println(`                    "192.0.2.123/24"; IPv6 prefix 0-128, e.g.`)
+	fmt.Println(`                    "2001:db8::/64" or "2001:db8::1234/64"; each`)
+	fmt.Println("                    network admits only its own address family).")
+	fmt.Println("                    Failed lines are still reported. May be given once.")
 	fmt.Println("  version     print the relayproof version")
 	fmt.Println("  help        show this help")
 }
@@ -73,9 +76,9 @@ func runNormalize() {
 
 // parseNormalizeOptions accepts at most one --source-cidr option, in either
 // "--source-cidr value" or "--source-cidr=value" form. A missing or empty
-// value, a value outside the IPv4/prefix grammar, a repeated option, or any
-// other argument is a parameter error: the caller reports it on stderr and
-// exits 2 before opening the log stream.
+// value, a value outside the IPv4/IPv6 network grammars, a repeated option,
+// or any other argument is a parameter error: the caller reports it on
+// stderr and exits 2 before opening the log stream.
 func parseNormalizeOptions(args []string) (*relayproof.SourceCIDRFilter, error) {
 	var filter *relayproof.SourceCIDRFilter
 	specified := false
@@ -87,8 +90,8 @@ func parseNormalizeOptions(args []string) (*relayproof.SourceCIDRFilter, error) 
 				return nil, fmt.Errorf("%s may be specified at most once", sourceCIDRFlag)
 			}
 			if i+1 >= len(args) {
-				return nil, fmt.Errorf("%s requires a value: an IPv4 network in dotted decimal with a \"/0\" to \"/32\" prefix length, e.g. %q",
-					sourceCIDRFlag, "192.0.2.0/24")
+				return nil, fmt.Errorf("%s requires a value: an IPv4 or IPv6 network with a prefix length, e.g. %q or %q",
+					sourceCIDRFlag, "192.0.2.0/24", "2001:db8::/64")
 			}
 			i++
 			value := args[i]
@@ -108,7 +111,7 @@ func parseNormalizeOptions(args []string) (*relayproof.SourceCIDRFilter, error) 
 			}
 			filter, specified = &parsed, true
 		default:
-			return nil, fmt.Errorf("unknown argument %q; normalize accepts only %s <IPv4>/<prefix>", arg, sourceCIDRFlag)
+			return nil, fmt.Errorf("unknown argument %q; normalize accepts only %s <address>/<prefix>", arg, sourceCIDRFlag)
 		}
 	}
 	return filter, nil

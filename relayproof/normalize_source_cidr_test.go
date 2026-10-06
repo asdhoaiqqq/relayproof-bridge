@@ -72,8 +72,10 @@ func TestParseSourceCIDRFilterCanonicalization(t *testing.T) {
 	}
 }
 
-// TestParseSourceCIDRFilterRejects pins what the option grammar refuses:
+// TestParseSourceCIDRFilterRejects pins what the IPv4 option grammar refuses:
 // only a dotted decimal IPv4 address, a slash, and a 0-32 prefix length.
+// (IPv6 networks are accepted by the same entry point; their grammar and the
+// IPv4-mapped rejection are covered in normalize_source_cidr_ipv6_test.go.)
 func TestParseSourceCIDRFilterRejects(t *testing.T) {
 	bad := []string{
 		"",
@@ -91,7 +93,6 @@ func TestParseSourceCIDRFilterRejects(t *testing.T) {
 		"192.168.001.1/24", // leading-zero padding
 		"01.2.3.4/8",
 		"192.0.2.1/024", // padded length
-		"::1/128",       // IPv6 form
 		"::ffff:192.0.2.0/120",
 		"192.0.2.0/0x8", // non-decimal length
 		"abc",
