@@ -304,6 +304,11 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 	// be reclassified by a write fault that follows in processing order. A
 	// clean EOF is recorded as ordinary end-of-input and is never a fault.
 	var pending []byte
+	// scanned counts the leading bytes of pending already known to contain no
+	// newline. Only bytes appended since the last scan are searched, so a long
+	// line delivered in many small pieces is assembled without re-examining
+	// the bytes every earlier piece already ruled out.
+	scanned := 0
 	chunk := make([]byte, 64*1024)
 	lineNo := 0
 	emptyReads := 0
@@ -366,14 +371,22 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 		}
 
 		// Process every newline-ended line the delivered bytes complete.
+		// pending[:scanned] holds no newline, so the search starts at the
+		// first not-yet-examined byte instead of re-scanning the whole
+		// accumulator on every delivery.
 		for {
-			i := bytes.IndexByte(pending, '\n')
+			i := bytes.IndexByte(pending[scanned:], '\n')
 			if i < 0 {
+				scanned = len(pending)
 				break
 			}
+			i += scanned
 			raw := pending[:i+1]
 			werr := processLine(raw)
 			pending = pending[i+1:]
+			// The bytes after the consumed newline have not been examined
+			// yet, so the next search starts from the new front.
+			scanned = 0
 			if werr != nil {
 				return failures, writeFailure(werr)
 			}
@@ -383,6 +396,7 @@ func NormalizeReaderFiltered(r io.Reader, w io.Writer, filter *SourceCIDRFilter)
 			// processed complete line, so retention tracks the longest line
 			// rather than the whole stream.
 			pending = nil
+			scanned = 0
 		}
 
 		switch {
