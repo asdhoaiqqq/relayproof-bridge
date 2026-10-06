@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -89,13 +90,17 @@ import (
 // carries "payload" and "payloadB64" together — even when one is the empty
 // string, both are empty, or the two happen to decode to the same bytes — is
 // an inconsistent record no build writes and rejects the directory with
-// ErrCorrupt, regardless of field order. The empty string counts as a present
-// key, so the legal empty payload ("payload":"" alone, a sole empty
-// "payloadB64":"", or neither key on old records) is never confused with a
-// dual-payload record. A checksum-valid record carrying an undecodable
-// payloadB64 likewise rejects the directory with ErrCorrupt, leaving the file
-// untouched — it is never read back as an empty or replacement-filled
-// payload.
+// ErrCorrupt, regardless of field order. Field-name casing changes nothing:
+// encoding/json fills the same struct field from "PAYLOADB64" or a mixed-case
+// spelling, so key presence is folded the same way on replay — a sole
+// re-cased base64 field still decodes to its exact bytes and a re-cased plain
+// field beside a base64 field is still two representations at once. The empty
+// string counts as a present key, so the legal empty payload ("payload":""
+// alone, a sole empty "payloadB64":"", or neither key on old records) is never
+// confused with a dual-payload record. A checksum-valid record carrying an
+// undecodable payloadB64 likewise rejects the directory with ErrCorrupt,
+// leaving the file untouched — it is never read back as an empty or
+// replacement-filled payload.
 //
 // Destination chain names have the same contract and use the same encoding:
 // replay identity is the exact (source chain, destination chain, nonce)
@@ -274,6 +279,16 @@ var splitJSONKeys = []string{
 // that the key was omitted. The exported fields decode exactly as with the
 // default unmarshalling (the alias avoids listing them by hand); only the
 // presence map is extra.
+//
+// Presence is matched case-insensitively — with strings.EqualFold, the same
+// folding encoding/json uses when selecting a struct field for a JSON key —
+// because the struct value and the presence map must describe the same key.
+// The struct decoder fills PayloadB64 from a key spelled "PAYLOADB64" or
+// "PayloadB64"; a literal lookup would miss it, so a sole re-cased base64 key
+// would be mistaken for an omitted one (its decoded bytes silently dropped to
+// the empty plain value) and a re-cased plain key alongside a normal base64
+// key would no longer read as two representations at once. Canonicalizing the
+// literal keys keeps the verdict identical across every casing.
 func (e *logEntry) UnmarshalJSON(data []byte) error {
 	type plain logEntry
 	var p plain
@@ -286,8 +301,13 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	e.present = make(map[string]bool, len(splitJSONKeys))
-	for _, k := range splitJSONKeys {
-		_, e.present[k] = keys[k]
+	for literal := range keys {
+		for _, canonical := range splitJSONKeys {
+			if strings.EqualFold(literal, canonical) {
+				e.present[canonical] = true
+				break
+			}
+		}
 	}
 	return nil
 }
