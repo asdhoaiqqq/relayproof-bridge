@@ -84,11 +84,18 @@ import (
 // base64-encoded in "payloadB64". The bytes 0xFF, 0xFE and the legal
 // character U+FFFD are three different payloads and are never conflated.
 // Payloads an older build already rewrote to replacement characters stay
-// those characters on replay — again, the lost bytes are never guessed. A
-// checksum-valid record carrying an undecodable payloadB64, or both payload
-// fields at once, is no record any build writes and rejects the directory
-// with ErrCorrupt, leaving the file untouched — it is never read back as an
-// empty or replacement-filled payload.
+// those characters on replay — again, the lost bytes are never guessed. The
+// two representations are mutually exclusive by key presence: a record that
+// carries "payload" and "payloadB64" together — even when one is the empty
+// string, both are empty, or the two happen to decode to the same bytes — is
+// an inconsistent record no build writes and rejects the directory with
+// ErrCorrupt, regardless of field order. The empty string counts as a present
+// key, so the legal empty payload ("payload":"" alone, a sole empty
+// "payloadB64":"", or neither key on old records) is never confused with a
+// dual-payload record. A checksum-valid record carrying an undecodable
+// payloadB64 likewise rejects the directory with ErrCorrupt, leaving the file
+// untouched — it is never read back as an empty or replacement-filled
+// payload.
 //
 // Message ids have the same contract and use the same encoding: identity is
 // judged by the id's exact bytes, never by its display form. The Go submit
@@ -186,6 +193,17 @@ type logEntry struct {
 	// together with Payload.
 	PayloadB64 string `json:"payloadB64,omitempty"`
 
+	// payloadPresent and payloadB64Present report whether the replayed JSON
+	// record literally carried the "payload"/"payloadB64" keys, distinct from
+	// the decoded value (which may be the empty string). They are set only by
+	// UnmarshalJSON and never marshalled: the empty payload is written as
+	// "payload":"" (payloadPresent alone on replay), while a record that names
+	// both representations — even when one of them is the empty string, and
+	// even when the two happen to decode to the same bytes — is corrupt no
+	// matter what the two decode to.
+	payloadPresent    bool
+	payloadB64Present bool
+
 	Now       int64  `json:"now,omitempty"`
 	Status    string `json:"status,omitempty"`
 	Reason    string `json:"reason,omitempty"`
@@ -236,6 +254,8 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 	}
 	_, e.rootPresent = keys["root"]
 	_, e.rootB64Present = keys["rootB64"]
+	_, e.payloadPresent = keys["payload"]
+	_, e.payloadB64Present = keys["payloadB64"]
 	return nil
 }
 
@@ -372,15 +392,20 @@ func (e *logEntry) setPayload(payload string) {
 // bytes. Entries written before payloadB64 existed carry only "payload" and
 // are taken at face value — including payloads an old build had already
 // rewritten to replacement characters, which stay those characters; the lost
-// bytes are never guessed. An entry carrying both fields, or a payloadB64
-// that does not decode, is an inconsistent record no build writes and is
-// corrupt; it is never read back as an empty or replacement-filled payload.
+// bytes are never guessed. An entry carrying both fields at once, or a
+// payloadB64 that does not decode, is an inconsistent record no build writes
+// and is corrupt; it is never read back as an empty or replacement-filled
+// payload. The two representations are mutually exclusive by key presence: an
+// explicitly empty "payload":"" is a legal plain payload, but "payload":""
+// together with any payloadB64 — even an empty one, even one that decodes to
+// the same bytes — still carries two representations of the message content
+// and is rejected. Field order does not change the verdict.
 func (e *logEntry) entryPayload() (string, error) {
-	if e.PayloadB64 == "" {
-		return e.Payload, nil
-	}
-	if e.Payload != "" {
+	if e.payloadPresent && e.payloadB64Present {
 		return "", fmt.Errorf("submit entry carries both payload and payloadB64")
+	}
+	if !e.payloadB64Present {
+		return e.Payload, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
 	if err != nil {
