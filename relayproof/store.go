@@ -333,6 +333,41 @@ func bytesField(plain, b64Value, bothMsg, undecodableMsg string) (string, error)
 	return string(raw), nil
 }
 
+// splitBytesField is the shared inverse of the plain/base64 field split for
+// the fields whose empty string is a legal value (header root, payload,
+// destination chain, consumed destination): there the two representations are
+// mutually exclusive by key presence, not by decoded value, so the empty
+// string cannot double as the signal that a key was omitted. The recovery
+// rules live here exactly once:
+//
+//   - both keys present — even when one is the empty string, both are empty,
+//     or the two decode to the same bytes, and regardless of field order — is
+//     an inconsistent record no build writes;
+//   - only the plain key (or neither key, on records written before the
+//     base64 form existed) is taken at face value, including bytes an old
+//     build already rewrote to U+FFFD, which stay those characters — the lost
+//     bytes are never guessed;
+//   - only the base64 key decodes back to the exact original byte sequence;
+//     an undecodable value is an inconsistent record, never read back as an
+//     empty or replacement-filled value.
+//
+// What each value means and how a corrupt record is worded stays with the
+// callers: bothMsg and undecodableMsg name the concrete record kind and
+// field, so a rejection still identifies which field of which entry failed.
+func splitBytesField(plain, b64Value string, plainPresent, b64Present bool, bothMsg, undecodableMsg string) (string, error) {
+	if plainPresent && b64Present {
+		return "", fmt.Errorf("%s", bothMsg)
+	}
+	if !b64Present {
+		return plain, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64Value)
+	if err != nil {
+		return "", fmt.Errorf("%s: %v", undecodableMsg, err)
+	}
+	return string(raw), nil
+}
+
 // setID encodes a message id for the log without altering its bytes.
 func (e *logEntry) setID(id string) {
 	if utf8.ValidString(id) {
@@ -405,27 +440,16 @@ func (e *logEntry) setRoot(root string) {
 }
 
 // headerRoot decodes a header entry's root back to its exact submitted
-// bytes. Entries written before rootB64 existed carry only "root" and are
-// taken at face value — including roots an old build had already rewritten to
-// replacement characters, which stay those characters; the lost bytes are
-// never guessed. An entry carrying both fields at once, or a rootB64 that does
-// not decode, is an inconsistent record no build writes and is corrupt. The
-// two representations are mutually exclusive by key presence: an explicitly
-// empty "root":"" is a legal plain root, but "root":"" together with any
-// rootB64 — even one that decodes to the same bytes, or to the empty root —
-// still carries two representations and is rejected.
+// bytes. Roots compare as their exact bytes, so the empty root is a legal
+// value and the plain/base64 split is judged by key presence; the shared
+// recovery rules are splitBytesField's. Entries written before rootB64
+// existed carry only "root" and are taken at face value — including roots an
+// old build had already rewritten to replacement characters, which stay those
+// characters; the lost bytes are never guessed.
 func (e *logEntry) headerRoot() (string, error) {
-	if e.rootPresent && e.rootB64Present {
-		return "", fmt.Errorf("header entry carries both root and rootB64")
-	}
-	if !e.rootB64Present {
-		return e.Root, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.RootB64)
-	if err != nil {
-		return "", fmt.Errorf("header entry carries undecodable rootB64: %v", err)
-	}
-	return string(raw), nil
+	return splitBytesField(e.Root, e.RootB64, e.rootPresent, e.rootB64Present,
+		"header entry carries both root and rootB64",
+		"header entry carries undecodable rootB64")
 }
 
 // setPayload encodes a message payload for the log without altering its
@@ -444,29 +468,16 @@ func (e *logEntry) setPayload(payload string) {
 }
 
 // entryPayload decodes a submit entry's payload back to its exact submitted
-// bytes. Entries written before payloadB64 existed carry only "payload" and
-// are taken at face value — including payloads an old build had already
-// rewritten to replacement characters, which stay those characters; the lost
-// bytes are never guessed. An entry carrying both fields at once, or a
-// payloadB64 that does not decode, is an inconsistent record no build writes
-// and is corrupt; it is never read back as an empty or replacement-filled
-// payload. The two representations are mutually exclusive by key presence: an
-// explicitly empty "payload":"" is a legal plain payload, but "payload":""
-// together with any payloadB64 — even an empty one, even one that decodes to
-// the same bytes — still carries two representations of the message content
-// and is rejected. Field order does not change the verdict.
+// bytes. Payloads participate in same-id content comparison, so the empty
+// payload is a legal value and the plain/base64 split is judged by key
+// presence; the shared recovery rules are splitBytesField's. Entries written
+// before payloadB64 existed carry only "payload" and are taken at face value
+// — including payloads an old build had already rewritten to replacement
+// characters, which stay those characters; the lost bytes are never guessed.
 func (e *logEntry) entryPayload() (string, error) {
-	if e.payloadPresent && e.payloadB64Present {
-		return "", fmt.Errorf("submit entry carries both payload and payloadB64")
-	}
-	if !e.payloadB64Present {
-		return e.Payload, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
-	if err != nil {
-		return "", fmt.Errorf("submit entry carries undecodable payloadB64: %v", err)
-	}
-	return string(raw), nil
+	return splitBytesField(e.Payload, e.PayloadB64, e.payloadPresent, e.payloadB64Present,
+		"submit entry carries both payload and payloadB64",
+		"submit entry carries undecodable payloadB64")
 }
 
 // setTo encodes a submit entry's destination chain for the log without
@@ -486,24 +497,16 @@ func (e *logEntry) setTo(to string) {
 }
 
 // entryTo decodes a submit entry's destination chain back to its exact
-// submitted bytes. Entries written before toB64 existed carry only "to" and
-// are taken at face value — including a destination an old build had already
-// rewritten to a replacement character, which stays that character; the lost
-// bytes are never guessed. An entry carrying both fields at once (judged by
-// key presence, the empty string included), or a toB64 that does not decode,
-// is an inconsistent record no build writes and is corrupt.
+// submitted bytes. The destination is half of the replay identity, so the
+// plain/base64 split is judged by key presence (the empty string included);
+// the shared recovery rules are splitBytesField's. Entries written before
+// toB64 existed carry only "to" and are taken at face value — including a
+// destination an old build had already rewritten to a replacement character,
+// which stays that character; the lost bytes are never guessed.
 func (e *logEntry) entryTo() (string, error) {
-	if e.toPresent && e.toB64Present {
-		return "", fmt.Errorf("submit entry carries both to and toB64")
-	}
-	if !e.toB64Present {
-		return e.To, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.ToB64)
-	if err != nil {
-		return "", fmt.Errorf("submit entry carries undecodable toB64: %v", err)
-	}
-	return string(raw), nil
+	return splitBytesField(e.To, e.ToB64, e.toPresent, e.toB64Present,
+		"submit entry carries both to and toB64",
+		"submit entry carries undecodable toB64")
 }
 
 // setConsumeTo records the successful message's destination chain alongside
@@ -519,20 +522,13 @@ func (e *logEntry) setConsumeTo(to string) {
 }
 
 // entryConsumeTo decodes a success entry's consumed destination back to its
-// exact bytes. A record with both consumeTo and consumeToB64 set, or an
-// undecodable consumeToB64, is corrupt.
+// exact bytes. The consumption attribution is the same replay identity as the
+// submit entry's "to", so it uses the same presence-judged split; the shared
+// recovery rules are splitBytesField's.
 func (e *logEntry) entryConsumeTo() (string, error) {
-	if e.consumeToPresent && e.consumeToB64Present {
-		return "", fmt.Errorf("success entry carries both consumeTo and consumeToB64")
-	}
-	if !e.consumeToB64Present {
-		return e.ConsumeTo, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(e.ConsumeToB64)
-	if err != nil {
-		return "", fmt.Errorf("success entry carries undecodable consumeToB64: %v", err)
-	}
-	return string(raw), nil
+	return splitBytesField(e.ConsumeTo, e.ConsumeToB64, e.consumeToPresent, e.consumeToB64Present,
+		"success entry carries both consumeTo and consumeToB64",
+		"success entry carries undecodable consumeToB64")
 }
 
 // legacyNonceKey reproduces the consumption string used by older builds:
