@@ -1317,7 +1317,14 @@ func (s *store) appendHeader(h Header) error {
 	return s.append(e)
 }
 
-func (s *store) appendSubmit(rec *Record) error {
+// newSubmitEntry builds the record that restores one message's original
+// content and first-submission position. It is the single construction rule
+// for both save paths: the incremental appendSubmit writes one per Submit call
+// and compact writes one per snapshotted record, so id, source and destination
+// chains, nonce, payload, proof height, expiry and seq — including the
+// plain/base64 byte preservation for id, destination and payload — are encoded
+// identically in a plain result log and in a compacted log.
+func newSubmitEntry(rec *Record) *logEntry {
 	m := rec.Msg.Message
 	e := &logEntry{
 		T: kindSubmit, Seq: rec.Seq, From: m.From,
@@ -1326,7 +1333,49 @@ func (s *store) appendSubmit(rec *Record) error {
 	e.setID(m.ID)
 	e.setTo(m.To)
 	e.setPayload(m.Payload)
-	return s.append(e)
+	return e
+}
+
+func (s *store) appendSubmit(rec *Record) error {
+	return s.append(newSubmitEntry(rec))
+}
+
+// setSuccessConsumption fills a success entry's consumed triple and attributes
+// it to the successful message id. It is the one fill rule shared by the
+// incremental result path and the compacted-state path, so a success state and
+// its nonce consumption are always written together, as one record, with the
+// same plain/base64 destination and id encoding.
+func setSuccessConsumption(e *logEntry, id string, token *consumeToken) {
+	e.ConsumeFrom = token.from
+	e.setConsumeTo(token.to)
+	e.ConsumeNonce = token.nonce
+	e.setConsumeBy(id)
+}
+
+// newStatusEntry builds one post-processing record from the same message-record
+// fields both save paths persist: kindResult for the incremental appendOutcome
+// path (one outcome per processing), kindState for the compacted snapshot (the
+// message's current status after >=1 attempts). The kind differs only in T and
+// in what replay accepts; every populated field — processing time, status,
+// reason, attempt count, the waiting retry instant and, on success, the
+// consumed triple attributed to this message — is chosen by one rule here, so
+// the two paths can never drift on status meaning, the plain-vs-raw-bytes
+// reason/id encoding, or when a nonce is consumed. nextRetry is the saturated
+// retry instant for a waiting result and zero otherwise (omitted on disk).
+func newStatusEntry(kind string, now, nextRetry int64, attempts int, id, status, reason string, consume *consumeToken) (*logEntry, error) {
+	e := &logEntry{
+		T: kind, Now: now,
+		Status: status, Attempts: attempts, NextRetry: nextRetry,
+	}
+	e.setID(id)
+	e.setReason(reason)
+	if status == StatusSuccess {
+		if consume == nil {
+			return nil, fmt.Errorf("internal error: success result for %q missing nonce consumption", id)
+		}
+		setSuccessConsumption(e, id, consume)
+	}
+	return e, nil
 }
 
 // appendOutcome records one processing result. Every result carries the
@@ -1336,23 +1385,13 @@ func (s *store) appendSubmit(rec *Record) error {
 // negative schedule. On success the consumed triple
 // (consumeFrom/consumeTo/consumeNonce) and its consumer are part of the same
 // durable record, committing together atomically; oc.consume is nil for every
-// non-success status.
+// non-success status. The entry itself is built by newStatusEntry, the same
+// constructor the compacted snapshot uses.
 func (s *store) appendOutcome(now int64, rec *Record, attempts int, nextRetry int64, oc outcome) error {
-	id := rec.Msg.Message.ID
-	e := &logEntry{
-		T: kindResult, Now: now,
-		Status: oc.status, Attempts: attempts, NextRetry: nextRetry,
-	}
-	e.setID(id)
-	e.setReason(oc.reason)
-	if oc.status == StatusSuccess {
-		if oc.consume == nil {
-			return fmt.Errorf("internal error: success result for %q missing nonce consumption", id)
-		}
-		e.ConsumeFrom = oc.consume.from
-		e.setConsumeTo(oc.consume.to)
-		e.ConsumeNonce = oc.consume.nonce
-		e.setConsumeBy(id)
+	e, err := newStatusEntry(kindResult, now, nextRetry, attempts,
+		rec.Msg.Message.ID, oc.status, oc.reason, oc.consume)
+	if err != nil {
+		return err
 	}
 	return s.append(e)
 }
@@ -1408,30 +1447,28 @@ func (s *store) compact(state *loadedState) error {
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 	for _, seq := range seqs {
 		rec := bySeq[seq]
-		m := rec.Msg.Message
-		se := &logEntry{
-			T: kindSubmit, Seq: rec.Seq, From: m.From,
-			Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
-		}
-		se.setID(m.ID)
-		se.setTo(m.To)
-		se.setPayload(m.Payload)
-		entries = append(entries, se)
+		// The submit entry is built by the same constructor the ordinary
+		// appendSubmit path uses, so the snapshot restores the message's
+		// original content and submission position byte for byte.
+		entries = append(entries, newSubmitEntry(rec))
 		if rec.Attempts > 0 {
-			re := &logEntry{
-				T: kindState, Now: rec.LastProcAt,
-				Status: rec.Status, Attempts: rec.Attempts,
-			}
-			re.setID(m.ID)
-			re.setReason(rec.Reason)
+			// The status entry is built by the same constructor the ordinary
+			// appendOutcome path uses, only with kindState: the snapshot saves
+			// the message's current status — not a new attempt — with the same
+			// waiting schedule and success-consumption fill either path writes.
+			nextRetry := int64(0)
+			var consume *consumeToken
 			if rec.Status == StatusWaiting {
-				re.NextRetry = rec.NextRetry
+				nextRetry = rec.NextRetry
 			}
 			if rec.Status == StatusSuccess {
-				re.ConsumeFrom = m.From
-				re.setConsumeTo(m.To)
-				re.ConsumeNonce = m.Nonce
-				re.setConsumeBy(m.ID)
+				t := newConsumeToken(rec.Msg.Message.From, rec.Msg.Message.To, rec.Msg.Message.Nonce)
+				consume = &t
+			}
+			re, err := newStatusEntry(kindState, rec.LastProcAt, nextRetry, rec.Attempts,
+				rec.Msg.Message.ID, rec.Status, rec.Reason, consume)
+			if err != nil {
+				return err
 			}
 			entries = append(entries, re)
 		}
