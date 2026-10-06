@@ -547,8 +547,18 @@ func TestPayloadLegacyRecordsReadAtFaceValue(t *testing.T) {
 // payloadB64, is an inconsistent record no build writes: opening returns
 // ErrCorrupt and leaves the file byte-for-byte untouched — the payload is
 // never treated as empty or as replacement-filled text.
+//
+// Presence is judged by key, not by value: "payload":"" is a legal empty
+// payload on its own, but together with any payloadB64 it is two
+// representations of the message content at once — no matter which side is
+// empty, and even when the two decode to the same bytes. Field order in the
+// JSON object is irrelevant. Every such record below is complete and
+// checksum-valid and sits at the end of the log, so it must be rejected as
+// corruption, never dropped as a torn tail.
 func TestPayloadB64InconsistentRecordsRejected(t *testing.T) {
-	for name, e := range map[string]*logEntry{
+	// Struct-built cases: omitempty drops an empty Payload, so the non-empty
+	// plain clash and the undecodable base64 can use the typed entry.
+	structEntries := map[string]*logEntry{
 		"both payload and payloadB64": {
 			T: kindSubmit, Seq: 0, ID: "m", From: "a", To: "b", Nonce: 1,
 			Payload: "x", PayloadB64: "eA==", ProofAt: 10,
@@ -557,7 +567,16 @@ func TestPayloadB64InconsistentRecordsRejected(t *testing.T) {
 			T: kindSubmit, Seq: 0, ID: "m", From: "a", To: "b", Nonce: 1,
 			PayloadB64: "!!!not-base64!!!", ProofAt: 10,
 		},
-	} {
+	}
+	// Raw-JSON cases: the "payload":"" key must literally be present, which
+	// the omitempty struct tag would erase on marshal.
+	rawPayloads := map[string]string{
+		"empty payload plus payloadB64 of 0xff":     `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payload":"","payloadB64":"/w=="}`,
+		"empty payload plus empty payloadB64":       `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payload":"","payloadB64":""}`,
+		"plain and payloadB64 decode to same bytes": `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payloadB64":"eA==","payload":"x"}`,
+		"payloadB64 first, plain payload second":    `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payloadB64":"/w==","payload":""}`,
+	}
+	for name, e := range structEntries {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			var raw []byte
@@ -566,6 +585,108 @@ func TestPayloadB64InconsistentRecordsRejected(t *testing.T) {
 			raw = append(raw, encodeFrame(mustMarshal(e))...)
 			writeRawLog(t, dir, raw)
 			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+	for name, payload := range rawPayloads {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(payload))...)
+			writeRawLog(t, dir, raw)
+			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+}
+
+// A dual-payload record rejects the whole directory even when intact,
+// acknowledged messages precede it — whether it sits at the end of a live log
+// or among the submit records of a compacted one. No usable queue comes back
+// and no partial state is recovered; the log keeps every byte.
+func TestPayloadB64ClashAfterValidRecordsRejected(t *testing.T) {
+	clash := `{"t":"submit","seq":1,"id":"bad","from":"a","to":"b","nonce":2,"proofAt":10,"payload":"","payloadB64":"/w=="}`
+	for name, mid := range map[string][]*logEntry{
+		// Live-log shape: a plain pending submit precedes the clashing record.
+		"after plain submit": {},
+		// Compacted-log shape: a processed message (submit plus its snapshot)
+		// precedes the clashing record.
+		"after compacted submit and state": {
+			{T: kindState, ID: "ok", Now: 100, Status: StatusSuccess, Attempts: 1,
+				ConsumeFrom: "a", ConsumeTo: "b", ConsumeNonce: 1, ConsumeBy: "ok"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{
+				T: kindSubmit, Seq: 0, ID: "ok", From: "a", To: "b", Nonce: 1,
+				Payload: "fine", ProofAt: 10,
+			}))...)
+			for _, e := range mid {
+				raw = append(raw, encodeFrame(mustMarshal(e))...)
+			}
+			raw = append(raw, encodeFrame([]byte(clash))...)
+			writeRawLog(t, dir, raw)
+			assertCorruptAndUntouched(t, dir, raw)
+		})
+	}
+}
+
+// The empty payload keeps its long-standing meaning through every legal
+// on-disk shape, and a sole payloadB64 still restores its bytes: the
+// presence-based clash check must never mistake an omitted key for an
+// empty-but-present one.
+func TestPayloadEmptyOmittedAndSoleB64StillAccepted(t *testing.T) {
+	payloadFF := string([]byte{0xFF})
+	cases := map[string]struct {
+		payload string
+		want    string
+	}{
+		"explicit empty payload": {
+			payload: `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payload":""}`,
+			want:    "",
+		},
+		"both payload keys omitted (historical empty payload)": {
+			payload: `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10}`,
+			want:    "",
+		},
+		"sole empty payloadB64": {
+			payload: `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payloadB64":""}`,
+			want:    "",
+		},
+		"sole payloadB64 restores its bytes": {
+			payload: `{"t":"submit","seq":0,"id":"m","from":"a","to":"b","nonce":1,"proofAt":10,"payloadB64":"/w=="}`,
+			want:    payloadFF,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			var raw []byte
+			raw = append(raw, logMagic...)
+			raw = append(raw, encodeFrame(mustMarshal(&logEntry{T: kindVersion, V: currentLogV}))...)
+			raw = append(raw, encodeFrame([]byte(tc.payload))...)
+			writeRawLog(t, dir, raw)
+
+			q := reopen(t, dir)
+			defer q.Close()
+			got, ok := q.Query("m")
+			if !ok {
+				t.Fatalf("message lost on replay")
+			}
+			if got.Payload != tc.want {
+				t.Fatalf("payload restored as % x, want % x", got.Payload, tc.want)
+			}
+			// A byte-identical resubmit is the existing record, proving the
+			// restored bytes are the real payload, not a conflated empty one.
+			same := Envelope{Message: Message{ID: "m", From: "a", To: "b", Nonce: 1,
+				Payload: tc.want, ProofAt: 10}}
+			if _, err := q.Submit(same); err != nil {
+				t.Fatalf("identical resubmit of restored payload: %v", err)
+			}
 		})
 	}
 }

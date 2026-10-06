@@ -84,11 +84,14 @@ import (
 // base64-encoded in "payloadB64". The bytes 0xFF, 0xFE and the legal
 // character U+FFFD are three different payloads and are never conflated.
 // Payloads an older build already rewrote to replacement characters stay
-// those characters on replay — again, the lost bytes are never guessed. A
-// checksum-valid record carrying an undecodable payloadB64, or both payload
-// fields at once, is no record any build writes and rejects the directory
-// with ErrCorrupt, leaving the file untouched — it is never read back as an
-// empty or replacement-filled payload.
+// those characters on replay — again, the lost bytes are never guessed. The
+// two representations are mutually exclusive by key presence: a record that
+// carries "payload" and "payloadB64" together — even when one is the empty
+// string, and even when the two happen to decode to the same bytes — is an
+// inconsistent record no build writes, as is a checksum-valid record carrying
+// an undecodable payloadB64; both reject the directory with ErrCorrupt,
+// leaving the file untouched — the payload is never read back as an empty or
+// replacement-filled one.
 //
 // Message ids have the same contract and use the same encoding: identity is
 // judged by the id's exact bytes, never by its display form. The Go submit
@@ -168,6 +171,16 @@ type logEntry struct {
 	rootPresent    bool
 	rootB64Present bool
 
+	// payloadPresent and payloadB64Present report whether the replayed JSON
+	// record literally carried the "payload"/"payloadB64" keys, distinct from
+	// the decoded value (which may be the empty string). Like the root flags,
+	// they exist so an explicitly empty "payload":"" stays a legal empty
+	// payload while "payload":"" together with any payloadB64 — even one that
+	// decodes to the same bytes, or to the empty payload — still carries two
+	// representations of the message content and is rejected.
+	payloadPresent    bool
+	payloadB64Present bool
+
 	Seq       int64  `json:"seq,omitempty"`
 	ID        string `json:"id,omitempty"`
 	From      string `json:"from,omitempty"`
@@ -236,6 +249,8 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 	}
 	_, e.rootPresent = keys["root"]
 	_, e.rootB64Present = keys["rootB64"]
+	_, e.payloadPresent = keys["payload"]
+	_, e.payloadB64Present = keys["payloadB64"]
 	return nil
 }
 
@@ -369,18 +384,21 @@ func (e *logEntry) setPayload(payload string) {
 }
 
 // entryPayload decodes a submit entry's payload back to its exact submitted
-// bytes. Entries written before payloadB64 existed carry only "payload" and
-// are taken at face value — including payloads an old build had already
-// rewritten to replacement characters, which stay those characters; the lost
-// bytes are never guessed. An entry carrying both fields, or a payloadB64
-// that does not decode, is an inconsistent record no build writes and is
-// corrupt; it is never read back as an empty or replacement-filled payload.
+// bytes. Entries written before payloadB64 existed carry only "payload" (or
+// neither key, for the empty payload) and are taken at face value — including
+// payloads an old build had already rewritten to replacement characters, which
+// stay those characters; the lost bytes are never guessed. The two
+// representations are mutually exclusive by key presence: an entry carrying
+// both "payload" and "payloadB64" — no matter which of them is empty, and even
+// when the two decode to the same bytes — is an inconsistent record no build
+// writes and is corrupt, as is a payloadB64 that does not decode; the payload
+// is never read back as an empty or replacement-filled one.
 func (e *logEntry) entryPayload() (string, error) {
-	if e.PayloadB64 == "" {
-		return e.Payload, nil
-	}
-	if e.Payload != "" {
+	if e.payloadPresent && e.payloadB64Present {
 		return "", fmt.Errorf("submit entry carries both payload and payloadB64")
+	}
+	if !e.payloadB64Present {
+		return e.Payload, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(e.PayloadB64)
 	if err != nil {
