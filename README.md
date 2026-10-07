@@ -33,7 +33,10 @@ go run ./cmd/relayproof normalize < logs.jsonl
   RFC3339Nano 输出（保留实际精度、去掉小数尾零）；`action` 为去首尾空白后的非空字符串；`source_ip` 必须是
   不带端口的合法 IPv4/IPv6，同一地址的不同写法输出相同结果。
 - 标准名与别名同时出现时分别规范化后比较：一致则合并，不一致则整条失败；
-  `null` 或类型不符按失败处理，重复顶层键同样失败。
+  `null` 或类型不符按失败处理，重复顶层键同样失败。`action`/`event_type`
+  同时提供时“比较的是什么、哪些写法算同一个动作、哪些看起来相同的文字仍会
+  失败”，见下文
+  [action 与 event_type 同时提供：合并与冲突怎么判定](#action-与-event_type-同时提供合并与冲突怎么判定)。
 - 未参与映射的顶层字段（包括输入自带的 `extra`）各自作为独立成员进入输出事件的
   `extra` 对象，值以原始 JSON 携带；映射不深入未知字段内部，“原样”也不是逐字节
   复制。成员边界、证据值保留语义与完整示例见下文
@@ -176,6 +179,161 @@ normalize` 逐行复现），所以行号始终是 1。
 ```json
 {"line":1,"ok":false,"error":"missing required field \"timestamp\""}
 ```
+
+### action 与 event_type 同时提供：合并与冲突怎么判定
+
+`event_type` 是 `action` 的别名。同一行同时写出这两个键时，不是“以谁为准、
+忽略另一个”，而是把两个值分别规范化后比较，由比较结果决定整行成败。本节说明
+比较的对象、哪些写法算同一个动作、哪些看起来相同的文字仍会让整行失败。
+
+#### 比较的是解码并去首尾空白后的实际内容
+
+- 先把两个值各自作为 JSON 字符串解码——`\uXXXX` 转义与代理项对在这一步还原成
+  实际字符——再对解码后的内容**分别**去掉首尾 Unicode 空白（与单值时的动作去
+  空白相同）。比较的是这两步之后的实际内容：剩余文字完全相同（逐码点一致），
+  两个键合并为一个 `action`；有任何差别，整行失败。
+- 合并后事件里只有一个 `action` 成员，值就是去首尾空白后的内容；`event_type`
+  已被消费，**不会作为扩展字段在 `extra` 里再次出现**。
+- 普通空格 U+0020、不换行空格 U+00A0、全角空格 U+3000 写在值的两端都会被去掉。
+  同一个字符直接书写（UTF-8 字节）或用合法 JSON 转义书写（如 `\u00a0`，或
+  代理项对 `\uD83D\uDE00`），解码后是同一个字符，比较结果相同。
+
+例：转义拼写、不换行空格与普通空格合并为一个动作（成功）。输入的 `action`
+用 JSON 转义拼写、两端是不换行空格 U+00A0，`event_type` 两端是普通空格：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","action":"\u00a0login\u00a0","event_type":" login "}
+```
+
+输出（两端空白各自去掉后剩余文字都是 `login`，合并成功；退出状态 `0`，标准
+错误为空）：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+```
+
+把 `\u00a0` 换成 `\u3000`（全角空格）结果相同；同一个表情直接书写（`"😀"`）
+与写成代理项对转义（`"\uD83D\uDE00"`）也会合并。无论哪种写法，事件里始终
+只有 `action`，没有 `event_type`，`extra` 也不出现。
+
+#### 比较区分大小写，也不把不同字符统一成一种写法
+
+- 比较是逐码点的精确比较，**区分大小写**：`Login` 与 `login` 是两个不同的
+  动作，同时提供即冲突，不会合并成其中任何一种写法。例如
+  `{"timestamp":"2026-10-04T08:30:00Z","action":"Login","event_type":"login"}`
+  失败为 `field "action" has conflicting values: "Login" and "login"`。
+- 规范化**不做 Unicode 规范化**，不会把不同字符组成的文字改成统一写法：单个
+  码点 U+00E9 的 `é`（预组合形式）与 U+0065 `e` 后接 U+0301（组合用尖音符）
+  的两码点形式，显示上几乎一样，仍是两个不同的动作。
+
+后一组的完整冲突示例如下。为了让复制时不丢失差别，输入用 JSON 转义明确标出
+码点：`caf\u00e9` 是 `c`、`a`、`f` 加**单个** U+00E9；`cafe\u0301` 是 `c`、`a`、
+`f`、`e`（U+0065）后接 U+0301。
+
+输入：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","action":"caf\u00e9","event_type":"cafe\u0301"}
+```
+
+输出（退出状态 `1`，标准错误为空）：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\" has conflicting values: \"café\" and \"café\""}
+```
+
+原因里的两个值在终端上通常显示得一模一样，但字节不同：前者是
+`63 61 66 c3 a9`（`caf` 加 U+00E9 的 UTF-8），后者是 `63 61 66 65 cc 81`
+（`cafe` 加 U+0301 的 UTF-8），可用 `xxd` 核对。判定按解码后的码点序列，
+不按显示效果。
+
+这两种文字**各自单独提供都合法**：`"action":"caf\u00e9"` 单独一行、
+`"event_type":"cafe\u0301"` 单独一行都成功（退出状态 `0`），且输出保持各自的
+组合方式，不会互相改写：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"café"}}
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"café"}}
+```
+
+冲突完全来自“同一行同时提供了两个内容不同的动作”，不是字符损坏：失败原因是
+`conflicting values`，不是 `invalid UTF-8` 或 `unpaired Unicode escape`
+（字符损坏的判定见
+[字符损坏的字节位置：从失败记录找回原始字节](#字符损坏的字节位置从失败记录找回原始字节)）。
+失败记录带原始行号与 `action` 的冲突原因，不携带 `event`。
+
+#### 首尾去空白不等于删除不可见字符
+
+去空白只去掉 Unicode 定义为空白的首尾字符，**不是**删除所有看不见的字符：
+
+- **U+200B 零宽空格不是空白，属于动作内容**，写在开头或结尾都会保留。因此
+  `"action":"\u200blogin"` 与 `"event_type":"login"` 同时提供时冲突（退出状态
+  `1`）：
+
+  ```json
+  {"line":1,"ok":false,"error":"field \"action\" has conflicting values: \"\\u200blogin\" and \"login\""}
+  ```
+
+  原因里不可见的 U+200B 以 `\u200b` 转义形式印出。而 `"action":"\u200b"` 单独
+  提供是**合法的非空动作**——去首尾空白后仍剩一个码点，成功事件的动作就是这个
+  零宽空格本身：
+
+  ```json
+  {"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"​"}}
+  ```
+
+  输出里它是原始 UTF-8 字节 `e2 80 8b`（引号之间看似空无一物），可用 `xxd`
+  核对。
+- 字符串**中间**的字符一律不参与去空白，全部计入比较：`"log in"` 与
+  `"login"` 只差中间一个空格，同时提供同样冲突，不会被删成同一个动作。
+
+#### 任一边去空白后为空，整行按空动作失败
+
+只要 `action`、`event_type` 中**任意一个**的值去掉首尾空白后为空（`""`、
+`"   "`、纯 `"\u00a0"`、纯 `"\u3000"` 等），整行就按空动作失败——**不能忽略
+空值、采用另一边的合法值**：
+
+```json
+{"timestamp":"2026-10-04T08:30:00Z","action":"   ","event_type":"login"}
+```
+
+输出（退出状态 `1`）：
+
+```json
+{"line":1,"ok":false,"error":"field \"action\": action must not be empty"}
+```
+
+把空值换到 `event_type`、合法值 `login` 放在 `action`，结果完全相同。这是
+空值错误，不是冲突（原因里没有 `conflicting values`），也不是“缺少
+action”。
+
+#### 例：一批日志里的合并、冲突与空动作
+
+下面四行的时间、地址等其余字段都合法，结果差异完全归因于动作字段：第 2 行是
+上面的 é 冲突，第 3 行有一边去空白后为空。
+
+```bash
+./bin/relayproof normalize <<'EOF'
+{"timestamp":"2026-10-04T08:30:00Z","action":"login","source_ip":"192.0.2.7"}
+{"timestamp":"2026-10-04T08:31:00Z","action":"caf\u00e9","event_type":"cafe\u0301"}
+{"timestamp":"2026-10-04T08:32:00Z","action":"   ","event_type":"login"}
+{"timestamp":"2026-10-04T08:33:00Z","action":"logout"}
+EOF
+echo "exit=$?"
+```
+
+标准输出（两条失败记录各带原始行号与原因、不携带 `event`；失败行不阻止后续
+合法日志处理。退出状态 `1`，标准错误为空）：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","source_ip":"192.0.2.7","action":"login"}}
+{"line":2,"ok":false,"error":"field \"action\" has conflicting values: \"café\" and \"café\""}
+{"line":3,"ok":false,"error":"field \"action\": action must not be empty"}
+{"line":4,"ok":true,"event":{"timestamp":"2026-10-04T08:33:00Z","action":"logout"}}
+```
+
+`exit=1` 对应[标准输出、标准错误与退出状态](#标准输出标准错误与退出状态)中
+“输入输出正常结束、但存在失败行”的情形。
 
 ### 字符损坏的字节位置：从失败记录找回原始字节
 
