@@ -185,6 +185,23 @@ import (
 // corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
 // and bytes are preserved.
 //
+// Expiry validation on replay: a success — a plain result or a compacted
+// state — is a recorded delivery, so just like a live advance it is only
+// legal when its own processing time is strictly before the message's saved
+// absolute expiry: a live advance terminalizes as expired once the processing
+// time reaches the expiry (equal included), so a success stamped at or after
+// it — however complete, checksum-valid, covered and correctly attributed — is
+// an outcome no legal advance could have produced, and recovery must not
+// resurrect it to consume the nonce. The judgment uses only the success's own
+// processing time and the expiry saved with the message — never the wall clock
+// at open time, a later queue-wide checkpoint, or the compaction time — so a
+// success made legitimately before its deadline keeps reopening long after the
+// deadline passed, and compaction never makes a completed success expire
+// again. An expiry of zero means "never expire" and imposes no deadline; it is
+// not a deadline at time zero. A complete, checksum-valid success that violates
+// this is corrupt (ErrCorrupt), never a truncatable torn tail, so the log's
+// length and bytes are preserved.
+//
 // Source-registration validation on replay: a success — a plain result or a
 // compacted state — is a recorded delivery, so just like a live advance it is
 // only legal when the message's own source chain was registered. A saved
@@ -1347,13 +1364,38 @@ func validateSuccessCoverage(s *loadedState, rec *Record, e *logEntry, rk recove
 		rk.entryNoun, e.ID, m.From, hs.trusted.Height, m.ProofAt)
 }
 
+// validateSuccessExpiry enforces, for a recovered success — a plain result or
+// a compacted state — the same expiry precondition a live advance applies: a
+// success may only be recorded at a processing time strictly before the
+// message's saved absolute expiry. A live advance terminalizes as expired once
+// now >= ExpiresAt (equal included), so a success stamped at the expiry instant
+// or later — however complete, checksum-valid, covered and correctly attributed
+// — is an outcome no legal advance could have produced, and recovery must not
+// resurrect it to consume the nonce. The rule compares only the success's own
+// processing time against the expiry saved with the message's submit record:
+// never the wall clock at open time, the time the queue later advanced to, or
+// the compaction time. An expiry of zero means "never expire" and imposes no
+// deadline — it is not a deadline at time zero.
+func validateSuccessExpiry(rec *Record, e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	expiry := rec.Msg.ExpiresAt
+	if expiry != 0 && e.Now >= expiry {
+		return corrupt("success %s for %q is stamped at processing time %d at or after its saved absolute expiry %d",
+			rk.entryNoun, e.ID, e.Now, expiry)
+	}
+	return nil
+}
+
 // acceptRecoveryStatus is the second shared check, run after the
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
 // sole legacy-overflow exception repaired in memory) and no consumption,
 // success must come from a source chain registered no later than the success
-// record and be covered by a trusted header of the message's own source
-// chain saved no later than the success record, keep no retry time and
+// record, be covered by a trusted header of the message's own source chain
+// saved no later than the success record, be stamped strictly before the
+// message's saved absolute expiry (zero means never), keep no retry time and
 // consume its own (from,to,nonce) attributed to itself, and terminal
 // failures carry neither a retry time nor consumption fields. The repaired
 // retry time of a legacy overflowed schedule is written back onto e.
@@ -1377,8 +1419,12 @@ func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryK
 		if e.NextRetry != 0 {
 			return corrupt("success %s for %q carries retry time", rk.entryNoun, e.ID)
 		}
-		// Registration first, then coverage — the same order a live advance
-		// judges a due message (unknown-source before waiting/delivery).
+		// Expiry first, then registration and coverage — the same order a live
+		// advance judges a due message (the replay/expiry hold before
+		// unknown-source and waiting/delivery).
+		if err := validateSuccessExpiry(rec, e, rk); err != nil {
+			return err
+		}
 		if err := validateSuccessRegistration(s, rec, e, rk); err != nil {
 			return err
 		}
