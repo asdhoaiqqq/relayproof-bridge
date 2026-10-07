@@ -350,13 +350,16 @@ func (e *logEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// splitFieldSpec is one plain/base64 field pair's recovery policy: the JSON
-// key names, a way to read the two decoded values off a replayed entry, and
-// the field's own wording for the two corruption verdicts. Every pair shares
-// exactly one byte-preservation rule set — implemented once in decode — and
-// differs only in this descriptor, so each value keeps its business meaning
-// (header root, message payload, destination chain, consumed destination) and
-// its existing, field-specific error text.
+// splitFieldSpec is one plain/base64 field pair's descriptor: the JSON key
+// names, ways to read and write the two slots on a log entry, and the field's
+// own wording for the two corruption verdicts. Every pair shares exactly one
+// byte-preservation rule set — the write half in encode and the read half in
+// decode, each implemented once — and differs only in this descriptor, so
+// each value keeps its business meaning (message id, processing reason,
+// header root, message payload, source and destination chains, and the
+// success entry's consumed triple) and its existing, field-specific error
+// text. Adding another raw-bytes field means adding one descriptor, not
+// another copy of the UTF-8/base64 or presence/empty/decode handling.
 //
 // plainKey is empty for fields that predate presence tracking (id/idB64,
 // reason/reasonB64, consumeBy/consumeByB64): those pairs keep their historical
@@ -367,6 +370,7 @@ type splitFieldSpec struct {
 	b64Key         string
 	plain          func(e *logEntry) string
 	b64            func(e *logEntry) string
+	set            func(e *logEntry, plain, b64 string)
 	bothErr        string
 	undecodableErr string
 }
@@ -413,12 +417,37 @@ func (s splitFieldSpec) decode(e *logEntry) (string, error) {
 	return string(raw), nil
 }
 
+// encode is the single write half of the plain/base64 field split every
+// raw-bytes log value uses, the exact inverse of decode:
+//
+//   - A value that is valid UTF-8 is written to the plain slot unchanged, so
+//     ordinary text, Chinese, colons, whitespace and U+0000 keep the
+//     historical plain field (the empty value included), and existing logs
+//     stay byte-compatible.
+//   - A value holding invalid UTF-8 bytes would be silently rewritten to
+//     U+FFFD by JSON string encoding, so it is base64-encoded into the b64
+//     slot instead, preserving the exact byte sequence across save, reopen
+//     and compaction.
+//
+// The two slots are always written through set together, so one field can
+// never carry both representations at once: the slot the value does not use
+// is cleared. The rule takes no position on what the bytes mean — that is the
+// caller's field — it only chooses the representation.
+func (s splitFieldSpec) encode(e *logEntry, value string) {
+	if utf8.ValidString(value) {
+		s.set(e, value, "")
+		return
+	}
+	s.set(e, "", base64.StdEncoding.EncodeToString([]byte(value)))
+}
+
 // splitFields is the one place each plain/base64 log pair is declared: the
 // JSON key names, accessors and field-specific corruption wording. Adding a
 // raw-bytes field means adding one descriptor, not another copy of the
-// presence/empty/decode-error handling. Message id, result reason and the
-// success entry's consuming id share the same decoder through these
-// descriptors too; their pairs keep value-based exclusion (empty plainKey).
+// UTF-8/base64 or presence/empty/decode-error handling. Message id, result
+// reason and the success entry's consuming id share the same encode/decode
+// through these descriptors too; their pairs keep value-based exclusion
+// (empty plainKey).
 var splitFields = struct {
 	id          splitFieldSpec
 	reason      splitFieldSpec
@@ -435,6 +464,7 @@ var splitFields = struct {
 		b64Key:         "idB64",
 		plain:          func(e *logEntry) string { return e.ID },
 		b64:            func(e *logEntry) string { return e.IDB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.ID, e.IDB64 = plain, b64 },
 		bothErr:        "entry carries both id and idB64",
 		undecodableErr: "entry carries undecodable idB64",
 	},
@@ -442,6 +472,7 @@ var splitFields = struct {
 		b64Key:         "reasonB64",
 		plain:          func(e *logEntry) string { return e.Reason },
 		b64:            func(e *logEntry) string { return e.ReasonB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.Reason, e.ReasonB64 = plain, b64 },
 		bothErr:        "entry carries both reason and reasonB64",
 		undecodableErr: "entry carries undecodable reasonB64",
 	},
@@ -449,6 +480,7 @@ var splitFields = struct {
 		b64Key:         "consumeByB64",
 		plain:          func(e *logEntry) string { return e.ConsumeBy },
 		b64:            func(e *logEntry) string { return e.ConsumeByB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.ConsumeBy, e.ConsumeByB64 = plain, b64 },
 		bothErr:        "success entry carries both consumeBy and consumeByB64",
 		undecodableErr: "success entry carries undecodable consumeByB64",
 	},
@@ -457,6 +489,7 @@ var splitFields = struct {
 		b64Key:         "rootB64",
 		plain:          func(e *logEntry) string { return e.Root },
 		b64:            func(e *logEntry) string { return e.RootB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.Root, e.RootB64 = plain, b64 },
 		bothErr:        "header entry carries both root and rootB64",
 		undecodableErr: "header entry carries undecodable rootB64",
 	},
@@ -465,6 +498,7 @@ var splitFields = struct {
 		b64Key:         "payloadB64",
 		plain:          func(e *logEntry) string { return e.Payload },
 		b64:            func(e *logEntry) string { return e.PayloadB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.Payload, e.PayloadB64 = plain, b64 },
 		bothErr:        "submit entry carries both payload and payloadB64",
 		undecodableErr: "submit entry carries undecodable payloadB64",
 	},
@@ -473,6 +507,7 @@ var splitFields = struct {
 		b64Key:         "toB64",
 		plain:          func(e *logEntry) string { return e.To },
 		b64:            func(e *logEntry) string { return e.ToB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.To, e.ToB64 = plain, b64 },
 		bothErr:        "submit entry carries both to and toB64",
 		undecodableErr: "submit entry carries undecodable toB64",
 	},
@@ -481,6 +516,7 @@ var splitFields = struct {
 		b64Key:         "fromB64",
 		plain:          func(e *logEntry) string { return e.From },
 		b64:            func(e *logEntry) string { return e.FromB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.From, e.FromB64 = plain, b64 },
 		bothErr:        "submit entry carries both from and fromB64",
 		undecodableErr: "submit entry carries undecodable fromB64",
 	},
@@ -489,6 +525,7 @@ var splitFields = struct {
 		b64Key:         "chainB64",
 		plain:          func(e *logEntry) string { return e.Chain },
 		b64:            func(e *logEntry) string { return e.ChainB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.Chain, e.ChainB64 = plain, b64 },
 		bothErr:        "entry carries both chain and chainB64",
 		undecodableErr: "entry carries undecodable chainB64",
 	},
@@ -497,6 +534,7 @@ var splitFields = struct {
 		b64Key:         "consumeToB64",
 		plain:          func(e *logEntry) string { return e.ConsumeTo },
 		b64:            func(e *logEntry) string { return e.ConsumeToB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.ConsumeTo, e.ConsumeToB64 = plain, b64 },
 		bothErr:        "success entry carries both consumeTo and consumeToB64",
 		undecodableErr: "success entry carries undecodable consumeToB64",
 	},
@@ -505,6 +543,7 @@ var splitFields = struct {
 		b64Key:         "consumeFromB64",
 		plain:          func(e *logEntry) string { return e.ConsumeFrom },
 		b64:            func(e *logEntry) string { return e.ConsumeFromB64 },
+		set:            func(e *logEntry, plain, b64 string) { e.ConsumeFrom, e.ConsumeFromB64 = plain, b64 },
 		bothErr:        "success entry carries both consumeFrom and consumeFromB64",
 		undecodableErr: "success entry carries undecodable consumeFromB64",
 	},
@@ -512,13 +551,7 @@ var splitFields = struct {
 
 // setID encodes a message id for the log without altering its bytes.
 func (e *logEntry) setID(id string) {
-	if utf8.ValidString(id) {
-		e.ID = id
-		e.IDB64 = ""
-		return
-	}
-	e.ID = ""
-	e.IDB64 = base64.StdEncoding.EncodeToString([]byte(id))
+	splitFields.id.encode(e, id)
 }
 
 // entryID decodes an entry's id back to its exact submitted bytes.
@@ -530,13 +563,7 @@ func (e *logEntry) entryID() (string, error) {
 // its bytes. Reasons may quote a raw-bytes message id (replay) or chain name
 // (unknown source).
 func (e *logEntry) setReason(reason string) {
-	if utf8.ValidString(reason) {
-		e.Reason = reason
-		e.ReasonB64 = ""
-		return
-	}
-	e.Reason = ""
-	e.ReasonB64 = base64.StdEncoding.EncodeToString([]byte(reason))
+	splitFields.reason.encode(e, reason)
 }
 
 // entryReason decodes a result/snapshot entry's reason back to its exact bytes.
@@ -547,13 +574,7 @@ func (e *logEntry) entryReason() (string, error) {
 // setConsumeBy records the successful message's raw id alongside the consumed
 // triple, using the same plain/base64 split as the id field.
 func (e *logEntry) setConsumeBy(id string) {
-	if utf8.ValidString(id) {
-		e.ConsumeBy = id
-		e.ConsumeByB64 = ""
-		return
-	}
-	e.ConsumeBy = ""
-	e.ConsumeByB64 = base64.StdEncoding.EncodeToString([]byte(id))
+	splitFields.consumeBy.encode(e, id)
 }
 
 // entryConsumeBy decodes the consuming message id back to its exact bytes.
@@ -568,11 +589,7 @@ func (e *logEntry) entryConsumeBy() (string, error) {
 // string encoding, so it is instead stored base64-encoded in "rootB64",
 // preserving the exact byte sequence across save, reopen and compaction.
 func (e *logEntry) setRoot(root string) {
-	if utf8.ValidString(root) {
-		e.Root = root
-		return
-	}
-	e.RootB64 = base64.StdEncoding.EncodeToString([]byte(root))
+	splitFields.root.encode(e, root)
 }
 
 // headerRoot decodes a header entry's root back to its exact submitted
@@ -599,11 +616,7 @@ func (e *logEntry) headerRoot() (string, error) {
 // is instead stored base64-encoded in "payloadB64", preserving the exact
 // byte sequence and order across save, reopen and compaction.
 func (e *logEntry) setPayload(payload string) {
-	if utf8.ValidString(payload) {
-		e.Payload = payload
-		return
-	}
-	e.PayloadB64 = base64.StdEncoding.EncodeToString([]byte(payload))
+	splitFields.payload.encode(e, payload)
 }
 
 // entryPayload decodes a submit entry's payload back to its exact submitted
@@ -633,11 +646,7 @@ func (e *logEntry) entryPayload() (string, error) {
 // preserving the exact byte sequence across save, reopen and compaction — the
 // destination is half of the replay identity and must never change identity.
 func (e *logEntry) setTo(to string) {
-	if utf8.ValidString(to) {
-		e.To = to
-		return
-	}
-	e.ToB64 = base64.StdEncoding.EncodeToString([]byte(to))
+	splitFields.to.encode(e, to)
 }
 
 // entryTo decodes a submit entry's destination chain back to its exact
@@ -658,11 +667,7 @@ func (e *logEntry) entryTo() (string, error) {
 // "to" field, so the consumption attribution survives invalid UTF-8 byte for
 // byte.
 func (e *logEntry) setConsumeTo(to string) {
-	if utf8.ValidString(to) {
-		e.ConsumeTo = to
-		return
-	}
-	e.ConsumeToB64 = base64.StdEncoding.EncodeToString([]byte(to))
+	splitFields.consumeTo.encode(e, to)
 }
 
 // entryConsumeTo decodes a success entry's consumed destination back to its
@@ -684,11 +689,7 @@ func (e *logEntry) entryConsumeTo() (string, error) {
 // the replay identity and of registration/header-coverage lookup, and must
 // never change identity.
 func (e *logEntry) setFrom(from string) {
-	if utf8.ValidString(from) {
-		e.From = from
-		return
-	}
-	e.FromB64 = base64.StdEncoding.EncodeToString([]byte(from))
+	splitFields.from.encode(e, from)
 }
 
 // entryFrom decodes a submit entry's source chain back to its exact submitted
@@ -710,11 +711,7 @@ func (e *logEntry) entryFrom() (string, error) {
 // headers must take effect for exactly the byte sequence they were saved
 // with, never for what a display layer happens to render.
 func (e *logEntry) setChain(chain string) {
-	if utf8.ValidString(chain) {
-		e.Chain = chain
-		return
-	}
-	e.ChainB64 = base64.StdEncoding.EncodeToString([]byte(chain))
+	splitFields.chain.encode(e, chain)
 }
 
 // entryChain decodes a source or header entry's chain name back to its exact
@@ -735,11 +732,7 @@ func (e *logEntry) entryChain() (string, error) {
 // "from" field, so the consumption attribution survives invalid UTF-8 byte
 // for byte.
 func (e *logEntry) setConsumeFrom(from string) {
-	if utf8.ValidString(from) {
-		e.ConsumeFrom = from
-		return
-	}
-	e.ConsumeFromB64 = base64.StdEncoding.EncodeToString([]byte(from))
+	splitFields.consumeFrom.encode(e, from)
 }
 
 // entryConsumeFrom decodes a success entry's consumed source back to its
