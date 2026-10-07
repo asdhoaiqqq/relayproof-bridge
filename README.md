@@ -45,6 +45,8 @@ go run ./cmd/relayproof normalize < logs.jsonl
   失败，绝不把损坏字符替换成“�”后再做字段映射、别名比较或存入 extra，也不通过
   删除字节、补齐转义或替换字符来修复。合法中文、表情、正确配对的代理项转义以及
   用户明确输入的合法“�”字符照常可用；`\\` 转义后的 `uD800` 只是普通文本，原样保留。
+  失败原因中 `at byte offset N` 的位置怎样对应回原始日志，见
+  [字符损坏的定位：at byte offset N 与原始日志的对应](#字符损坏的定位at-byte-offset-n-与原始日志的对应)。
 
 ### 多处错误的报告顺序
 
@@ -173,6 +175,165 @@ normalize` 逐行复现），所以行号始终是 1。
 ```json
 {"line":1,"ok":false,"error":"missing required field \"timestamp\""}
 ```
+
+### 字符损坏的定位：at byte offset N 与原始日志的对应
+
+字符完整性检查（见[字段规则](#字段规则)）失败时，原因里带一个位置：
+
+- `invalid UTF-8 encoding at byte offset N`
+- `unpaired Unicode escape \uXXXX at byte offset N: high surrogate must be
+  followed immediately by a low surrogate escape`（或 `low surrogate must
+  follow a high surrogate escape`）
+
+本节说明 N 怎样对应回输入日志里的原始字节。这类失败与其他行级失败一样：
+标准输出只有一条带原始物理行号的 `ok:false` 记录，只有一个 `error`、不带
+`event`，后续行照常处理，仅有日志行失败时退出状态为 `1`、标准错误为空。
+
+#### N 从哪开始数
+
+- **N 从零开始，针对的是该行去掉首尾合法 JSON 空白之后的内容。** 被去掉的
+  只有空格（U+0020）、制表符（U+0009）、回车（U+000D）、换行（U+000A）四种；
+  行首、行尾的这类字符不占 N。对象**内部**的空白（成员之间的空格、缩进等）
+  仍是内容的一部分，照常占字节。
+- **N 不是整批输入的累计位置。** 每一行各自从 0 数起；`line` 仍是原始物理
+  行号，前面的空白行会占行号，却不会给当前行的 N 增加任何字节。
+- **N 不是屏幕上显示的第几个字。** 中文、表情以及 `\uXXXX` 反斜线转义都按
+  输入时实际占用的字节计算：一个汉字 3 字节、一个表情 4 字节、一段
+  `\uXXXX` 转义是 6 个 ASCII 字节。
+- **错误出现在未知字段的嵌套对象或数组里时，起点也不会改。** N 始终从整行
+  内容的开头数起，不会改成该未知字段、或内层对象/数组的开头。
+
+因此用 N 定位原始字节的做法是：取出 `line` 指定的物理行，去掉行首行尾的
+空格/制表/回车/换行，再从 0 数 N 个字节。用 shell 验证（`tail -c` 从 1 数
+起，所以偏移 N 对应 `tail -c +N+1`）：
+
+```bash
+printf '%s' '<去掉首尾空白后的该行内容>' | tail -c +$((N+1)) | head -c 8
+```
+
+#### 两类原因各指向哪里
+
+- **非法 UTF-8**：N 指向最先不能组成合法字符的那个字节。截断的多字节序列
+  （如只来了 `e2 80` 两个字节的三字节字符）指向它的**起始字节**，而不是
+  缺失部分的位置。
+- **未配对代理项转义**：N 指向有问题的转义开头的**反斜线**。原因区分两种
+  形态：高代理项（D800–DBFF）后面没有紧跟低代理项时，报 `high surrogate
+  must be followed immediately by a low surrogate escape`；低代理项
+  （DC00–DFFF）单独出现时，报 `low surrogate must follow a high surrogate
+  escape`。
+- **一行同时有两类问题时，先报告非法 UTF-8**，即使未配对转义写在更前面。
+  因此不能把 N 理解成“所有错误中位置最靠前的一处”——它是被报告的那一类
+  错误自己的位置；修掉它之后再跑，才可能看到另一处。
+
+#### 例一：中文、表情在坏转义之前；行首空白不动 N，对象内部空白会动 N
+
+同一处问题——`action` 里的 `登录😀` 之后跟了一个落单的高代理项转义
+`\uD800`——用三种写法喂给 `normalize`，观察 N 的变化。坏转义前面有
+`{"timestamp":"2026-01-02T00:00:00Z","action":"`（46 字节）、两个汉字
+（6 字节）、一个表情（4 字节），所以它的反斜线在第 56 字节。
+
+写法一：行首行尾没有空白。
+
+```bash
+printf '%s\n' '{"timestamp":"2026-01-02T00:00:00Z","action":"登录😀\uD800"}' \
+  | ./bin/relayproof normalize
+```
+
+输出（退出状态 `1`，标准错误为空）：
+
+```json
+{"line":1,"ok":false,"error":"unpaired Unicode escape \\uD800 at byte offset 56: high surrogate must be followed immediately by a low surrogate escape"}
+```
+
+N=56，指向 `\uD800` 开头的反斜线：`46 + 6（登录）+ 4（😀）= 56`，按字节
+数而不是按显示字符数（若按字符数会错算成 49）。
+
+写法二：行首加空格和制表符、行尾加空格。这些字符被裁掉，**N 不变**：
+
+```bash
+printf '%s\n' ' 	{"timestamp":"2026-01-02T00:00:00Z","action":"登录😀\uD800"}  ' \
+  | ./bin/relayproof normalize
+```
+
+```json
+{"line":1,"ok":false,"error":"unpaired Unicode escape \\uD800 at byte offset 56: high surrogate must be followed immediately by a low surrogate escape"}
+```
+
+写法三：不改行首，只在对象**内部**加空白——`{` 后两个空格、两个键名前后
+各加空格、成员之间加一个制表符，共多出 8 个字节。同一处坏转义的 N 随之
+后移 8：
+
+```bash
+printf '%s\n' '{  "timestamp" : "2026-01-02T00:00:00Z" ,	"action" : "登录😀\uD800" }' \
+  | ./bin/relayproof normalize
+```
+
+```json
+{"line":1,"ok":false,"error":"unpaired Unicode escape \\uD800 at byte offset 64: high surrogate must be followed immediately by a low surrogate escape"}
+```
+
+N=64，仍指向 `\uD800` 的反斜线。三种写法用上面的 `tail -c` 命令验证
+（N=56 用 `tail -c +57`，N=64 用 `tail -c +65`），切到的都是 `\uD800`。
+
+#### 例二：坏转义在前、非法字节在后，报告的是非法字节
+
+一行里 `\uD800` 写在第 46 字节，后面 `登录` 之后还有一个非法字节
+`0xFF`（第 58 字节）。非法字节无法用文本安全写出，用 `printf` 的 `\xff`
+字节写法构造，保证能准确重建：
+
+```bash
+printf '{"timestamp":"2026-01-02T00:00:00Z","action":"\\uD800登录\xff"}\n' \
+  | ./bin/relayproof normalize
+```
+
+输出（退出状态 `1`，标准错误为空）：
+
+```json
+{"line":1,"ok":false,"error":"invalid UTF-8 encoding at byte offset 58"}
+```
+
+报告的是**非法 UTF-8**，N=58 指向 `0xFF` 本身，而不是位置更靠前（第 46
+字节）的 `\uD800`——非法 UTF-8 优先于未配对转义。用
+`... | tail -c +59 | head -c 1 | od -An -tx1` 可看到该位置正是 `ff`。
+把 `0xFF` 修正后再次规范化，才会报告第 46 字节的未配对转义。
+
+截断的多字节序列同理指向起始字节：动作值 `ab` 后面只来了三字节字符的前
+两个字节 `e2 80`（同样用 `printf` 字节写法构造）：
+
+```bash
+printf '{"timestamp":"2026-01-02T00:00:00Z","action":"ab\xe2\x80"}\n' \
+  | ./bin/relayproof normalize
+```
+
+```json
+{"line":1,"ok":false,"error":"invalid UTF-8 encoding at byte offset 48"}
+```
+
+N=48 指向 `0xE2`——这条不完整序列的**第一个**字节，而不是缺失的第三个
+字节的位置。
+
+#### 例三：前面的行与空白行不影响当前行的 N
+
+N 逐行独立。下面第 2 行是空白行（占行号、无输出），第 3 行行首有两个
+空格（被裁掉），坏转义在该行内容里的位置与例一写法一完全相同：
+
+```bash
+printf '%s\n\n%s\n' \
+  '{"timestamp":"2026-01-02T00:00:00Z","action":"first"}' \
+  '  {"timestamp":"2026-01-02T00:00:00Z","action":"登录😀\uD800"}' \
+  | ./bin/relayproof normalize
+echo "exit=$?"
+```
+
+标准输出（退出状态 `1`，标准错误为空）：
+
+```json
+{"line":1,"ok":true,"event":{"timestamp":"2026-01-02T00:00:00Z","action":"first"}}
+{"line":3,"ok":false,"error":"unpaired Unicode escape \\uD800 at byte offset 56: high surrogate must be followed immediately by a low surrogate escape"}
+```
+
+`line:3` 是原始物理行号——第 2 行的空白行把它从 2 推到了 3；但 N 仍是
+56：前两行的全部字节、第 3 行行首的两个空格都不计入。
 
 ### 扩展字段 extra：成员边界与证据值保留
 
