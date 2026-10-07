@@ -185,6 +185,22 @@ import (
 // corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
 // and bytes are preserved.
 //
+// Source-registration validation on replay: a success — a plain result or a
+// compacted state — is a recorded delivery, so just like a live advance it is
+// only legal when the message's own source chain was registered. A saved
+// trusted header never stands in for registration: normal processing
+// terminalizes an unregistered source as unknown-source however high its
+// trusted coverage is, so recovery must not resurrect such a message as
+// success and consume its nonce. For a plain result only registrations saved
+// in earlier records count, so a source registered after the success was
+// recorded can never retroactively legalize it; a compacted state is judged
+// against the registrations the snapshot retained (compaction writes them
+// before the records), with no reconstruction of compacted-away registration
+// history. Registering another chain never covers the message — chain names
+// are their raw bytes, never their display form. A complete, checksum-valid
+// success from an unregistered source is corrupt (ErrCorrupt), never a
+// truncatable torn tail, so the log's length and bytes are preserved.
+//
 // Trusted-coverage validation on replay: a success — a plain result or a
 // compacted state — is a recorded delivery, so just like a live advance it is
 // only legal when the message's own source chain has a trusted header at least
@@ -1268,6 +1284,34 @@ func validateRecoveryDue(rec *Record, e *logEntry) error {
 	return nil
 }
 
+// validateSuccessRegistration enforces, for a recovered success — a plain
+// result or a compacted state — the same source-registration precondition a
+// live advance applies: the message's own source chain must be registered, or
+// normal processing would have terminalized it as unknown-source instead of
+// delivering it and consuming its nonce. A saved trusted header never
+// substitutes for registration.
+//
+// For a plain result, only registrations saved in earlier records count:
+// replay applies entries in log order, so a source registered after the
+// success was recorded can never retroactively legalize it, while a
+// registration completed any time before the success — even after the message
+// was submitted — does. A compacted state is judged against the registrations
+// the snapshot retained (compaction writes them before the records), without
+// reconstructing the compacted-away registration history. Another chain's
+// registration never covers the message: chain names are their raw bytes, so
+// two names that merely display alike stay distinct.
+func validateSuccessRegistration(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	m := rec.Msg.Message
+	if s.sources[m.From] {
+		return nil
+	}
+	return corrupt("success %s for %q from source chain %q is not registered: no source registration saved",
+		rk.entryNoun, e.ID, m.From)
+}
+
 // validateSuccessCoverage enforces, for a recovered success — a plain result
 // or a compacted state — the same delivery precondition a live advance
 // applies: the source chain's highest trusted header accepted so far must
@@ -1307,7 +1351,8 @@ func validateSuccessCoverage(s *loadedState, rec *Record, e *logEntry, rk recove
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
 // sole legacy-overflow exception repaired in memory) and no consumption,
-// success must be covered by a trusted header of the message's own source
+// success must come from a source chain registered no later than the success
+// record and be covered by a trusted header of the message's own source
 // chain saved no later than the success record, keep no retry time and
 // consume its own (from,to,nonce) attributed to itself, and terminal
 // failures carry neither a retry time nor consumption fields. The repaired
@@ -1331,6 +1376,11 @@ func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryK
 	case StatusSuccess:
 		if e.NextRetry != 0 {
 			return corrupt("success %s for %q carries retry time", rk.entryNoun, e.ID)
+		}
+		// Registration first, then coverage — the same order a live advance
+		// judges a due message (unknown-source before waiting/delivery).
+		if err := validateSuccessRegistration(s, rec, e, rk); err != nil {
+			return err
 		}
 		if err := validateSuccessCoverage(s, rec, e, rk); err != nil {
 			return err
