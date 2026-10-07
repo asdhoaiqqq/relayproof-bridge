@@ -171,11 +171,19 @@ import (
 // time the log has already confirmed — an advance checkpoint or any earlier
 // result or snapshot, of any message — because no legal advance can produce
 // an outcome stamped before the time the queue had already reached. A
-// compacted snapshot's time must likewise be non-negative, but snapshots need
-// not be time-ordered among themselves: each records its own message's last
-// processing instant in first-submission order. A complete, checksum-valid
-// record that violates these rules is corrupt (ErrCorrupt), never a
-// truncatable torn tail, so the log's length and bytes are preserved.
+// due-result (success or waiting) of an already processed message must
+// additionally respect that message's own retry schedule: it may only be
+// stamped at a distinct processing instant at or after the retry its last
+// result scheduled, however intact and well-checksummed the record is —
+// replaying an early success would otherwise consume a nonce that normal
+// advances could not. Replay and expired results are not bounded by the
+// schedule: phase-2 replay/expiry holds settle a waiting message while its
+// backoff is still running. A compacted snapshot's time must likewise be
+// non-negative, but snapshots need not be time-ordered among themselves:
+// each records its own message's last processing instant in first-submission
+// order. A complete, checksum-valid record that violates these rules is
+// corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
+// and bytes are preserved.
 
 const (
 	logName          = "queue.log"
@@ -1210,6 +1218,40 @@ func validateRecoveryStatus(e *logEntry, rk recoveryKind) error {
 	return nil
 }
 
+// validateRecoveryDue enforces, for one incremental result, the schedule the
+// message's previously saved state (an earlier plain result or a compacted
+// state) already established: a success or waiting result is a phase-1
+// outcome of a due processing, so once a message has been processed and left a
+// retry instant behind, such a result may only be stamped when that retry is
+// due at a distinct processing time. Recovery judges with the live queue's
+// own retryDue predicate — the result's own processing time against this
+// message's saved schedule, never the wall clock — so a recovered message
+// obeys exactly the timing a live advance would: an early success cannot be
+// reconstructed to consume a nonce, and an extra waiting attempt cannot be
+// added, while the backoff is still running. Replay and expired results are
+// exempt — they are the phase-2 hold outcomes that settle a waiting message
+// independently of its schedule, including at the same instant as its wait —
+// and a message's first processing carries no schedule (the waiting record
+// it schedules is accepted by first-processing rules, adding no backoff).
+func validateRecoveryDue(rec *Record, e *logEntry) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	if rec.Attempts == 0 {
+		return nil // never processed before: no backoff to honor
+	}
+	if e.Status != StatusWaiting && e.Status != StatusSuccess {
+		return nil // replay/expired holds are not bounded by the retry schedule
+	}
+	if e.Now == rec.LastProcAt {
+		return corrupt("result time %d re-processes %q at the same instant as its prior processing", e.Now, e.ID)
+	}
+	if !retryDue(rec, e.Now) {
+		return corrupt("result time %d precedes scheduled retry %d for %q", e.Now, rec.NextRetry, e.ID)
+	}
+	return nil
+}
+
 // acceptRecoveryStatus is the second shared check, run after the
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
@@ -1339,9 +1381,18 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// confirmed: an advance checkpoint, or any earlier result or snapshot
 		// of any message, checkpointed or not. A result stamped earlier than
 		// that is an outcome no legal advance can have produced, however
-		// intact and well-checksummed the record is. The per-status
-		// validation (waiting schedule, success consumption, terminal fields)
-		// is shared with compacted state entries.
+		// intact and well-checksummed the record is. A waiting or success
+		// result is a phase-1 due-processing outcome and must additionally be
+		// stamped at a distinct instant at or after the retry the message's
+		// previous result (or compacted state) scheduled: recovery may not
+		// deliver — and consume a nonce for — a message whose backoff had not
+		// elapsed, nor add a waiting attempt the live queue could not have
+		// made. Replay and expired results are the phase-2 hold outcomes and
+		// stay exempt: they settle a waiting message while its backoff is
+		// still running, at the same instant as its wait included. A message's
+		// first processing has no schedule to obey (time zero included). The
+		// per-status validation (waiting schedule, success consumption,
+		// terminal fields) is shared with compacted state entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)
@@ -1365,6 +1416,9 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
 		}
 		if err := validateRecoveryStatus(e, recoveryResult); err != nil {
+			return err
+		}
+		if err := validateRecoveryDue(rec, e); err != nil {
 			return err
 		}
 		if err := acceptRecoveryStatus(s, rec, e, recoveryResult); err != nil {

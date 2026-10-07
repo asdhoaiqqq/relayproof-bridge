@@ -143,23 +143,40 @@ func TestRecoveryTimeMustBeNonNegative(t *testing.T) {
 		assertRecoveryCorrupt(t, append(successRecoveryBase(), r), "state time -1 is negative", `"m"`)
 	})
 
-	t.Run("zero is a valid processing time", func(t *testing.T) {
+	t.Run("zero is a valid first processing time", func(t *testing.T) {
 		dir := t.TempDir()
 		entries := append(waitingRecoveryBase(),
 			&logEntry{T: kindResult, Now: 0, ID: "w", Status: StatusWaiting,
 				Reason: "waiting", Attempts: 1, NextRetry: 1000},
-			&logEntry{T: kindResult, Now: 0, ID: "w", Status: StatusWaiting,
-				Reason: "waiting", Attempts: 2, NextRetry: 2000},
 			&logEntry{T: kindAdvance, Now: 0},
 		)
 		writeLegacyLog(t, dir, entries...)
 		q, err := Open(dir)
 		if err != nil {
-			t.Fatalf("zero-time results must open: %v", err)
+			t.Fatalf("zero as a first processing time must open: %v", err)
 		}
 		defer q.Close()
-		if r := statusOf(t, q, "w"); r.Status != StatusWaiting || r.Attempts != 2 || r.NextRetry != 2000 {
-			t.Fatalf("zero-time results not restored: %+v", r)
+		if r := statusOf(t, q, "w"); r.Status != StatusWaiting || r.Attempts != 1 || r.NextRetry != 1000 {
+			t.Fatalf("zero-time first result not restored: %+v", r)
+		}
+	})
+
+	t.Run("zero is a valid first terminal time", func(t *testing.T) {
+		dir := t.TempDir()
+		entries := append(successRecoveryBase(),
+			&logEntry{T: kindResult, Now: 0, ID: "m", Status: StatusSuccess,
+				Reason:   "delivered; proof verified by trusted header at height 100",
+				Attempts: 1, ConsumeFrom: "a", ConsumeTo: "b", ConsumeNonce: 1, ConsumeBy: "m"},
+			&logEntry{T: kindAdvance, Now: 0},
+		)
+		writeLegacyLog(t, dir, entries...)
+		q, err := Open(dir)
+		if err != nil {
+			t.Fatalf("zero-time first success must open: %v", err)
+		}
+		defer q.Close()
+		if r := statusOf(t, q, "m"); r.Status != StatusSuccess || r.Attempts != 1 {
+			t.Fatalf("zero-time success not restored: %+v", r)
 		}
 	})
 }
