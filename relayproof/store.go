@@ -176,6 +176,25 @@ import (
 // processing instant in first-submission order. A complete, checksum-valid
 // record that violates these rules is corrupt (ErrCorrupt), never a
 // truncatable torn tail, so the log's length and bytes are preserved.
+//
+// Retry-schedule validation on replay: a plain result that requires the
+// message to be processed again — waiting, success or unknown-source — must
+// also respect the retry schedule the log previously saved for that message:
+// its own processing time must reach the saved retry instant (and must not
+// equal the instant the message was last processed at, which only a
+// ceiling-saturated schedule can reach). A message first waiting at 1000ms
+// with its retry saved at 2000ms cannot legitimately succeed or wait again at
+// 1500ms, however intact and well-checksummed that record is; accepting it
+// would recover an undeliverable message as delivered and consume its nonce.
+// Replay and expired results are exempt: they come from the replay/expiry
+// re-check that closes every advance regardless of backoff, so they may land
+// before the retry is due — even at the very instant of the wait that
+// scheduled it. A message with no prior processing has no schedule to obey:
+// its first result is accepted at any non-negative time, zero included. A
+// compacted snapshot restores the message's full current state — including
+// the accumulated attempt count and retry instant — without replaying the
+// per-attempt history, and a later plain result must then obey the schedule
+// the snapshot established.
 
 const (
 	logName          = "queue.log"
@@ -1210,6 +1229,41 @@ func validateRecoveryStatus(e *logEntry, rk recoveryKind) error {
 	return nil
 }
 
+// validateRetryTiming makes a recovered incremental result obey the retry
+// schedule the log previously saved for the same message. A result that
+// requires the message to be processed again — waiting, success or
+// unknown-source — is legal only once the saved retry instant has been
+// reached, judged by the result's own processing time against the message's
+// own saved schedule, never against the wall clock at open time. Replay and
+// expired results come from the replay/expiry re-check that closes every
+// advance, which runs regardless of the backoff, so they may legitimately
+// land before the retry is due — even at the very instant of the wait that
+// scheduled it. A message with no prior processing has no schedule to obey:
+// its first result is accepted at any non-negative time, zero included. The
+// due predicate is the live queue's retryDue, so the int64-ceiling corner —
+// processed at the ceiling with the retry saturated to the ceiling — rejects
+// a second processing at that same instant too.
+//
+// Only plain results come here: a compacted snapshot restores the full
+// current state (attempt count and retry instant included) without
+// replaying per-attempt history, and snapshots apply only before any result
+// for the message, so there is no saved schedule they could violate.
+func validateRetryTiming(rec *Record, e *logEntry) error {
+	if rec.Attempts == 0 {
+		return nil
+	}
+	switch e.Status {
+	case StatusWaiting, StatusSuccess, StatusUnknownSrc:
+	default:
+		return nil
+	}
+	if retryDue(rec, e.Now) {
+		return nil
+	}
+	return fmt.Errorf("%w: result at %d for %q is not due under the saved retry schedule (next retry %d, last processed %d)",
+		ErrCorrupt, e.Now, e.ID, rec.NextRetry, rec.LastProcAt)
+}
+
 // acceptRecoveryStatus is the second shared check, run after the
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
@@ -1339,9 +1393,12 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// confirmed: an advance checkpoint, or any earlier result or snapshot
 		// of any message, checkpointed or not. A result stamped earlier than
 		// that is an outcome no legal advance can have produced, however
-		// intact and well-checksummed the record is. The per-status
-		// validation (waiting schedule, success consumption, terminal fields)
-		// is shared with compacted state entries.
+		// intact and well-checksummed the record is. A result that needs the
+		// message to be processed again must additionally wait for the retry
+		// instant the message's own earlier record scheduled (see
+		// validateRetryTiming). The per-status validation (waiting schedule,
+		// success consumption, terminal fields) is shared with compacted
+		// state entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)
@@ -1365,6 +1422,9 @@ func applyEntry(s *loadedState, e *logEntry) error {
 			return corrupt("attempts jump %d -> %d for %q", rec.Attempts, e.Attempts, e.ID)
 		}
 		if err := validateRecoveryStatus(e, recoveryResult); err != nil {
+			return err
+		}
+		if err := validateRetryTiming(rec, e); err != nil {
 			return err
 		}
 		if err := acceptRecoveryStatus(s, rec, e, recoveryResult); err != nil {

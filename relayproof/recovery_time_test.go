@@ -148,18 +148,18 @@ func TestRecoveryTimeMustBeNonNegative(t *testing.T) {
 		entries := append(waitingRecoveryBase(),
 			&logEntry{T: kindResult, Now: 0, ID: "w", Status: StatusWaiting,
 				Reason: "waiting", Attempts: 1, NextRetry: 1000},
-			&logEntry{T: kindResult, Now: 0, ID: "w", Status: StatusWaiting,
-				Reason: "waiting", Attempts: 2, NextRetry: 2000},
-			&logEntry{T: kindAdvance, Now: 0},
+			&logEntry{T: kindResult, Now: 1000, ID: "w", Status: StatusWaiting,
+				Reason: "waiting", Attempts: 2, NextRetry: 3000},
+			&logEntry{T: kindAdvance, Now: 1000},
 		)
 		writeLegacyLog(t, dir, entries...)
 		q, err := Open(dir)
 		if err != nil {
-			t.Fatalf("zero-time results must open: %v", err)
+			t.Fatalf("zero-time first processing must open: %v", err)
 		}
 		defer q.Close()
-		if r := statusOf(t, q, "w"); r.Status != StatusWaiting || r.Attempts != 2 || r.NextRetry != 2000 {
-			t.Fatalf("zero-time results not restored: %+v", r)
+		if r := statusOf(t, q, "w"); r.Status != StatusWaiting || r.Attempts != 2 || r.NextRetry != 3000 {
+			t.Fatalf("zero-time first processing not restored: %+v", r)
 		}
 	})
 }
