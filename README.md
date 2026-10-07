@@ -689,18 +689,181 @@ func normalizeLogs(r io.Reader, w io.Writer) error {
 失败结果；详细对比与示例见
 [空白字符：整行、JSON 分隔符与字符串内容](#空白字符整行json-分隔符与字符串内容)。
 
-正常文件结束与读取中断的区别：
+#### 什么才算“干净的 EOF”：包装与组合错误
 
-- 读到干净的 EOF 不是错误，即使末行没有换行符，该末行也会照常处理并计入行号。
-- 读取故障时，随故障一起返回的未结束片段属于这次失败读取的一部分，不是完整
-  日志行：它既不产生逐行结果，也不计入 `failures`；此前已经读到的完整日志仍按
-  原顺序处理并计数行号。
-- 写出故障时处理立即停止，输出端可能残留一条写了一半的末条 JSON；文档不保证
-  中断之后仍有完整输出，调用方不应继续在该 writer 上追加内容。
-- 若读取已经失败、收尾刷新写出时又失败：读故障仍是主要原因
-  （`errors.Is(err, ErrLogRead)` 成立、底层读取原因也仍在错误链中），后来的
-  写故障只体现在返回错误的文字里，命令入口同样按退出 `2` 报告。
+`NormalizeReader` 判断“输入正常结束”看的不是 `errors.Is(err, io.EOF)`，而是
+**这个错误里除了 `io.EOF` 什么都没有**：
 
+- 直接返回 `io.EOF`：正常结束；
+- 外面包一层或多层 `%w`（如 `fmt.Errorf("connection closed: %w", io.EOF)`）：
+  仍是正常结束；
+- 用 `errors.Join` 组合，但每个底层原因都只是 `io.EOF`（如
+  `errors.Join(io.EOF, io.EOF)`）：仍是正常结束；
+- 一旦组合里除了 `io.EOF` 还有**另一个独立的读取原因**（如
+  `errors.Join(io.EOF, deviceErr)`，以及它外面再套任意层 `%w` 包装）：这是
+  **读取中断**。此时 `errors.Is(err, io.EOF)` 照样成立——所以不能用它判断
+  本次读取是否成功结束。
+
+正常结束时，即使最后一条日志没有末尾换行符，也会作为最后一条完整日志处理，
+物理行号照常计数。读取中断时，随这次失败读取**同一批交付**的字节要分开看：
+
+- 已以换行结束的完整日志仍**按原顺序逐条处理**：合法的成功、字段无效的照常
+  计入 `failures`、空白行照样占用行号但无输出；
+- 剩下那个没有换行的末尾片段属于这次失败读取的一部分，不是完整日志行：
+  **不产生任何结果，也不计入 `failures`**，即使它本身是一条完全合法的日志。
+
+处理在故障当次读取后立即停止，不会再发一次 `Read` 去“确认”结尾。
+
+#### 完整示例：同一批日志的两种结局
+
+下面的程序只依赖标准库与本项目，可直接放进任何引用本模块的工程里离线运行
+（脚本化的 `oneShotReader` 在第一次 `Read` 时一次性交付全部字节并同时返回
+指定错误，用来确定性地复现“最后一批字节与错误同批到达”）：
+
+```go
+package main
+
+import (
+    "bytes"
+    "errors"
+    "fmt"
+    "io"
+
+    "github.com/asdhoaiqqq/relayproof-bridge/relayproof"
+)
+
+var errInputDevice = errors.New("input device reset")
+
+// oneShotReader 在第一次 Read 时一次性交付 data，并同时返回 err。
+type oneShotReader struct {
+    data      []byte
+    err       error
+    delivered bool
+}
+
+func (r *oneShotReader) Read(p []byte) (int, error) {
+    if r.delivered {
+        return 0, io.EOF
+    }
+    r.delivered = true
+    return copy(p, r.data), r.err
+}
+
+// 同一批输入：第 1 行合法，第 2 行时间字段无效，第 3 行合法且没有末尾换行。
+const batch = "" +
+    `{"timestamp":"2026-01-02T00:00:00Z","action":"ok-1"}` + "\n" +
+    `{"timestamp":"not-a-time","action":"bad-2"}` + "\n" +
+    `{"timestamp":"2026-01-02T00:00:00Z","action":"tail-3"}`
+
+func main() {
+    // 情形一：干净 EOF，正常结束。
+    var out bytes.Buffer
+    failures, err := relayproof.NormalizeReader(
+        &oneShotReader{data: []byte(batch), err: io.EOF}, &out)
+    fmt.Printf("[A] output:\n%s", out.String())
+    fmt.Printf("[A] failures=%d err=%v\n\n", failures, err)
+
+    // 情形二：同一次 Read 同时给出 io.EOF 与另一个独立读取原因。
+    combined := errors.Join(io.EOF, errInputDevice)
+    out.Reset()
+    failures, err = relayproof.NormalizeReader(
+        &oneShotReader{data: []byte(batch), err: combined}, &out)
+    fmt.Printf("[B] output:\n%s", out.String())
+    fmt.Printf("[B] failures=%d\nerr=%v\n", failures, err)
+    fmt.Printf("[B] Is(ErrLogRead)=%v Is(errInputDevice)=%v Is(ErrLogWrite)=%v\n\n",
+        errors.Is(err, relayproof.ErrLogRead),
+        errors.Is(err, errInputDevice),
+        errors.Is(err, relayproof.ErrLogWrite))
+
+    // 情形三：故障只带着一个没有换行的合法片段，此前没有任何完整行。
+    fragment := `{"timestamp":"2026-01-02T00:00:00Z","action":"tail-3"}`
+    out.Reset()
+    failures, err = relayproof.NormalizeReader(
+        &oneShotReader{data: []byte(fragment), err: combined}, &out)
+    fmt.Printf("[C] output empty=%v failures=%d Is(ErrLogRead)=%v Is(errInputDevice)=%v\n",
+        out.Len() == 0, failures,
+        errors.Is(err, relayproof.ErrLogRead),
+        errors.Is(err, errInputDevice))
+}
+```
+
+实际输出（错误文字中的换行来自 `errors.Join` 的标准格式）：
+
+```text
+[A] output:
+{"line":1,"ok":true,"event":{"timestamp":"2026-01-02T00:00:00Z","action":"ok-1"}}
+{"line":2,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+{"line":3,"ok":true,"event":{"timestamp":"2026-01-02T00:00:00Z","action":"tail-3"}}
+[A] failures=1 err=<nil>
+
+[B] output:
+{"line":1,"ok":true,"event":{"timestamp":"2026-01-02T00:00:00Z","action":"ok-1"}}
+{"line":2,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+[B] failures=1
+err=log stream read failure: EOF
+input device reset
+[B] Is(ErrLogRead)=true Is(errInputDevice)=true Is(ErrLogWrite)=false
+
+[C] output empty=true failures=0 Is(ErrLogRead)=true Is(errInputDevice)=true
+```
+
+对照输入逐行看两种结局：
+
+- **情形 A（正常结束）**：第 1 行成功；第 2 行是字段无效日志，输出一条
+  `ok:false` 记录并使 `failures=1`，但它**不会让 `err` 非空**——逐行失败
+  从来不是流级错误；没有末尾换行的第 3 行在干净 EOF 下照常处理，成为
+  `line:3` 的成功记录。最终 `failures=1, err=<nil>`。
+- **情形 B（读取中断）**：同批三行中只有以换行结束的第 1、2 行按原顺序
+  处理，输出与 A 的前两行完全一致、`failures` 同样为 1（只来自第 2 行）；
+  第 3 行虽然是合法日志，但它作为无换行片段随故障一起到达，**不留记录、
+  不占失败数**。`err` 包着 `ErrLogRead`，且上游自己的原因
+  `errInputDevice` 仍可由 `errors.Is` 识别；`errors.Is(err, io.EOF)` 虽然
+  成立却不能当成功依据。若组合错误外面再套 `fmt.Errorf("...: %w", ...)`，
+  结论不变。
+- **情形 C（只有未结束片段）**：整批输入只有一个没有换行的合法片段时，
+  **输出为空、`failures=0`，但 `err` 仍报告读取中断**。所以“没看到失败
+  记录、失败数也是 0”不代表输入完整处理完了——接入方必须先判断 `err`，
+  不能用 `failures == 0` 或输出为空代替。
+
+#### 读取与写出同时失败时，按谁归因
+
+读、写故障可能在同一次处理中都发生。归因只取决于**写出故障发生的那一刻，
+手上是否已经有读取故障**，对应两种实际发生条件：
+
+1. **一次读取已经返回故障及完整日志，随后写出这些结果失败。** 读取故障在
+   故障发生的当次 `Read` 就被记录（早于同批字节的任何写出），因此它始终是
+   主要原因，与写出失败发生在哪个阶段无关——既可能是写出某条超长结果时
+   当场失败（它会逼出对此前缓冲结果的物理写入），也可能是输入处理结束后
+   收尾 `Flush` 时失败。返回错误保持 `ErrLogRead` 包原读取原因这一条链：
+   `errors.Is(err, relayproof.ErrLogRead)` 与
+   `errors.Is(err, 上游读取原因)` 都成立；**后来的写出原因只出现在错误文字
+   中**，既不包进错误链，也不作为 `errors.Join` 成员加入，因此
+   `errors.Is(err, relayproof.ErrLogWrite)` 与对写出原因的 `errors.Is` 都为
+   `false`。
+2. **写出失败时尚未收到任何读取故障。** 立即按写出故障报告
+   （`ErrLogWrite` 与写出原因都在可匹配的错误链中），处理当场停止，
+   **不会为了决定归因再继续读取后续输入**。
+
+两种情况下 `failures` 都只统计此前已处理完整行中的逐行失败，I/O 故障不改动
+这个计数；输出端可能残留一条写了一半的末条 JSON（写出端少接收字节却返回
+`nil` 时同样按 `io.ErrShortWrite` 归入写出故障），中断后不应再在该 writer 上
+追加内容。命令行入口对两类流级故障都以退出 `2` 结束并在标准错误给出
+`normalize:` 诊断。
+
+`--source-cidr` 来源网段筛选（Go 侧为 `NormalizeReaderFiltered`）只筛掉
+**成功事件**：网段外的坏日志仍输出失败记录，流级读取/写出中断也照常返回，
+筛选既不会把中断变成正常结束，也不改变上述读写归因。
+
+上述全部边界——含干净 EOF 的三种形态、包装后的组合错误、仅片段到达，以及
+读写同时失败的两种归因——都有一个只依赖标准库与本项目、可在本机离线运行的
+完整程序：
+
+```bash
+go run ./examples/normalizeeof
+```
+
+它用内存 reader/writer 脚本化每一种故障，逐条打印实际输出记录、`failures`、
+错误文字与各 `errors.Is` 的判定结果。
 
 ## 技术方向
 
