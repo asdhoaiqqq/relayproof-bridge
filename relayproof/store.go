@@ -184,6 +184,22 @@ import (
 // order. A complete, checksum-valid record that violates these rules is
 // corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
 // and bytes are preserved.
+//
+// Trusted-coverage validation on replay: a success — a plain result or a
+// compacted state — is a recorded delivery, so just like a live advance it is
+// only legal when the message's own source chain has a trusted header at least
+// at its proof height. For a plain result only headers saved in earlier
+// records count, so a trusted header written after the success can never
+// retroactively cover it; a compacted state is judged against the trusted
+// coverage the snapshot retained, with no reconstruction of compacted-away
+// header history. Another chain's trusted headers never cover the message —
+// chains are their raw bytes — untrusted headers at any height never establish
+// coverage, a lower trusted header never narrows it, and a trusted height
+// exactly equal to the proof height does cover. The saved reason text never
+// stands in for a saved trusted header and need not name the retained highest
+// trusted height. A complete, checksum-valid success that lacks coverage is
+// corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
+// and bytes are preserved.
 
 const (
 	logName          = "queue.log"
@@ -1252,14 +1268,50 @@ func validateRecoveryDue(rec *Record, e *logEntry) error {
 	return nil
 }
 
+// validateSuccessCoverage enforces, for a recovered success — a plain result
+// or a compacted state — the same delivery precondition a live advance
+// applies: the source chain's highest trusted header accepted so far must
+// cover the message's proof height.
+//
+// For a plain result, "so far" is the log prefix before the result: the
+// trusted header must already have been saved when the success was recorded,
+// so a higher trusted header written only afterwards can never retroactively
+// legalize a success that no advance could have delivered. A compacted state
+// is judged against the headers the snapshot retained — compaction writes
+// them before the records — without reconstructing the compacted-away header
+// history; a later-higher retained trusted header may therefore widen the
+// coverage beyond the height named in the saved reason, which need not match
+// it. Untrusted headers never establish coverage, a lower trusted header
+// never narrows it, another chain's headers never cover this chain's messages
+// (chain names are their raw bytes), and a trusted height exactly equal to
+// the proof height does cover. The reason text never substitutes for a saved
+// trusted header.
+func validateSuccessCoverage(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	m := rec.Msg.Message
+	hs := s.headers[m.From]
+	if hs != nil && hs.trusted != nil && hs.trusted.Height >= m.ProofAt {
+		return nil
+	}
+	if hs == nil || hs.trusted == nil {
+		return corrupt("success %s for %q from source chain %q lacks trusted header coverage: proof height %d but no trusted header saved",
+			rk.entryNoun, e.ID, m.From, m.ProofAt)
+	}
+	return corrupt("success %s for %q from source chain %q lacks trusted header coverage: highest trusted height %d is below proof height %d",
+		rk.entryNoun, e.ID, m.From, hs.trusted.Height, m.ProofAt)
+}
+
 // acceptRecoveryStatus is the second shared check, run after the
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
 // sole legacy-overflow exception repaired in memory) and no consumption,
-// success must keep no retry time and consume its own (from,to,nonce)
-// attributed to itself, and terminal failures carry neither a retry time nor
-// consumption fields. The repaired retry time of a legacy overflowed schedule
-// is written back onto e.
+// success must be covered by a trusted header of the message's own source
+// chain saved no later than the success record, keep no retry time and
+// consume its own (from,to,nonce) attributed to itself, and terminal
+// failures carry neither a retry time nor consumption fields. The repaired
+// retry time of a legacy overflowed schedule is written back onto e.
 func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
 	corrupt := func(msg string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
@@ -1279,6 +1331,9 @@ func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryK
 	case StatusSuccess:
 		if e.NextRetry != 0 {
 			return corrupt("success %s for %q carries retry time", rk.entryNoun, e.ID)
+		}
+		if err := validateSuccessCoverage(s, rec, e, rk); err != nil {
+			return err
 		}
 		if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
 			return err
