@@ -122,9 +122,29 @@ import (
 // replay — the lost bytes are never guessed. As with the other split fields,
 // carrying both representations at once (by key presence, the empty string
 // included) or an undecodable base64 value is an inconsistent record that
-// rejects the directory with ErrCorrupt. Source chains are not split: the Go
-// interface accepts only valid-UTF-8 source names (and an unregistered source
-// never delivers), so historical "from" values are always read at face value.
+// rejects the directory with ErrCorrupt.
+//
+// Source chain names have the same contract and use the same encoding: the
+// replay identity's first element is the source chain's exact bytes, source
+// registration and trusted-header coverage apply per byte-identical chain,
+// and an unknown-source reason quotes the chain. The Go interface accepts any
+// non-empty source name without requiring valid UTF-8 — ordinary text,
+// colons, NUL bytes, stray 0xFF/0xFE bytes or text mixed with them — and the
+// bytes 0xFF, 0xFE and the legal character U+FFFD are three different source
+// chains that must never merge: two names that differ only in an invalid byte
+// are distinct in the same process, so saving one as the replacement
+// character would, after a reopen, mix the two chains' registrations, trusted
+// headers and consumed nonces. JSON string encoding would silently rewrite an
+// invalid source name in a source or header entry's "chain", a submit entry's
+// "from" and a success entry's "consumeFrom", so a valid-UTF-8 name keeps the
+// historical plain fields while an invalid-UTF-8 name is stored
+// base64-encoded in "chainB64", "fromB64" and "consumeFromB64". Names an
+// older build already rewrote to replacement characters stay those characters
+// on replay — the lost bytes are never guessed, and a message terminalized by
+// such a legacy record is never reactivated. As with the other split fields,
+// carrying both representations at once (by key presence, the empty string
+// included) or an undecodable base64 value is an inconsistent record that
+// rejects the directory with ErrCorrupt.
 //
 // Message ids have the same contract and use the same encoding: identity is
 // judged by the id's exact bytes, never by its display form. The Go submit
@@ -189,6 +209,11 @@ type logEntry struct {
 	Root    string `json:"root,omitempty"`
 	Trusted bool   `json:"trusted,omitempty"`
 
+	// ChainB64 carries a source/header entry's chain name raw bytes
+	// base64-encoded when the name is not valid UTF-8; see setChain/entryChain.
+	// Never set together with Chain.
+	ChainB64 string `json:"chainB64,omitempty"`
+
 	// RootB64 carries a header root's raw bytes base64-encoded when the root
 	// is not valid UTF-8; see setRoot/headerRoot. Never set together with
 	// Root.
@@ -207,6 +232,11 @@ type logEntry struct {
 	// when the destination is not valid UTF-8; see setTo/entryTo. Never set
 	// together with To.
 	ToB64 string `json:"toB64,omitempty"`
+
+	// FromB64 carries a submit entry's source chain raw bytes base64-encoded
+	// when the source is not valid UTF-8; see setFrom/entryFrom. Never set
+	// together with From.
+	FromB64 string `json:"fromB64,omitempty"`
 
 	// IDB64 carries a message id's raw bytes base64-encoded when the id is
 	// not valid UTF-8; see setID/entryID. Never set together with ID.
@@ -242,6 +272,11 @@ type logEntry struct {
 	// with ConsumeTo.
 	ConsumeToB64 string `json:"consumeToB64,omitempty"`
 
+	// ConsumeFromB64 is the base64 form of ConsumeFrom for an invalid-UTF-8
+	// source chain; see setConsumeFrom/entryConsumeFrom. Never set together
+	// with ConsumeFrom.
+	ConsumeFromB64 string `json:"consumeFromB64,omitempty"`
+
 	// ConsumeByB64 is the base64 form of ConsumeBy for an invalid-UTF-8
 	// message id; see setConsumeBy/entryConsumeBy. Never set together with
 	// ConsumeBy.
@@ -254,8 +289,8 @@ type logEntry struct {
 
 	// present records which JSON keys the replayed record literally carried,
 	// for the plain/base64-split fields — root/rootB64, payload/payloadB64,
-	// to/toB64 and consumeTo/consumeToB64. The split's mutual-exclusion and
-	// empty-value rules are keyed on presence, not the decoded value: the
+	// to/toB64, from/fromB64, chain/chainB64, consumeTo/consumeToB64 and
+	// consumeFrom/consumeFromB64. The split's mutual-exclusion and empty-value rules are keyed on presence, not the decoded value: the
 	// empty string is a legal value and is written as an explicitly present
 	// "…":"", so it must never double as the signal that the key was omitted.
 	// Set only by UnmarshalJSON and never marshalled.
@@ -269,7 +304,10 @@ var splitJSONKeys = []string{
 	"root", "rootB64",
 	"payload", "payloadB64",
 	"to", "toB64",
+	"from", "fromB64",
+	"chain", "chainB64",
 	"consumeTo", "consumeToB64",
+	"consumeFrom", "consumeFromB64",
 }
 
 // UnmarshalJSON decodes a log record while recording which plain/base64 keys
@@ -382,13 +420,16 @@ func (s splitFieldSpec) decode(e *logEntry) (string, error) {
 // success entry's consuming id share the same decoder through these
 // descriptors too; their pairs keep value-based exclusion (empty plainKey).
 var splitFields = struct {
-	id        splitFieldSpec
-	reason    splitFieldSpec
-	consumeBy splitFieldSpec
-	root      splitFieldSpec
-	payload   splitFieldSpec
-	to        splitFieldSpec
-	consumeTo splitFieldSpec
+	id          splitFieldSpec
+	reason      splitFieldSpec
+	consumeBy   splitFieldSpec
+	root        splitFieldSpec
+	payload     splitFieldSpec
+	to          splitFieldSpec
+	from        splitFieldSpec
+	chain       splitFieldSpec
+	consumeTo   splitFieldSpec
+	consumeFrom splitFieldSpec
 }{
 	id: splitFieldSpec{
 		b64Key:         "idB64",
@@ -435,6 +476,22 @@ var splitFields = struct {
 		bothErr:        "submit entry carries both to and toB64",
 		undecodableErr: "submit entry carries undecodable toB64",
 	},
+	from: splitFieldSpec{
+		plainKey:       "from",
+		b64Key:         "fromB64",
+		plain:          func(e *logEntry) string { return e.From },
+		b64:            func(e *logEntry) string { return e.FromB64 },
+		bothErr:        "submit entry carries both from and fromB64",
+		undecodableErr: "submit entry carries undecodable fromB64",
+	},
+	chain: splitFieldSpec{
+		plainKey:       "chain",
+		b64Key:         "chainB64",
+		plain:          func(e *logEntry) string { return e.Chain },
+		b64:            func(e *logEntry) string { return e.ChainB64 },
+		bothErr:        "entry carries both chain and chainB64",
+		undecodableErr: "entry carries undecodable chainB64",
+	},
 	consumeTo: splitFieldSpec{
 		plainKey:       "consumeTo",
 		b64Key:         "consumeToB64",
@@ -442,6 +499,14 @@ var splitFields = struct {
 		b64:            func(e *logEntry) string { return e.ConsumeToB64 },
 		bothErr:        "success entry carries both consumeTo and consumeToB64",
 		undecodableErr: "success entry carries undecodable consumeToB64",
+	},
+	consumeFrom: splitFieldSpec{
+		plainKey:       "consumeFrom",
+		b64Key:         "consumeFromB64",
+		plain:          func(e *logEntry) string { return e.ConsumeFrom },
+		b64:            func(e *logEntry) string { return e.ConsumeFromB64 },
+		bothErr:        "success entry carries both consumeFrom and consumeFromB64",
+		undecodableErr: "success entry carries undecodable consumeFromB64",
 	},
 }
 
@@ -607,6 +672,83 @@ func (e *logEntry) setConsumeTo(to string) {
 // wording is success-entry specific.
 func (e *logEntry) entryConsumeTo() (string, error) {
 	return splitFields.consumeTo.decode(e)
+}
+
+// setFrom encodes a submit entry's source chain for the log without altering
+// its bytes. A source that is valid UTF-8 (ordinary text, colons, NUL bytes)
+// keeps the historical plain "from" field, so logs stay byte-compatible with
+// older builds and the CLI text interface. A source holding invalid UTF-8
+// bytes would be silently rewritten to U+FFFD by JSON string encoding, so it
+// is instead stored base64-encoded in "fromB64", preserving the exact byte
+// sequence across save, reopen and compaction — the source chain is part of
+// the replay identity and of registration/header-coverage lookup, and must
+// never change identity.
+func (e *logEntry) setFrom(from string) {
+	if utf8.ValidString(from) {
+		e.From = from
+		return
+	}
+	e.FromB64 = base64.StdEncoding.EncodeToString([]byte(from))
+}
+
+// entryFrom decodes a submit entry's source chain back to its exact submitted
+// bytes. Entries written before fromB64 existed carry only "from" and are
+// taken at face value — including a source an old build had already rewritten
+// to a replacement character, which stays that character; the lost bytes are
+// never guessed. An entry carrying both fields at once (judged by key
+// presence, the empty string included), or a fromB64 that does not decode, is
+// an inconsistent record no build writes and is corrupt. Those rules are the
+// shared ones in splitFieldSpec.decode; only the wording is source specific.
+func (e *logEntry) entryFrom() (string, error) {
+	return splitFields.from.decode(e)
+}
+
+// setChain encodes a source or header entry's chain name for the log without
+// altering its bytes, using the same plain/base64 split as the submit entry's
+// "from" field: valid UTF-8 keeps the historical plain "chain" field, invalid
+// UTF-8 is stored base64-encoded in "chainB64". Registration and trusted
+// headers must take effect for exactly the byte sequence they were saved
+// with, never for what a display layer happens to render.
+func (e *logEntry) setChain(chain string) {
+	if utf8.ValidString(chain) {
+		e.Chain = chain
+		return
+	}
+	e.ChainB64 = base64.StdEncoding.EncodeToString([]byte(chain))
+}
+
+// entryChain decodes a source or header entry's chain name back to its exact
+// bytes. Entries written before chainB64 existed carry only "chain" and are
+// taken at face value — including a name an old build had already rewritten
+// to replacement characters, which stays those characters; the lost bytes are
+// never guessed. An entry carrying both fields at once (judged by key
+// presence, the empty string included), or a chainB64 that does not decode,
+// is an inconsistent record no build writes and is corrupt. Those rules are
+// the shared ones in splitFieldSpec.decode; only the wording is chain
+// specific.
+func (e *logEntry) entryChain() (string, error) {
+	return splitFields.chain.decode(e)
+}
+
+// setConsumeFrom records the successful message's source chain alongside the
+// consumed triple, using the same plain/base64 split as the submit entry's
+// "from" field, so the consumption attribution survives invalid UTF-8 byte
+// for byte.
+func (e *logEntry) setConsumeFrom(from string) {
+	if utf8.ValidString(from) {
+		e.ConsumeFrom = from
+		return
+	}
+	e.ConsumeFromB64 = base64.StdEncoding.EncodeToString([]byte(from))
+}
+
+// entryConsumeFrom decodes a success entry's consumed source back to its
+// exact bytes. A record with both consumeFrom and consumeFromB64 set (by key
+// presence, the empty string included), or an undecodable consumeFromB64, is
+// corrupt. Those rules are the shared ones in splitFieldSpec.decode; only the
+// wording is success-entry specific.
+func (e *logEntry) entryConsumeFrom() (string, error) {
+	return splitFields.consumeFrom.decode(e)
 }
 
 // legacyNonceKey reproduces the consumption string used by older builds:
@@ -930,12 +1072,30 @@ func normalizeEntryRaw(e *logEntry) error {
 	}
 	e.ID = id
 	e.IDB64 = ""
+	from, err := e.entryFrom()
+	if err != nil {
+		return err
+	}
+	e.From = from
+	e.FromB64 = ""
+	chain, err := e.entryChain()
+	if err != nil {
+		return err
+	}
+	e.Chain = chain
+	e.ChainB64 = ""
 	to, err := e.entryTo()
 	if err != nil {
 		return err
 	}
 	e.To = to
 	e.ToB64 = ""
+	consumeFrom, err := e.entryConsumeFrom()
+	if err != nil {
+		return err
+	}
+	e.ConsumeFrom = consumeFrom
+	e.ConsumeFromB64 = ""
 	consumeTo, err := e.entryConsumeTo()
 	if err != nil {
 		return err
@@ -1345,11 +1505,14 @@ func (s *store) needsCompaction() bool {
 }
 
 func (s *store) appendRegisterSource(chain string) error {
-	return s.append(&logEntry{T: kindSource, Chain: chain})
+	e := &logEntry{T: kindSource}
+	e.setChain(chain)
+	return s.append(e)
 }
 
 func (s *store) appendHeader(h Header) error {
-	e := &logEntry{T: kindHeader, Chain: h.Chain, Height: h.Height, Trusted: h.Trusted}
+	e := &logEntry{T: kindHeader, Height: h.Height, Trusted: h.Trusted}
+	e.setChain(h.Chain)
 	e.setRoot(h.Root)
 	return s.append(e)
 }
@@ -1359,15 +1522,16 @@ func (s *store) appendHeader(h Header) error {
 // for both save paths: the incremental appendSubmit writes one per Submit call
 // and compact writes one per snapshotted record, so id, source and destination
 // chains, nonce, payload, proof height, expiry and seq — including the
-// plain/base64 byte preservation for id, destination and payload — are encoded
-// identically in a plain result log and in a compacted log.
+// plain/base64 byte preservation for id, source, destination and payload — are
+// encoded identically in a plain result log and in a compacted log.
 func newSubmitEntry(rec *Record) *logEntry {
 	m := rec.Msg.Message
 	e := &logEntry{
-		T: kindSubmit, Seq: rec.Seq, From: m.From,
+		T: kindSubmit, Seq: rec.Seq,
 		Nonce: m.Nonce, ProofAt: m.ProofAt, ExpiresAt: rec.Msg.ExpiresAt,
 	}
 	e.setID(m.ID)
+	e.setFrom(m.From)
 	e.setTo(m.To)
 	e.setPayload(m.Payload)
 	return e
@@ -1381,9 +1545,9 @@ func (s *store) appendSubmit(rec *Record) error {
 // it to the successful message id. It is the one fill rule shared by the
 // incremental result path and the compacted-state path, so a success state and
 // its nonce consumption are always written together, as one record, with the
-// same plain/base64 destination and id encoding.
+// same plain/base64 source, destination and id encoding.
 func setSuccessConsumption(e *logEntry, id string, token *consumeToken) {
-	e.ConsumeFrom = token.from
+	e.setConsumeFrom(token.from)
 	e.setConsumeTo(token.to)
 	e.ConsumeNonce = token.nonce
 	e.setConsumeBy(id)
@@ -1449,7 +1613,9 @@ func (s *store) compact(state *loadedState) error {
 	}
 	sort.Strings(chains)
 	for _, c := range chains {
-		entries = append(entries, &logEntry{T: kindSource, Chain: c})
+		e := &logEntry{T: kindSource}
+		e.setChain(c)
+		entries = append(entries, e)
 	}
 
 	headerChains := make([]string, 0, len(state.headers))
@@ -1464,12 +1630,14 @@ func (s *store) compact(state *loadedState) error {
 		// highest trusted as the max-height trusted entry, so this order
 		// restores both exactly.
 		if hs.trusted != nil {
-			e := &logEntry{T: kindHeader, Chain: hs.trusted.Chain, Height: hs.trusted.Height, Trusted: hs.trusted.Trusted}
+			e := &logEntry{T: kindHeader, Height: hs.trusted.Height, Trusted: hs.trusted.Trusted}
+			e.setChain(hs.trusted.Chain)
 			e.setRoot(hs.trusted.Root)
 			entries = append(entries, e)
 		}
 		if hs.trusted == nil || hs.latest != *hs.trusted {
-			e := &logEntry{T: kindHeader, Chain: hs.latest.Chain, Height: hs.latest.Height, Trusted: hs.latest.Trusted}
+			e := &logEntry{T: kindHeader, Height: hs.latest.Height, Trusted: hs.latest.Trusted}
+			e.setChain(hs.latest.Chain)
 			e.setRoot(hs.latest.Root)
 			entries = append(entries, e)
 		}

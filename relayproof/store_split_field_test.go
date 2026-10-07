@@ -2,12 +2,13 @@ package relayproof
 
 // These tests pin the single shared plain/base64 recovery rule behind
 // splitFieldSpec.decode — the inverse of every raw-bytes log field's encoding
-// (header root, message payload, submit destination, consumed destination, and
-// the value-based pairs message id / reason / consuming id). Each field pair
-// must keep exactly one behavior matrix, while keeping its own business value
-// and its own corruption wording. The end-to-end open/compaction semantics are
-// covered by the per-field tests; this table guards the shared rule itself so
-// the rule cannot silently drift per field again.
+// (header root, message payload, submit source and destination, source/header
+// chain name, consumed source and destination, and the value-based pairs
+// message id / reason / consuming id). Each field pair must keep exactly one
+// behavior matrix, while keeping its own business value and its own corruption
+// wording. The end-to-end open/compaction semantics are covered by the
+// per-field tests; this table guards the shared rule itself so the rule cannot
+// silently drift per field again.
 
 import (
 	"encoding/base64"
@@ -47,7 +48,7 @@ func TestSplitFieldSharedDecoderMatrix(t *testing.T) {
 		name     string
 		spec     splitFieldSpec
 		plainKey string // real JSON plain key, even for value-based pairs
-		presence bool   // presence-tracked pair (root/payload/to/consumeTo)
+		presence bool   // presence-tracked pair (root/payload/to/from/chain/consumeTo/consumeFrom)
 	}
 	fields := []field{
 		{"id", splitFields.id, "id", false},
@@ -56,7 +57,10 @@ func TestSplitFieldSharedDecoderMatrix(t *testing.T) {
 		{"root", splitFields.root, "root", true},
 		{"payload", splitFields.payload, "payload", true},
 		{"to", splitFields.to, "to", true},
+		{"from", splitFields.from, "from", true},
+		{"chain", splitFields.chain, "chain", true},
 		{"consumeTo", splitFields.consumeTo, "consumeTo", true},
+		{"consumeFrom", splitFields.consumeFrom, "consumeFrom", true},
 	}
 
 	for _, f := range fields {
@@ -144,7 +148,10 @@ func TestSplitFieldDescriptorWordingIsFieldSpecific(t *testing.T) {
 		{"rootB64", splitFields.root},
 		{"payloadB64", splitFields.payload},
 		{"toB64", splitFields.to},
+		{"fromB64", splitFields.from},
+		{"chainB64", splitFields.chain},
 		{"consumeToB64", splitFields.consumeTo},
+		{"consumeFromB64", splitFields.consumeFrom},
 	}
 	seenBoth := map[string]string{}
 	seenUndec := map[string]string{}
