@@ -184,6 +184,26 @@ import (
 // order. A complete, checksum-valid record that violates these rules is
 // corrupt (ErrCorrupt), never a truncatable torn tail, so the log's length
 // and bytes are preserved.
+//
+// Success coverage validation on replay: a success — a plain result or a
+// compacted state — is only something a legal advance could have produced
+// when the log itself carries a trusted header of the message's own source
+// chain covering the message's proof height. Recovery therefore requires the
+// highest trusted header recorded for that exact chain (by its raw bytes,
+// never another chain's) to reach the proof height; equality counts as
+// covered. A success saved with no trusted header, with only untrusted
+// headers, or with a highest trusted height below the proof height is
+// corrupt (ErrCorrupt) and rejects the whole directory — the log is left
+// byte-for-byte untouched, even when the offending record is the final
+// frame. For a plain result the covering trusted header must precede the
+// result in the log: a higher trusted header saved only afterwards cannot
+// rescue it. A compacted state is judged by the trusted coverage the
+// snapshot retained; the header-update history compaction dropped is never
+// demanded back. The success reason's text is not evidence either way, and
+// the height it names need not equal the retained highest trusted height.
+// Coverage is judged by the highest trusted header, not the latest one, so
+// lower trusted or untrusted headers saved later never invalidate a legal
+// success.
 
 const (
 	logName          = "queue.log"
@@ -1256,10 +1276,11 @@ func validateRecoveryDue(rec *Record, e *logEntry) error {
 // kind-specific acceptance rules (including the snapshot's >=1-attempts
 // requirement): waiting must carry the canonical retry schedule (with the
 // sole legacy-overflow exception repaired in memory) and no consumption,
-// success must keep no retry time and consume its own (from,to,nonce)
-// attributed to itself, and terminal failures carry neither a retry time nor
-// consumption fields. The repaired retry time of a legacy overflowed schedule
-// is written back onto e.
+// success must keep no retry time, consume its own (from,to,nonce) attributed
+// to itself, and be backed by saved trusted-header coverage of its proof
+// height, and terminal failures carry neither a retry time nor consumption
+// fields. The repaired retry time of a legacy overflowed schedule is written
+// back onto e.
 func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
 	corrupt := func(msg string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
@@ -1283,10 +1304,58 @@ func acceptRecoveryStatus(s *loadedState, rec *Record, e *logEntry, rk recoveryK
 		if _, err := acceptConsumption(s, rec, e, corrupt); err != nil {
 			return err
 		}
+		if err := validateSuccessCoverage(s, rec, e, rk); err != nil {
+			return err
+		}
 	default: // terminal failure kinds
 		if e.NextRetry != 0 || entryCarriesConsumption(e) {
 			return corrupt("terminal %s for %q carries scheduling/consume fields", rk.entryNoun, e.ID)
 		}
+	}
+	return nil
+}
+
+// validateSuccessCoverage requires a recovered success — a plain result or a
+// compacted state — to be backed by the trusted coverage the log itself has
+// saved: the highest trusted header recorded for the message's own source
+// chain must cover the message's proof height. A live advance only delivers
+// under exactly that condition, so a complete, checksum-valid success record
+// without it is corruption, however consistent the rest of the record is:
+//
+//   - no header at all for the source chain, or only untrusted headers, never
+//     covers anything;
+//   - a highest trusted height below the proof height does not cover it,
+//     while one exactly equal to it does;
+//   - another chain's trusted headers never count — chain identity is the
+//     exact saved bytes;
+//   - the coverage is judged against the headers saved before this record: a
+//     plain result is only legal when its covering trusted header precedes it
+//     in the log, and a compacted state is judged by the trusted coverage the
+//     snapshot retained, with no obligation to restore the header-update
+//     history compaction dropped;
+//   - the success reason's text ("delivered; proof verified by trusted
+//     header at height N") is not evidence — only a saved trusted header
+//     counts, and the height the reason names need not equal the retained
+//     highest trusted height.
+//
+// Because the judgment reads the chain's highest trusted header — never the
+// latest header — a legal success stays legal no matter which lower trusted
+// or untrusted headers were saved around it. A record failing this check is
+// corrupt in place: the log's length and bytes are preserved, even when the
+// record is the final frame.
+func validateSuccessCoverage(s *loadedState, rec *Record, e *logEntry, rk recoveryKind) error {
+	corrupt := func(msg string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(msg, args...))
+	}
+	m := rec.Msg.Message
+	hs := s.headers[m.From]
+	if hs == nil || hs.trusted == nil {
+		return corrupt("success %s for %q lacks trusted coverage: no trusted header recorded for source chain %q (proof height %d)",
+			rk.entryNoun, e.ID, m.From, m.ProofAt)
+	}
+	if hs.trusted.Height < m.ProofAt {
+		return corrupt("success %s for %q lacks trusted coverage: highest trusted header of source chain %q is at height %d, below proof height %d",
+			rk.entryNoun, e.ID, m.From, hs.trusted.Height, m.ProofAt)
 	}
 	return nil
 }
@@ -1391,8 +1460,9 @@ func applyEntry(s *loadedState, e *logEntry) error {
 		// stay exempt: they settle a waiting message while its backoff is
 		// still running, at the same instant as its wait included. A message's
 		// first processing has no schedule to obey (time zero included). The
-		// per-status validation (waiting schedule, success consumption,
-		// terminal fields) is shared with compacted state entries.
+		// per-status validation (waiting schedule, success consumption and
+		// trusted-header coverage, terminal fields) is shared with compacted
+		// state entries.
 		rec, ok := s.records[e.ID]
 		if !ok {
 			return corrupt("result for unknown id %q", e.ID)

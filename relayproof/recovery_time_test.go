@@ -192,13 +192,16 @@ func TestCompactedSnapshotsKeepUnorderedTimes(t *testing.T) {
 	dir := t.TempDir()
 	entries := []*logEntry{
 		{T: kindSource, Chain: "a"},
+		// A real compaction always retains the trusted header the success was
+		// delivered under; the success state below is judged against it.
+		{T: kindHeader, Chain: "a", Height: 100, Root: "0x100", Trusted: true},
 		{T: kindSubmit, Seq: 0, ID: "m1", From: "a", To: "b", Nonce: 1, ProofAt: 10},
 		{T: kindState, Now: 6000, ID: "m1", Status: StatusSuccess,
 			Reason: "delivered; proof verified by trusted header at height 100", Attempts: 3,
 			ConsumeFrom: "a", ConsumeTo: "b", ConsumeNonce: 1, ConsumeBy: "m1"},
-		{T: kindSubmit, Seq: 1, ID: "m2", From: "a", To: "b", Nonce: 2, ProofAt: 100},
+		{T: kindSubmit, Seq: 1, ID: "m2", From: "a", To: "b", Nonce: 2, ProofAt: 101},
 		{T: kindState, Now: 2000, ID: "m2", Status: StatusWaiting,
-			Reason: "waiting for trusted header covering height 100 (current 0)", Attempts: 1, NextRetry: 3000},
+			Reason: "waiting for trusted header covering height 101 (current 100)", Attempts: 1, NextRetry: 3000},
 		{T: kindAdvance, Now: 6000},
 	}
 	writeLegacyLog(t, dir, entries...)
@@ -213,7 +216,7 @@ func TestCompactedSnapshotsKeepUnorderedTimes(t *testing.T) {
 		t.Fatalf("success snapshot not restored: %+v", r)
 	}
 	if r := statusOf(t, q, "m2"); r.Status != StatusWaiting || r.Attempts != 1 || r.NextRetry != 3000 ||
-		!strings.Contains(r.Reason, "height 100") {
+		!strings.Contains(r.Reason, "height 101") {
 		t.Fatalf("waiting snapshot not restored: %+v", r)
 	}
 	if winner := q.consumed[newConsumeToken("a", "b", 1)]; winner != "m1" {
