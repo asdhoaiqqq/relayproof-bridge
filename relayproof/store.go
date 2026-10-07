@@ -761,11 +761,21 @@ func checkMagic(path string) error {
 // exactly once; what differs is the recovery policy each caller applies to a
 // frame that is torn, zero-length, or checksum-bad, and those decisions stay
 // in the callers.
+//
+// The declared length n and the frame end are int64, not int: the length
+// header is an unsigned 32-bit value, and on 32-bit builds a plain int cannot
+// represent declared lengths at or above 2^31 (they would wrap negative) nor
+// hold bodyStart+n+frameCRCsSize without overflow when n is large. A wrapped
+// or overflowed extent would either panic on slicing or misjudge a frame that
+// runs far past end of file as complete. Computing the extent in int64 makes
+// the torn/complete verdict identical on 32-bit and 64-bit builds: any
+// declared length up to 4294967295 is judged against the actual file size,
+// never against what a machine word happens to hold.
 type frame struct {
-	pos       int // offset of the length header
-	n         int // declared payload length
-	bodyStart int // offset of the payload; zero while even the header is incomplete
-	end       int // offset just past the frame
+	pos       int   // offset of the length header
+	n         int64 // declared payload length
+	bodyStart int   // offset of the payload; zero while even the header is incomplete
+	end       int64 // offset just past the frame
 }
 
 // errZeroLengthFrame reports a declared payload length of zero, which is
@@ -784,23 +794,27 @@ func scanFrame(raw []byte, pos int) (frame, bool, error) {
 	if len(raw)-pos < frameHeaderSize {
 		return f, true, nil
 	}
-	f.n = int(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
+	// The declared length is an unsigned 32-bit value; keep it in int64 so
+	// lengths at or above 2^31 stay positive on 32-bit builds and the end
+	// computation below cannot overflow.
+	f.n = int64(binary.BigEndian.Uint32(raw[pos : pos+frameHeaderSize]))
 	if f.n == 0 {
 		return f, false, errZeroLengthFrame
 	}
 	f.bodyStart = pos + frameHeaderSize
-	f.end = f.bodyStart + f.n + frameCRCsSize
-	if f.end > len(raw) {
+	f.end = int64(f.bodyStart) + f.n + frameCRCsSize
+	if f.end > int64(len(raw)) {
 		return f, true, nil
 	}
 	return f, false, nil
 }
 
 // payload returns the complete frame's payload bytes and reports whether the
-// stored CRC32 matches them.
+// stored CRC32 matches them. It must only be called on a frame scanFrame
+// reported complete, so n and end fit in int on any architecture.
 func (f frame) payload(raw []byte) ([]byte, bool) {
-	payload := raw[f.bodyStart : f.bodyStart+f.n]
-	wantCRC := binary.BigEndian.Uint32(raw[f.bodyStart+f.n : f.end])
+	payload := raw[f.bodyStart : f.bodyStart+int(f.n)]
+	wantCRC := binary.BigEndian.Uint32(raw[f.bodyStart+int(f.n) : int(f.end)])
 	return payload, crc32.Checksum(payload, crcTable) == wantCRC
 }
 
@@ -840,7 +854,7 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		}
 		payload, ok := f.payload(raw)
 		if !ok {
-			if f.end == len(raw) {
+			if f.end == int64(len(raw)) {
 				// Torn sectors of the final, unacknowledged frame.
 				return int64(pos), state, nil
 			}
@@ -859,7 +873,8 @@ func replayLog(raw []byte) (int64, *loadedState, error) {
 		if err := applyEntry(state, &e); err != nil {
 			return 0, nil, err
 		}
-		pos = f.end
+		// The frame is complete, so its end is within the file and fits in int.
+		pos = int(f.end)
 	}
 	return int64(pos), state, nil
 }
@@ -901,7 +916,8 @@ func readVersionRecord(raw []byte, start int) (int, error) {
 	if e.V != currentLogV {
 		return 0, fmt.Errorf("%w: unsupported log version %d", ErrCorrupt, e.V)
 	}
-	return f.end, nil
+	// The frame is complete, so its end is within the file and fits in int.
+	return int(f.end), nil
 }
 
 // normalizeEntryRaw decodes every raw-bytes field of a replayed entry back to

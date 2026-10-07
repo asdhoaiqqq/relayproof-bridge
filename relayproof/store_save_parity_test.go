@@ -36,7 +36,7 @@ func readLogEntries(t *testing.T, dir string) [][]byte {
 		if e.T != kindVersion {
 			out = append(out, body)
 		}
-		pos = f.end
+		pos = int(f.end)
 	}
 	return out
 }
