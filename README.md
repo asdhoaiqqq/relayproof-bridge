@@ -689,18 +689,251 @@ func normalizeLogs(r io.Reader, w io.Writer) error {
 失败结果；详细对比与示例见
 [空白字符：整行、JSON 分隔符与字符串内容](#空白字符整行json-分隔符与字符串内容)。
 
-正常文件结束与读取中断的区别：
+#### 正常结束与读取中断：怎样才算“只有 EOF”
 
-- 读到干净的 EOF 不是错误，即使末行没有换行符，该末行也会照常处理并计入行号。
-- 读取故障时，随故障一起返回的未结束片段属于这次失败读取的一部分，不是完整
-  日志行：它既不产生逐行结果，也不计入 `failures`；此前已经读到的完整日志仍按
-  原顺序处理并计数行号。
-- 写出故障时处理立即停止，输出端可能残留一条写了一半的末条 JSON；文档不保证
-  中断之后仍有完整输出，调用方不应继续在该 writer 上追加内容。
-- 若读取已经失败、收尾刷新写出时又失败：读故障仍是主要原因
-  （`errors.Is(err, ErrLogRead)` 成立、底层读取原因也仍在错误链中），后来的
-  写故障只体现在返回错误的文字里，命令入口同样按退出 `2` 报告。
+`NormalizeReader` 自己读输入流，因此“读到结尾”和“读到一半出故障”都要靠
+Reader 返回的 `error` 区分。判定规则不是 `errors.Is(err, io.EOF)`，而是看这个
+错误是否**只包含 `io.EOF`、再没有别的独立原因**：
 
+- 裸 `io.EOF` 是正常结束；
+- `io.EOF` 外面包多少层普通 `%w` 包装（例如
+  `fmt.Errorf("connection closed: %w", io.EOF)`）也是正常结束；
+- `errors.Join` 组合错误里若**每个**原因都是 `io.EOF`（如
+  `errors.Join(io.EOF, io.EOF)`）同样是正常结束。
+
+这三种情况下返回的 `err` 为 `nil`；即使最后一条完整日志后面**没有末尾换行符**，
+该末行也照样规范化、照样占用物理行号。`*os.File`、`strings.Reader`、
+`bytes.Reader` 等常见输入走到文件尾时返回的就是这种干净 EOF。
+
+反过来，只要错误在 `io.EOF` 之外还带着**另一个独立读取原因**（典型是
+`errors.Join(io.EOF, cause)`，外面再套多少层 `%w` 包装都一样），它就是**读取
+中断**，不是正常结束。注意此时 `errors.Is(err, io.EOF)` 依然成立——所以接入方
+**不能**用它判断成功，要用下面例子里的 `ErrLogRead`/原始原因去识别。
+
+读取中断时各部分的去向：
+
+- 与故障**同一次 `Read` 一起交付的、以换行结束的完整日志**仍按原顺序逐条处理：
+  合法的输出成功记录，字段无效的照常输出失败记录并计入 `failures`，空白行照旧
+  占用行号但不输出；
+- 最后一个换行之后剩下的**无换行片段属于这次失败读取的一部分**，不是一条完整
+  日志：它不产生任何记录，也不计入 `failures`，**即使该片段本身是一条完全合法
+  的 JSON 日志**；
+- 故障在返回它的那次 `Read` 即刻生效，处理停止，不会再发起下一次 `Read`。
+- 逐行规范化失败（无效日志）只增加 `failures`，**永远不会单独让 `err` 非空**；
+  `err` 只表示流级中断。
+
+#### 例：同一批日志在六种结局下的实际输出与返回值
+
+下面的程序只依赖标准库和本项目，全部输入输出都在进程内用确定性的假
+Reader/Writer 脚本化，不碰网络、管道与真实磁盘。把它存成仓库内任意临时目录下
+的 `main.go`（例如 `docscenario/main.go`），用 `go run ./docscenario` 即可离线
+复现；它只是使用示例，不是仓库的公共入口。
+
+同一批输入包含三种行：第 1 行合法、第 2 行字段无效、第 3 行合法但**整批末尾
+没有换行符**：
+
+```go
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/asdhoaiqqq/relayproof-bridge/relayproof"
+)
+
+var (
+	errUpstream = errors.New("upstream device reset")
+	errDisk     = errors.New("disk quota exceeded")
+)
+
+// finalReadReader 第一次 Read 一次性交付全部 data 并同时返回 endErr，
+// 在进程内确定性复现“最后一次读取同时带回字节与错误”的情形。
+type finalReadReader struct {
+	data   []byte
+	endErr error
+	done   bool
+}
+
+func (r *finalReadReader) Read(p []byte) (int, error) {
+	if r.done {
+		panic("读取故障后不应再发起 Read")
+	}
+	r.done = true
+	return copy(p, r.data), r.endErr
+}
+
+// failingWriter 拒绝所有写入（记录都很短，物理写出只发生在收尾 Flush）。
+type failingWriter struct{}
+
+func (*failingWriter) Write(p []byte) (int, error) { return 0, errDisk }
+
+// 同一批输入：第 1 行合法、第 2 行字段无效、第 3 行合法但整批末尾没有换行。
+var batch = strings.Join([]string{
+	`{"timestamp":"2026-10-04T08:30:00Z","action":"login"}`,
+	`{"timestamp":"not-a-time","action":"deny"}`,
+	`{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}`,
+}, "\n")
+
+func report(tag string, failures int, err error, out []byte) {
+	fmt.Printf("==== %s ====\n", tag)
+	fmt.Printf("records=%d failures=%d err=%v\n",
+		bytes.Count(out, []byte("\n")), failures, err)
+	fmt.Printf("Is(ErrLogRead)=%t Is(ErrLogWrite)=%t Is(io.EOF)=%t Is(errUpstream)=%t Is(errDisk)=%t\n",
+		errors.Is(err, relayproof.ErrLogRead), errors.Is(err, relayproof.ErrLogWrite),
+		errors.Is(err, io.EOF), errors.Is(err, errUpstream), errors.Is(err, errDisk))
+	fmt.Println("---- 输出 ----")
+	fmt.Print(string(out))
+	fmt.Println()
+}
+
+func main() {
+	// 1. 干净 EOF 的正常结束（末行没有换行符）。
+	var out1 bytes.Buffer
+	f1, e1 := relayproof.NormalizeReader(strings.NewReader(batch), &out1)
+	report("1 正常结束: io.EOF", f1, e1, out1.Bytes())
+
+	// 2. 同一次 Read 同时交付 io.EOF 与一个独立读取故障。
+	combined := errors.Join(io.EOF, errUpstream)
+	var out2 bytes.Buffer
+	f2, e2 := relayproof.NormalizeReader(&finalReadReader{data: []byte(batch), endErr: combined}, &out2)
+	report("2 读取中断: errors.Join(io.EOF, errUpstream)", f2, e2, out2.Bytes())
+
+	// 3. 组合错误外面再包一层，errors.Is(err, io.EOF) 依然成立。
+	wrapped := fmt.Errorf("upstream connection lost: %w", combined)
+	var out3 bytes.Buffer
+	f3, e3 := relayproof.NormalizeReader(&finalReadReader{data: []byte(batch), endErr: wrapped}, &out3)
+	report("3 读取中断: 包装后的组合错误", f3, e3, out3.Bytes())
+
+	// 4. 故障只带着一个没有换行的合法片段，此前没有任何完整行。
+	var out4 bytes.Buffer
+	f4, e4 := relayproof.NormalizeReader(&finalReadReader{
+		data:   []byte(`{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}`),
+		endErr: combined,
+	}, &out4)
+	report("4 读取中断: 只有未结束片段", f4, e4, out4.Bytes())
+
+	// 5. 读故障已到手，随后写出这些结果（收尾 Flush）也失败。
+	f5, e5 := relayproof.NormalizeReader(
+		&finalReadReader{data: []byte(batch), endErr: combined}, &failingWriter{})
+	fmt.Printf("==== 5 读写同时失败: 读故障为主 ====\n")
+	fmt.Printf("failures=%d err=%v\n", f5, e5)
+	fmt.Printf("Is(ErrLogRead)=%t Is(ErrLogWrite)=%t Is(io.EOF)=%t Is(errUpstream)=%t Is(errDisk)=%t\n\n",
+		errors.Is(e5, relayproof.ErrLogRead), errors.Is(e5, relayproof.ErrLogWrite),
+		errors.Is(e5, io.EOF), errors.Is(e5, errUpstream), errors.Is(e5, errDisk))
+
+	// 6. 写出失败时还没有收到任何读取故障（输入读到的是干净 EOF）。
+	f6, e6 := relayproof.NormalizeReader(strings.NewReader(batch), &failingWriter{})
+	fmt.Printf("==== 6 写出先失败: 尚无读取故障 ====\n")
+	fmt.Printf("failures=%d err=%v\n", f6, e6)
+	fmt.Printf("Is(ErrLogRead)=%t Is(ErrLogWrite)=%t Is(io.EOF)=%t Is(errUpstream)=%t Is(errDisk)=%t\n",
+		errors.Is(e6, relayproof.ErrLogRead), errors.Is(e6, relayproof.ErrLogWrite),
+		errors.Is(e6, io.EOF), errors.Is(e6, errUpstream), errors.Is(e6, errDisk))
+}
+```
+
+实际输出如下（`err` 为组合错误时跨两行，是 `errors.Join` 的标准格式；换行处
+不是新记录）：
+
+```text
+==== 1 正常结束: io.EOF ====
+records=3 failures=1 err=<nil>
+Is(ErrLogRead)=false Is(ErrLogWrite)=false Is(io.EOF)=false Is(errUpstream)=false Is(errDisk)=false
+---- 输出 ----
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+{"line":2,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+{"line":3,"ok":true,"event":{"timestamp":"2026-10-04T09:00:00Z","action":"logout"}}
+
+==== 2 读取中断: errors.Join(io.EOF, errUpstream) ====
+records=2 failures=1 err=log stream read failure: EOF
+upstream device reset
+Is(ErrLogRead)=true Is(ErrLogWrite)=false Is(io.EOF)=true Is(errUpstream)=true Is(errDisk)=false
+---- 输出 ----
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+{"line":2,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+
+==== 3 读取中断: 包装后的组合错误 ====
+records=2 failures=1 err=log stream read failure: upstream connection lost: EOF
+upstream device reset
+Is(ErrLogRead)=true Is(ErrLogWrite)=false Is(io.EOF)=true Is(errUpstream)=true Is(errDisk)=false
+---- 输出 ----
+{"line":1,"ok":true,"event":{"timestamp":"2026-10-04T08:30:00Z","action":"login"}}
+{"line":2,"ok":false,"error":"field \"timestamp\": invalid RFC3339 timestamp: not an RFC3339 timestamp (need YYYY-MM-DDTHH:MM:SS with two-digit fields, a dot fraction of 1-9 digits, and Z or ±HH:MM offset)"}
+
+==== 4 读取中断: 只有未结束片段 ====
+records=0 failures=0 err=log stream read failure: EOF
+upstream device reset
+Is(ErrLogRead)=true Is(ErrLogWrite)=false Is(io.EOF)=true Is(errUpstream)=true Is(errDisk)=false
+---- 输出 ----
+
+==== 5 读写同时失败: 读故障为主 ====
+failures=1 err=log stream read failure: EOF
+upstream device reset: disk quota exceeded
+Is(ErrLogRead)=true Is(ErrLogWrite)=false Is(io.EOF)=true Is(errUpstream)=true Is(errDisk)=false
+
+==== 6 写出先失败: 尚无读取故障 ====
+failures=1 err=log stream write failure: disk quota exceeded
+Is(ErrLogRead)=false Is(ErrLogWrite)=true Is(io.EOF)=false Is(errUpstream)=false Is(errDisk)=true
+```
+
+六种结局与输入逐行对应：
+
+1. **正常结束。** 输出三行记录：`line:1` 成功、`line:2` 失败（时间不合法）、
+   没有末尾换行的第 3 行成为 `line:3` 成功记录；`failures=1` 只数第 2 行，
+   `err` 为 `nil`。把第 2 行换成合法日志，`failures` 即为 `0`；若 Reader 返回的
+   是只包着 EOF 的包装错误或 `errors.Join(io.EOF, io.EOF)`，结果与本情形完全
+   相同。
+2. **EOF 与独立读取原因组合 = 读取中断。** 前两条以换行结束的完整日志照常按序
+   处理（成功、失败各一条，`failures=1`）；没有换行的第 3 行随故障一起到达，
+   却不产生 `line:3`、也不计入失败。`err` 同时可被
+   `errors.Is(err, relayproof.ErrLogRead)`、`errors.Is(err, errUpstream)` 和
+   `errors.Is(err, io.EOF)` 匹配——第三个成立也不能把它当作成功结束。
+3. **外面再套包装不改变判定。** 输出、`failures` 与情形 2 完全相同，只是错误
+   文字多了包装前缀；三个 `errors.Is` 匹配结果不变。
+4. **只有未结束片段时，“空输出 + 零失败”仍可能是中断。** 那条片段本身是合法
+   日志，但它没有换行、且与故障同批到达，因此输出为空（`records=0`）、
+   `failures=0`，而 `err` 非空且 `ErrLogRead` 与原始原因都可匹配。接入方必须先
+   判断 `err`，不能用 `failures == 0` 或输出为空推断本次批处理成功。
+5. **读写同时失败、读取故障先到手。** 见下一节的归因规则：`ErrLogRead` 与
+   `errUpstream` 可匹配，`ErrLogWrite`、`errDisk` 不可匹配，写出原因只出现在
+   错误文字末尾。
+6. **写出失败时尚无读取故障。** 按写出故障报告：`ErrLogWrite` 与 `errDisk` 可
+   匹配，`ErrLogRead` 不成立；此时不会再继续读取输入来改变归因。注意
+   `failures=1` 仍是此前已完整处理的第 2 行无效日志，与写出故障互不影响。
+
+#### 读取与写出同时失败时的归因
+
+读写两端可能在同一次收尾中先后报错，归因取决于**写出失败发生时手上是否已经
+有读取故障**：
+
+- **一次 `Read` 已经返回了读取故障以及若干以换行结束的完整日志，随后写出这些
+  结果失败**——无论失败的物理写出是某条超长结果本身的直接写出，还是仅把此前
+  缓冲在 4 KiB 缓冲区里的结果在收尾 `Flush` 时刷新（情形 5）——读取故障始终是
+  主要原因：返回错误同时满足
+  `errors.Is(err, relayproof.ErrLogRead)` 和
+  `errors.Is(err, 读取原始原因)`；后来的写出原因**只出现在 `err.Error()` 的文字
+  里**，`errors.Is(err, relayproof.ErrLogWrite)` 与
+  `errors.Is(err, 写出原因)` 都**不成立**，它没有被包进可匹配的错误链。处理在
+  写出失败处立即停止，不会再读一次输入；已被 Writer 接收的字节保留为正常输出
+  的前缀，末条 JSON 可能写了一半，调用方不应继续在该 Writer 上追加内容。
+- **写出失败发生时还没有收到读取故障**（输入此前一直健康，或读取已经以干净
+  EOF 结束、收尾写出才失败，情形 6）：立即按写出故障报告，
+  `errors.Is(err, relayproof.ErrLogWrite)` 与写出的原始原因都在错误链中；程序
+  **不会**为了比较先后而继续读取后续输入——此后即使输入再报故障，也不会改变
+  这次归因。
+
+两种情况在命令行入口都以退出 `2`、标准错误一行 `normalize: ...` 诊断呈现。
+
+#### 来源网段筛选不会消除流级中断
+
+`NormalizeReaderFiltered`（及 `--source-cidr`）的筛选只作用于**成功事件**：网段
+外、无来源地址或另一地址族的成功记录被省略且不计失败；但它不改变这一节的任何
+结论——字段无效的日志仍按逐行失败输出并计入 `failures`，EOF 组合错误等读取
+中断照常以 `ErrLogRead` 返回，无换行片段仍不留记录。筛选器不会把一次流级中断
+伪装成正常结束。
 
 ## 技术方向
 
